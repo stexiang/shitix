@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "bugs": [
+    {
+      "id": "bug-001",
+      "timestamp": "2026-08-02T03:30:00Z",
+      "error_message": "内核在 mm::init 后第一次 get_free_page 时三重错误重启（QEMU -d cpu_reset 显示 CPU Reset，串口只打出 'long mode entry reached' 就停）",
+      "file": "src/mm/page_alloc.rs",
+      "root_cause": "mem_init 把 E820 报告为 usable 的页全部放进空闲链表，但低 1MB 里塞着启动期结构：0x70000-0x72FFF 的四级页表、0x90000 机器参数区、0x9E000 的 E820 数组。E820 并不把这些标为 reserved，于是分配器第一次就把 PML4/PDPT/PD 所在的页派了出去，get_free_page 的清零动作直接抹掉当前 cr3 指向的页表，导致三重错误。另外 mem_map 表体紧贴内核镜像（约 0x48000）向后放，表一大就会自己盖住 0x70000 的页表。",
+      "fix": "在 page_alloc.rs 加 MIN_USABLE_PHYS = 0x100000：(1) mem_map 基址用 page_align(kernel_end).max(MIN_USABLE_PHYS)，保证表体在 1MB 之上；(2) 空闲页下界 map_end 同样 .max(MIN_USABLE_PHYS)，整个低 1MB 永不进空闲链表。原版靠 mem_init 的 start_low_mem 参数和 0xA0000 硬编码绕开这块，我们没有等价参数，索引干脆整块保留。",
+      "tags": ["mm", "page-alloc", "triple-fault", "e820", "paging", "boot"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T03:30:00Z"
+    }
+  ]
+}

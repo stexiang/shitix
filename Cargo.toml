@@ -3,4 +3,19 @@ name = "shitix"
 version = "0.1.0"
 edition = "2024"
 
+# 内核编译成静态库，再由 ld 和 boot/head.S 一起链接成 system 二进制
+[lib]
+name = "shitix"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
 [dependencies]
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "const_fn"] }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true

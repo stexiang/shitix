@@ -1,0 +1,4540 @@
+{
+  "version": 1,
+  "meta": {
+    "lastScanned": "2026-08-01T19:00:20.316Z",
+    "fileCount": 503,
+    "hits": 0,
+    "misses": 0,
+    "renderedHash": "c4ac068fd644e43cf7e571b31d293d3d6c7f3461ba84b19be7935cb57ed09fb2",
+    "storeUpdatedAt": "2026-08-01T19:00:20.319Z"
+  },
+  "files": {
+    ".claude/commands/reframe.md": {
+      "description": "Mode: migrate [framework]",
+      "tokens": 551,
+      "hash": "17a75695be5d4629",
+      "size": 2221,
+      "mtimeMs": 1785610820182.8115,
+      "updatedAt": "2026-08-01T19:00:20.203Z",
+      "source": "scan"
+    },
+    ".claude/commands/security-audit.md": {
+      "description": "Layer 1 — Dependencies",
+      "tokens": 510,
+      "hash": "e6f7e0b7337c9c86",
+      "size": 2060,
+      "mtimeMs": 1785610820182.8115,
+      "updatedAt": "2026-08-01T19:00:20.203Z",
+      "source": "scan"
+    },
+    ".claude/rules/openwolf.md": {
+      "description": "",
+      "tokens": 328,
+      "hash": "6d735b2c1c54a916",
+      "size": 1323,
+      "mtimeMs": 1785610819434.757,
+      "updatedAt": "2026-08-01T19:00:20.204Z",
+      "source": "scan"
+    },
+    ".claude/settings.json": {
+      "description": "",
+      "tokens": 514,
+      "hash": "f68759bb50af5ee4",
+      "size": 1799,
+      "mtimeMs": 1785610819430.7568,
+      "updatedAt": "2026-08-01T19:00:20.204Z",
+      "source": "scan"
+    },
+    ".claude/settings.local.json": {
+      "description": "",
+      "tokens": 152,
+      "hash": "f2b1d932d16e1867",
+      "size": 532,
+      "mtimeMs": 1785610574920.982,
+      "updatedAt": "2026-08-01T19:00:20.205Z",
+      "source": "scan"
+    },
+    ".cursor/rules/openwolf.mdc": {
+      "description": "",
+      "tokens": 87,
+      "hash": "25a895da2047ef4d",
+      "size": 323,
+      "mtimeMs": 1785610820178.811,
+      "updatedAt": "2026-08-01T19:00:20.205Z",
+      "source": "scan"
+    },
+    ".gitignore": {
+      "description": "Git ignore rules",
+      "tokens": 3,
+      "hash": "44c92e3a70ad3307",
+      "size": 8,
+      "mtimeMs": 1785603447365.7124,
+      "updatedAt": "2026-08-01T19:00:20.205Z",
+      "source": "scan"
+    },
+    "boot/bootsect.ld": {
+      "description": "",
+      "tokens": 62,
+      "hash": "c63db9cbd98569f6",
+      "size": 302,
+      "mtimeMs": 1785610201169.7856,
+      "updatedAt": "2026-08-01T19:00:20.205Z",
+      "source": "scan"
+    },
+    "boot/bootsect.S": {
+      "description": "",
+      "tokens": 1074,
+      "hash": "8602bf289bd9b295",
+      "size": 4538,
+      "mtimeMs": 1785610092473.867,
+      "updatedAt": "2026-08-01T19:00:20.206Z",
+      "source": "scan"
+    },
+    "boot/head.S": {
+      "description": "",
+      "tokens": 802,
+      "hash": "e909ddc9392d6f57",
+      "size": 3740,
+      "mtimeMs": 1785610468865.2686,
+      "updatedAt": "2026-08-01T19:00:20.206Z",
+      "source": "scan"
+    },
+    "boot/kernel.ld": {
+      "description": "",
+      "tokens": 171,
+      "hash": "e4f8ac98c7efe075",
+      "size": 699,
+      "mtimeMs": 1785610215738.8467,
+      "updatedAt": "2026-08-01T19:00:20.206Z",
+      "source": "scan"
+    },
+    "boot/setup.ld": {
+      "description": "",
+      "tokens": 52,
+      "hash": "0eca41da9cff4758",
+      "size": 219,
+      "mtimeMs": 1785610205578.1067,
+      "updatedAt": "2026-08-01T19:00:20.206Z",
+      "source": "scan"
+    },
+    "boot/setup.S": {
+      "description": "",
+      "tokens": 1260,
+      "hash": "6441e6ffa5d4d6c2",
+      "size": 5473,
+      "mtimeMs": 1785610151478.1663,
+      "updatedAt": "2026-08-01T19:00:20.207Z",
+      "source": "scan"
+    },
+    "Cargo.toml": {
+      "description": "Rust package manifest",
+      "tokens": 82,
+      "hash": "e5a858ccc45d55c3",
+      "size": 326,
+      "mtimeMs": 1785610302417.1572,
+      "updatedAt": "2026-08-01T19:00:20.207Z",
+      "source": "scan"
+    },
+    "CLAUDE.md": {
+      "description": "OpenWolf",
+      "tokens": 364,
+      "hash": "cd0a2a88737359eb",
+      "size": 2028,
+      "mtimeMs": 1785610819434.757,
+      "updatedAt": "2026-08-01T19:00:20.207Z",
+      "source": "scan"
+    },
+    "linux/boot/bootsect.S": {
+      "description": "Declares 0x08",
+      "tokens": 2450,
+      "hash": "6ec0a7aeb656711f",
+      "size": 9187,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.207Z",
+      "source": "scan"
+    },
+    "linux/boot/head.S": {
+      "description": "andl: paging",
+      "tokens": 2307,
+      "hash": "0d3f6ce52fc0e28c",
+      "size": 8651,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.208Z",
+      "source": "scan"
+    },
+    "linux/boot/setup.S": {
+      "description": "Declares of",
+      "tokens": 4718,
+      "hash": "86363fd538dc6527",
+      "size": 17689,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.210Z",
+      "source": "scan"
+    },
+    "linux/CHANGES": {
+      "description": "Declares key",
+      "tokens": 1675,
+      "hash": "f9b59181be7a5bc8",
+      "size": 6281,
+      "mtimeMs": 1785601238148.346,
+      "updatedAt": "2026-08-01T19:00:20.210Z",
+      "source": "scan"
+    },
+    "linux/config.in": {
+      "description": "For a description of the syntax of this configuration file,",
+      "tokens": 1239,
+      "hash": "8fbcf30773cf6f64",
+      "size": 4645,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.210Z",
+      "source": "scan"
+    },
+    "linux/Configure": {
+      "description": "This script is used to configure the linux kernel.",
+      "tokens": 1573,
+      "hash": "4415af18de083ef9",
+      "size": 5898,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.210Z",
+      "source": "scan"
+    },
+    "linux/COPYING": {
+      "description": "Declares definition",
+      "tokens": 4923,
+      "hash": "ed71cfca021790f7",
+      "size": 18458,
+      "mtimeMs": 1785601238148.346,
+      "updatedAt": "2026-08-01T19:00:20.211Z",
+      "source": "scan"
+    },
+    "linux/CREDITS": {
+      "description": "",
+      "tokens": 3617,
+      "hash": "5cd7be2148edf9e4",
+      "size": 13561,
+      "mtimeMs": 1785601238148.346,
+      "updatedAt": "2026-08-01T19:00:20.211Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/blk.h": {
+      "description": "ifndef _BLK_H",
+      "tokens": 2265,
+      "hash": "77941fbe760f720a",
+      "size": 7926,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.212Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/cdu31a.c": {
+      "description": "Declares device",
+      "tokens": 14601,
+      "hash": "7a1ad09038294060",
+      "size": 51103,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.212Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/floppy.c": {
+      "description": "Declares has",
+      "tokens": 10234,
+      "hash": "9719c4199d70db65",
+      "size": 35817,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.212Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/genhd.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 1762,
+      "hash": "e2e828fd6213008c",
+      "size": 6167,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.213Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/hd.c": {
+      "description": "",
+      "tokens": 5182,
+      "hash": "4a432e31044ae439",
+      "size": 18134,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.213Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/ll_rw_blk.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 3326,
+      "hash": "d8d9ef0d9f3d8103",
+      "size": 11639,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.213Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/Makefile": {
+      "description": "Make build targets",
+      "tokens": 333,
+      "hash": "1fd2a76f9f90d807",
+      "size": 1246,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.214Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/mcd.c": {
+      "description": "",
+      "tokens": 7136,
+      "hash": "55e21232d8361b40",
+      "size": 24973,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.214Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/ramdisk.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 1249,
+      "hash": "97cd0906f858eec1",
+      "size": 4371,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.214Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/README.sbpcd": {
+      "description": "type: changed",
+      "tokens": 2092,
+      "hash": "4e2f9487b0309895",
+      "size": 7845,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.214Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/sbpcd.c": {
+      "description": "Declares cards",
+      "tokens": 23514,
+      "hash": "a72c407bff23cedf",
+      "size": 82299,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.215Z",
+      "source": "scan"
+    },
+    "linux/drivers/block/xd.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 6739,
+      "hash": "42c566a8dcbf652f",
+      "size": 23584,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.215Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/atixlmouse.c": {
+      "description": "include <linux/kernel.h>",
+      "tokens": 1511,
+      "hash": "52bf39e738c40af5",
+      "size": 5288,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.215Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/busmouse.c": {
+      "description": "Declares with",
+      "tokens": 1560,
+      "hash": "65852a12bdb2d3a9",
+      "size": 5458,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.216Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/console.c": {
+      "description": "Declares by",
+      "tokens": 14153,
+      "hash": "91288cc38f2568a7",
+      "size": 49533,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.216Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/defkeymap.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 5783,
+      "hash": "3f5be340fd03872b",
+      "size": 20239,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.216Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/defkeymap.map": {
+      "description": "",
+      "tokens": 2847,
+      "hash": "0aec4370eb8a7762",
+      "size": 10676,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.217Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/diacr.h": {
+      "description": "ifndef _DIACR_H",
+      "tokens": 45,
+      "hash": "3260be58d61f0f1b",
+      "size": 157,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.217Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/kbd_kern.h": {
+      "description": "ifndef _KBD_KERN_H",
+      "tokens": 790,
+      "hash": "d076ecaead801069",
+      "size": 2762,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.217Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/keyboard.c": {
+      "description": "define KEYBOARD_IRQ 1",
+      "tokens": 6029,
+      "hash": "b60dead00f734b90",
+      "size": 21101,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.217Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/lp.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 3116,
+      "hash": "c1ec85e53076b71d",
+      "size": 10904,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.218Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/Makefile": {
+      "description": "Make build targets",
+      "tokens": 391,
+      "hash": "3478e4a25fafdc6b",
+      "size": 1463,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.218Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/mem.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 2726,
+      "hash": "ab4bbbd95dc360d8",
+      "size": 9539,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.218Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/mouse.c": {
+      "description": "",
+      "tokens": 756,
+      "hash": "266489c2b27e95e9",
+      "size": 2646,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.218Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/msbusmouse.c": {
+      "description": "Declares to",
+      "tokens": 1323,
+      "hash": "ace6a8b2fba2f074",
+      "size": 4629,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.218Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/psaux.c": {
+      "description": "Declares mouse",
+      "tokens": 3817,
+      "hash": "9d532866e7917653",
+      "size": 13359,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.219Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/pty.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 775,
+      "hash": "15d78a200a4bf109",
+      "size": 2710,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.219Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/serial.c": {
+      "description": "Declares fields",
+      "tokens": 15560,
+      "hash": "58f89e0ae892bd3e",
+      "size": 54459,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.219Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/tpqic02.c": {
+      "description": "Declares for",
+      "tokens": 22984,
+      "hash": "15dbcc6dbe23b939",
+      "size": 80442,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.221Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/tty_io.c": {
+      "description": "Declares is",
+      "tokens": 13453,
+      "hash": "c88d0c1d646458e3",
+      "size": 47083,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.221Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/tty_ioctl.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 4936,
+      "hash": "9fa63c0e15a919e3",
+      "size": 17273,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.222Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/vt_kern.h": {
+      "description": "ifndef _VT_KERN_H",
+      "tokens": 144,
+      "hash": "45f28885e9b5bd54",
+      "size": 501,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.222Z",
+      "source": "scan"
+    },
+    "linux/drivers/char/vt.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 4123,
+      "hash": "10cd217c2484a87e",
+      "size": 14428,
+      "mtimeMs": 1785601238160.3467,
+      "updatedAt": "2026-08-01T19:00:20.222Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/control_w.h": {
+      "description": "",
+      "tokens": 519,
+      "hash": "4de54d08f0367328",
+      "size": 1815,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.222Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/div_small.S": {
+      "description": "",
+      "tokens": 398,
+      "hash": "9bf8553d33c79745",
+      "size": 1492,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.222Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/errors.c": {
+      "description": "Declares 0x",
+      "tokens": 4734,
+      "hash": "855d7be07f0d6a02",
+      "size": 16569,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.223Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/exception.h": {
+      "description": "",
+      "tokens": 514,
+      "hash": "c909136f7f98fb28",
+      "size": 1798,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.223Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_arith.c": {
+      "description": "",
+      "tokens": 1057,
+      "hash": "7dcfe6d25c42725f",
+      "size": 3698,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.223Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_asm.h": {
+      "description": "",
+      "tokens": 267,
+      "hash": "54b63227a188e094",
+      "size": 934,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.223Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_aux.c": {
+      "description": "Declares finit_table",
+      "tokens": 1104,
+      "hash": "9ef63708ef361a5e",
+      "size": 3862,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.223Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_emu.h": {
+      "description": "Declares x",
+      "tokens": 1672,
+      "hash": "5086179ded6ee1db",
+      "size": 5849,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.223Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_entry.c": {
+      "description": "Declares for",
+      "tokens": 5441,
+      "hash": "f4df558b660eb614",
+      "size": 19043,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.224Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_etc.c": {
+      "description": "Declares fp_etc_table",
+      "tokens": 857,
+      "hash": "86c74681a0c62a2f",
+      "size": 2998,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.224Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_proto.h": {
+      "description": "",
+      "tokens": 1136,
+      "hash": "50bda7fce03ce4c1",
+      "size": 3973,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.224Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_system.h": {
+      "description": "",
+      "tokens": 735,
+      "hash": "d9772d34f2012ffe",
+      "size": 2572,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.224Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/fpu_trig.c": {
+      "description": "",
+      "tokens": 11667,
+      "hash": "2ad9cf9452840977",
+      "size": 40832,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.224Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/get_address.c": {
+      "description": "Declares assumes",
+      "tokens": 2431,
+      "hash": "319b1b5a00bc4454",
+      "size": 8506,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.224Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/load_store.c": {
+      "description": "Declares type_table",
+      "tokens": 2082,
+      "hash": "0847fbdb7a34d29d",
+      "size": 7284,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/Makefile": {
+      "description": "Make build targets",
+      "tokens": 268,
+      "hash": "51ddf1cd9fcd611c",
+      "size": 1004,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_2xm1.c": {
+      "description": "Declares lterms",
+      "tokens": 804,
+      "hash": "506e85102852f045",
+      "size": 2811,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_atan.c": {
+      "description": "Declares oddnegterms",
+      "tokens": 1718,
+      "hash": "fed8012a68a7c0c0",
+      "size": 6012,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_div.S": {
+      "description": "",
+      "tokens": 615,
+      "hash": "ca69822bee73d6d5",
+      "size": 2304,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_l2.c": {
+      "description": "Declares lterms",
+      "tokens": 2275,
+      "hash": "8b075525767e974f",
+      "size": 7961,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_mul64.S": {
+      "description": "",
+      "tokens": 464,
+      "hash": "5d1c5bc43b63a1c0",
+      "size": 1739,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_sin.c": {
+      "description": "Declares by",
+      "tokens": 1309,
+      "hash": "bb16f3b14efe5aa2",
+      "size": 4580,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.225Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/poly_tan.c": {
+      "description": "Declares oddplterms",
+      "tokens": 1436,
+      "hash": "9be2a2518baf6615",
+      "size": 5023,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.226Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/polynomial.S": {
+      "description": "",
+      "tokens": 997,
+      "hash": "a2b34009605d646b",
+      "size": 3736,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.226Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/README": {
+      "description": "Declares to",
+      "tokens": 4275,
+      "hash": "fe49e6bd2ff19f68",
+      "size": 16031,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.226Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_add_sub.c": {
+      "description": "",
+      "tokens": 2204,
+      "hash": "3d6a6ec4ad90bd8e",
+      "size": 7711,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.226Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_compare.c": {
+      "description": "Declares requires",
+      "tokens": 2298,
+      "hash": "930a16ff294b28c8",
+      "size": 8040,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_constant.c": {
+      "description": "Declares CONST_1",
+      "tokens": 971,
+      "hash": "6990513f293dfb60",
+      "size": 3397,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_constant.h": {
+      "description": "Declares CONST_1",
+      "tokens": 334,
+      "hash": "de51f5863aee7f39",
+      "size": 1167,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_div.S": {
+      "description": "",
+      "tokens": 1458,
+      "hash": "9c8e8065df71c53a",
+      "size": 5464,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_ld_str.c": {
+      "description": "Declares must",
+      "tokens": 10579,
+      "hash": "21bcc69fcb704d25",
+      "size": 37024,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_mul.c": {
+      "description": "",
+      "tokens": 934,
+      "hash": "56d49d3e1ec10394",
+      "size": 3266,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_norm.S": {
+      "description": "",
+      "tokens": 862,
+      "hash": "17cf7941e98d2fcc",
+      "size": 3232,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.227Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_round.S": {
+      "description": "Declares must",
+      "tokens": 4714,
+      "hash": "f8907131fdaefbd0",
+      "size": 17675,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_u_add.S": {
+      "description": "",
+      "tokens": 1115,
+      "hash": "7f3ad51d38c21d82",
+      "size": 4180,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_u_div.S": {
+      "description": "",
+      "tokens": 3251,
+      "hash": "b347e98c321ac606",
+      "size": 12190,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_u_mul.S": {
+      "description": "",
+      "tokens": 1004,
+      "hash": "b183826e89ab67ef",
+      "size": 3764,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/reg_u_sub.S": {
+      "description": "",
+      "tokens": 1704,
+      "hash": "de923eb48c0d7563",
+      "size": 6387,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/status_w.h": {
+      "description": "",
+      "tokens": 710,
+      "hash": "60efe41d7fb01cbf",
+      "size": 2483,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/version.h": {
+      "description": "",
+      "tokens": 242,
+      "hash": "7a4430f9442ee34c",
+      "size": 844,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.228Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/wm_shrx.S": {
+      "description": "",
+      "tokens": 1642,
+      "hash": "82485d05efb0e359",
+      "size": 6156,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.229Z",
+      "source": "scan"
+    },
+    "linux/drivers/FPU-emu/wm_sqrt.S": {
+      "description": "",
+      "tokens": 2922,
+      "hash": "d25a0add445656f3",
+      "size": 10954,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.229Z",
+      "source": "scan"
+    },
+    "linux/drivers/Makefile": {
+      "description": "Make build targets",
+      "tokens": 242,
+      "hash": "d592ea1dee79d125",
+      "size": 904,
+      "mtimeMs": 1785601238156.3464,
+      "updatedAt": "2026-08-01T19:00:20.229Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/3c501.c": {
+      "description": "Declares interrupts",
+      "tokens": 4232,
+      "hash": "b540b58752e6ae60",
+      "size": 14811,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.229Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/3c503.c": {
+      "description": "Declares unsigned",
+      "tokens": 3889,
+      "hash": "0bd815a2b8aab580",
+      "size": 13611,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.229Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/3c503.h": {
+      "description": "",
+      "tokens": 778,
+      "hash": "d3fb4760907e34fb",
+      "size": 2720,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.230Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/3c507.c": {
+      "description": "Declares commands",
+      "tokens": 8077,
+      "hash": "0e9239992b4f0896",
+      "size": 28269,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.230Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/3c509.c": {
+      "description": "",
+      "tokens": 5532,
+      "hash": "cfd8c4b5d7235f38",
+      "size": 19361,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.230Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/8390.c": {
+      "description": "Declares interfaces",
+      "tokens": 7010,
+      "hash": "ce31251f2adfb1f1",
+      "size": 24534,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.230Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/8390.h": {
+      "description": "Declares unsigned",
+      "tokens": 1975,
+      "hash": "2c83523e3cbf460d",
+      "size": 6910,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.231Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/at1700.c": {
+      "description": "Declares prototypes",
+      "tokens": 5379,
+      "hash": "8811908046d8e609",
+      "size": 18826,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.231Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/atp.c": {
+      "description": "Declares prototypes",
+      "tokens": 7176,
+      "hash": "c3321b57436d33e3",
+      "size": 25116,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.232Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/atp.h": {
+      "description": "include <linux/if_ether.h>",
+      "tokens": 2502,
+      "hash": "3ea5699a07bc754c",
+      "size": 8755,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.232Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/auto_irq.c": {
+      "description": "",
+      "tokens": 1020,
+      "hash": "094eb17a64979f11",
+      "size": 3570,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.232Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/CONFIG": {
+      "description": "This file is used for selecting non-standard netcard options, and",
+      "tokens": 611,
+      "hash": "b3621d53e762d3e4",
+      "size": 2291,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.232Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/d_link.c": {
+      "description": "Declares prototypes",
+      "tokens": 5934,
+      "hash": "3c1f8fe777472b56",
+      "size": 20769,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.233Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/depca.c": {
+      "description": "",
+      "tokens": 12125,
+      "hash": "ef60eea432402085",
+      "size": 42437,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.233Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/depca.h": {
+      "description": "Declares CSR",
+      "tokens": 1250,
+      "hash": "c87c31914f7cefdf",
+      "size": 4372,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.233Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/eexpress.c": {
+      "description": "Declares commands",
+      "tokens": 9486,
+      "hash": "2dd22e3bcfa13da3",
+      "size": 33198,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.233Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/hp.c": {
+      "description": "unsigned: done",
+      "tokens": 2842,
+      "hash": "c63510e815b52678",
+      "size": 9944,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.234Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/iow.h": {
+      "description": "ifndef _ASM_IOW_H",
+      "tokens": 20,
+      "hash": "79caf2732fd5391b",
+      "size": 68,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.234Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/lance.c": {
+      "description": "",
+      "tokens": 7769,
+      "hash": "541123feea0a2985",
+      "size": 27190,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.234Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/LICENSE.SRC": {
+      "description": "",
+      "tokens": 236,
+      "hash": "234ea9142570e972",
+      "size": 883,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.234Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/Makefile": {
+      "description": "Make build targets",
+      "tokens": 884,
+      "hash": "7adbee675841fc31",
+      "size": 3314,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.234Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/ne.c": {
+      "description": "Declares int",
+      "tokens": 3996,
+      "hash": "c6278151c2d599fa",
+      "size": 13983,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.234Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/net_init.c": {
+      "description": "Declares port",
+      "tokens": 1356,
+      "hash": "ff21c1d0a460f1c2",
+      "size": 4743,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.235Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/plip.c": {
+      "description": "Declares octet",
+      "tokens": 6455,
+      "hash": "bbb2db3cb934a176",
+      "size": 22590,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.235Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/README.DLINK": {
+      "description": "",
+      "tokens": 1916,
+      "hash": "53014f3844ceaea4",
+      "size": 7183,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.235Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/README1.PLIP": {
+      "description": "Declares allows",
+      "tokens": 1075,
+      "hash": "7eb70ee6b8c0e1fa",
+      "size": 4029,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.235Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/README2.PLIP": {
+      "description": "",
+      "tokens": 680,
+      "hash": "e5fc4cb1f4b7bbb1",
+      "size": 2550,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.235Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/skeleton.c": {
+      "description": "Declares prototypes",
+      "tokens": 4089,
+      "hash": "ce135ca5a8f9f449",
+      "size": 14310,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.235Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/slhc.c": {
+      "description": "Declares of",
+      "tokens": 5388,
+      "hash": "e7bba2423f44f999",
+      "size": 18856,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.236Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/slhc.h": {
+      "description": "ifndef _SLHC_H",
+      "tokens": 1988,
+      "hash": "64631d95ed0e74df",
+      "size": 6958,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.236Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/slip.c": {
+      "description": "",
+      "tokens": 8166,
+      "hash": "7690b1ee544de733",
+      "size": 28579,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.236Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/slip.h": {
+      "description": "ifndef _LINUX_SLIP_H",
+      "tokens": 824,
+      "hash": "9f11f200e5fc9d77",
+      "size": 2883,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.236Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/smc-ultra.c": {
+      "description": "Declares unsigned",
+      "tokens": 2148,
+      "hash": "1890811cc808e1aa",
+      "size": 7516,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.236Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/Space.c": {
+      "description": "Declares as",
+      "tokens": 2362,
+      "hash": "87747ba89ffd4ac5",
+      "size": 8267,
+      "mtimeMs": 1785601238164.347,
+      "updatedAt": "2026-08-01T19:00:20.237Z",
+      "source": "scan"
+    },
+    "linux/drivers/net/wd.c": {
+      "description": "Declares unsigned",
+      "tokens": 3468,
+      "hash": "b59d332ebe292e33",
+      "size": 12137,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.237Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/aha152x.c": {
+      "description": "Declares bodies",
+      "tokens": 18384,
+      "hash": "4b363b334699fffb",
+      "size": 64342,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.238Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/aha152x.h": {
+      "description": "ifndef _AHA152X_H",
+      "tokens": 2573,
+      "hash": "8bb33372874030de",
+      "size": 9003,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.238Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/aha1542.c": {
+      "description": "include <linux/kernel.h>",
+      "tokens": 7776,
+      "hash": "246871b7975143bf",
+      "size": 27214,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.238Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/aha1542.h": {
+      "description": "ifndef _AHA1542_H",
+      "tokens": 1402,
+      "hash": "72bf2c12744bba6e",
+      "size": 4904,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.238Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/aha1740.c": {
+      "description": "Declares char",
+      "tokens": 4239,
+      "hash": "c2dde31ddce047c9",
+      "size": 14836,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.238Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/aha1740.h": {
+      "description": "ifndef _AHA1740_H",
+      "tokens": 1652,
+      "hash": "140d3df4a2ae8ca5",
+      "size": 5781,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.239Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/constants.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 5821,
+      "hash": "d211eccb2967a504",
+      "size": 20373,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.239Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/constants.h": {
+      "description": "ifndef _CONSTANTS_H",
+      "tokens": 67,
+      "hash": "5ef300ae2b2a4c23",
+      "size": 234,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.239Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/fdomain.c": {
+      "description": "Declares after",
+      "tokens": 14630,
+      "hash": "3b0dc8e2696c3092",
+      "size": 51205,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.239Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/fdomain.h": {
+      "description": "Declares char",
+      "tokens": 557,
+      "hash": "830503d3faa688f7",
+      "size": 1948,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.239Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/g_NCR5380.c": {
+      "description": "define AUTOSENSE",
+      "tokens": 1338,
+      "hash": "7ab1ce59cca94040",
+      "size": 4680,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.240Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/g_NCR5380.h": {
+      "description": "Declares char",
+      "tokens": 535,
+      "hash": "21091d10fa29b53d",
+      "size": 1871,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.240Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/hosts.c": {
+      "description": "Declares by",
+      "tokens": 1985,
+      "hash": "2ebb6a43d5a3e7cd",
+      "size": 6945,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.240Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/hosts.h": {
+      "description": "Declares header",
+      "tokens": 2149,
+      "hash": "c843454e3fa1f1ca",
+      "size": 7520,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.240Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/Makefile": {
+      "description": "Make build targets",
+      "tokens": 725,
+      "hash": "b1ec840d5799efc4",
+      "size": 2717,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.240Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/NCR5380.c": {
+      "description": "Declares and",
+      "tokens": 21798,
+      "hash": "9e8bf0181b7306c5",
+      "size": 76291,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.241Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/NCR5380.h": {
+      "description": "Declares returns",
+      "tokens": 2919,
+      "hash": "52dc3dcb70e8f64c",
+      "size": 10215,
+      "mtimeMs": 1785601238168.3474,
+      "updatedAt": "2026-08-01T19:00:20.241Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/pas16.c": {
+      "description": "define AUTOSENSE",
+      "tokens": 3853,
+      "hash": "dadce8387738d7c1",
+      "size": 13483,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.241Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/pas16.h": {
+      "description": "Declares char",
+      "tokens": 1449,
+      "hash": "2f3a68e6fd8cb908",
+      "size": 5069,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.241Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/scsi_debug.c": {
+      "description": "include <linux/kernel.h>",
+      "tokens": 4096,
+      "hash": "20299ef0ae8fb830",
+      "size": 14336,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.242Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/scsi_debug.h": {
+      "description": "ifndef _SCSI_DEBUG_H",
+      "tokens": 191,
+      "hash": "61854969b758ca8d",
+      "size": 667,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.242Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/scsi_ioctl.c": {
+      "description": "include <asm/io.h>",
+      "tokens": 2496,
+      "hash": "eae745927b396d88",
+      "size": 8734,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.242Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/scsi_ioctl.h": {
+      "description": "ifndef _SCSI_IOCTL_H",
+      "tokens": 164,
+      "hash": "dd74c84d3dd73c5f",
+      "size": 574,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.242Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/scsi.c": {
+      "description": "Declares char",
+      "tokens": 12940,
+      "hash": "79745707d1115b1f",
+      "size": 45288,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.243Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/scsi.h": {
+      "description": "ifndef _SCSI_H",
+      "tokens": 4041,
+      "hash": "5ade4f10f0b279a6",
+      "size": 14143,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.243Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sd_ioctl.c": {
+      "description": "include <linux/kernel.h>",
+      "tokens": 534,
+      "hash": "0200c2413fa9190a",
+      "size": 1869,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.244Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sd.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 8012,
+      "hash": "cca5fc27549c64e9",
+      "size": 28042,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.244Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sd.h": {
+      "description": "ifndef _SD_H",
+      "tokens": 334,
+      "hash": "1e427171d24e020d",
+      "size": 1168,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.244Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/seagate.c": {
+      "description": "Declares void",
+      "tokens": 12044,
+      "hash": "d2234818ac9daf9e",
+      "size": 42154,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.244Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/seagate.h": {
+      "description": "ifndef _SEAGATE_H",
+      "tokens": 814,
+      "hash": "7c7b6a4bb37a31c7",
+      "size": 2846,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.244Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sg.c": {
+      "description": "",
+      "tokens": 2517,
+      "hash": "65ea5874ab42bf8e",
+      "size": 8809,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.245Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sg.h": {
+      "description": "",
+      "tokens": 311,
+      "hash": "6df6852e31517687",
+      "size": 1088,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.245Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sr_ioctl.c": {
+      "description": "include <linux/kernel.h>",
+      "tokens": 3098,
+      "hash": "766971802a470b6e",
+      "size": 10842,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.245Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sr.c": {
+      "description": "Declares checks",
+      "tokens": 6375,
+      "hash": "5c957a7d5771606b",
+      "size": 22310,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.245Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/sr.h": {
+      "description": "",
+      "tokens": 285,
+      "hash": "64bf83fa3e86bb56",
+      "size": 996,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.245Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/st.c": {
+      "description": "",
+      "tokens": 11417,
+      "hash": "77507fd8d35a21fa",
+      "size": 39957,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.245Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/st.h": {
+      "description": "ifndef _ST_H",
+      "tokens": 319,
+      "hash": "36d9427daaeefd06",
+      "size": 1115,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.246Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/t128.c": {
+      "description": "define AUTOSENSE",
+      "tokens": 2978,
+      "hash": "4a6a791dba96b3ca",
+      "size": 10420,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.246Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/t128.h": {
+      "description": "Declares char",
+      "tokens": 1301,
+      "hash": "4e625051b4956a97",
+      "size": 4552,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.246Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/ultrastor.c": {
+      "description": "Declares for",
+      "tokens": 9434,
+      "hash": "9c2f2163ceecdbb9",
+      "size": 33018,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.246Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/ultrastor.h": {
+      "description": "ifndef _ULTRASTOR_H",
+      "tokens": 617,
+      "hash": "f9a30975701312f9",
+      "size": 2157,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.246Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/wd7000.c": {
+      "description": "include <stdarg.h>",
+      "tokens": 4564,
+      "hash": "f6179e718c8a62a2",
+      "size": 15971,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.247Z",
+      "source": "scan"
+    },
+    "linux/drivers/scsi/wd7000.h": {
+      "description": "ifndef _WD7000_H",
+      "tokens": 1732,
+      "hash": "328e8e60b86d6597",
+      "size": 6060,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.247Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/.blurb": {
+      "description": "",
+      "tokens": 119,
+      "hash": "272ee3c502d81e1c",
+      "size": 446,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.247Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/.indent.pro": {
+      "description": "",
+      "tokens": 12,
+      "hash": "df7dcad1d124c15e",
+      "size": 44,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.247Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/adlib_card.c": {
+      "description": "",
+      "tokens": 503,
+      "hash": "da868aca4fb51ba9",
+      "size": 1760,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.247Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/audio.c": {
+      "description": "Declares unsigned",
+      "tokens": 2121,
+      "hash": "255c6d07e9833a94",
+      "size": 7421,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.248Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/CHANGELOG": {
+      "description": "",
+      "tokens": 614,
+      "hash": "fe4248619fa16894",
+      "size": 2302,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.248Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/configure.c": {
+      "description": "Declares of",
+      "tokens": 4486,
+      "hash": "a55d5cdd978a706a",
+      "size": 15700,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.248Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/COPYING": {
+      "description": "",
+      "tokens": 356,
+      "hash": "7b658defc070f75b",
+      "size": 1335,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.248Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/dev_table.c": {
+      "description": "",
+      "tokens": 1564,
+      "hash": "cae409362538098d",
+      "size": 5471,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.248Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/dev_table.h": {
+      "description": "UWM -- new  MIDI structure here.. *",
+      "tokens": 2473,
+      "hash": "bb1f239f346f824f",
+      "size": 8655,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.248Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/dma.h": {
+      "description": "ifndef _ASM_DMA_H",
+      "tokens": 2616,
+      "hash": "b8322bec179f0e53",
+      "size": 9154,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.249Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/dmabuf.c": {
+      "description": "",
+      "tokens": 5674,
+      "hash": "5fed6f4f4623a5d3",
+      "size": 19858,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.249Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/finetune.h": {
+      "description": "ifdef SEQUENCER_C",
+      "tokens": 723,
+      "hash": "cbdd5ad12f2796f4",
+      "size": 2529,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.249Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/gus_card.c": {
+      "description": "",
+      "tokens": 1010,
+      "hash": "885f1d700bf814ab",
+      "size": 3532,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.249Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/gus_hw.h": {
+      "description": "define u_Base\t\t\t(gus_base + 0x000)",
+      "tokens": 348,
+      "hash": "39ff70be7e1775ad",
+      "size": 1215,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.249Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/gus_midi.c": {
+      "description": "",
+      "tokens": 1635,
+      "hash": "5839a4f84ba16a6f",
+      "size": 5721,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.250Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/gus_vol.c": {
+      "description": "include \"sound_config.h\"",
+      "tokens": 736,
+      "hash": "d959e55a9d1bafc6",
+      "size": 2573,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.250Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/gus_wave.c": {
+      "description": "",
+      "tokens": 20590,
+      "hash": "8a34578ae68c147c",
+      "size": 72062,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.250Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/Makefile": {
+      "description": "Make build targets",
+      "tokens": 488,
+      "hash": "0cce20d58dfd3a53",
+      "size": 1830,
+      "mtimeMs": 1785601238172.3477,
+      "updatedAt": "2026-08-01T19:00:20.250Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/midibuf.c": {
+      "description": "Declares not",
+      "tokens": 831,
+      "hash": "4456bf1da88b14af",
+      "size": 2907,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.251Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/mpu401.c": {
+      "description": "",
+      "tokens": 2032,
+      "hash": "a8b60788f613fa32",
+      "size": 7110,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.251Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/opl3.c": {
+      "description": "Declares returns",
+      "tokens": 6854,
+      "hash": "6fe7816102507762",
+      "size": 23986,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.251Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/opl3.h": {
+      "description": "",
+      "tokens": 2315,
+      "hash": "11aa7ec528c5ed05",
+      "size": 8100,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.251Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/os.h": {
+      "description": "Declares is",
+      "tokens": 1676,
+      "hash": "4b8898222b6d6f59",
+      "size": 5866,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.251Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/pas.h": {
+      "description": "Declares PCM",
+      "tokens": 4616,
+      "hash": "13ad81b2b54253e7",
+      "size": 16153,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.252Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/pas2_card.c": {
+      "description": "**************** Begin of the Interrupt Handler *******************",
+      "tokens": 2649,
+      "hash": "5bf583e74d6d7267",
+      "size": 9270,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.252Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/pas2_midi.c": {
+      "description": "",
+      "tokens": 1746,
+      "hash": "8bdef781223af7a1",
+      "size": 6110,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.252Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/pas2_mixer.c": {
+      "description": "define _PAS2_MIXER_C_",
+      "tokens": 4193,
+      "hash": "e04a749922ce111e",
+      "size": 14674,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.252Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/pas2_pcm.c": {
+      "description": "define _PAS2_PCM_C_",
+      "tokens": 3081,
+      "hash": "7d0fd31899bfa23d",
+      "size": 10783,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.252Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/patmgr.c": {
+      "description": "Declares for",
+      "tokens": 1749,
+      "hash": "40899beec3736b65",
+      "size": 6120,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.252Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/Readme": {
+      "description": "Declares of",
+      "tokens": 2471,
+      "hash": "21bf8399c850dae5",
+      "size": 9266,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.253Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/Readme.linux": {
+      "description": "Declares 1",
+      "tokens": 2200,
+      "hash": "ec2d803c838f8e83",
+      "size": 8249,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.253Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb_card.c": {
+      "description": "",
+      "tokens": 527,
+      "hash": "f680019f2072fd18",
+      "size": 1844,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.253Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb_dsp.c": {
+      "description": "",
+      "tokens": 4426,
+      "hash": "9f6c4af6bb2534dd",
+      "size": 15490,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.253Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb_midi.c": {
+      "description": "",
+      "tokens": 1417,
+      "hash": "92450b1b026dbc27",
+      "size": 4958,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.253Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb_mixer.c": {
+      "description": "",
+      "tokens": 2310,
+      "hash": "d373c5d6cd21a11f",
+      "size": 8085,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.254Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb_mixer.h": {
+      "description": "",
+      "tokens": 1613,
+      "hash": "29346afa92f9c3dd",
+      "size": 5645,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.254Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb.h": {
+      "description": "define DSP_RESET\t(sbc_base + 0x6)",
+      "tokens": 208,
+      "hash": "ec9f432e3b4aa26c",
+      "size": 727,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.254Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb16_dsp.c": {
+      "description": "",
+      "tokens": 3965,
+      "hash": "72152cae77385ed5",
+      "size": 13877,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.254Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sb16_midi.c": {
+      "description": "",
+      "tokens": 2016,
+      "hash": "dcef30b4be569589",
+      "size": 7056,
+      "mtimeMs": 1785601238176.348,
+      "updatedAt": "2026-08-01T19:00:20.254Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sequencer.c": {
+      "description": "",
+      "tokens": 6758,
+      "hash": "306b5ba7cf3dd2ee",
+      "size": 23652,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.256Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sound_calls.h": {
+      "description": "",
+      "tokens": 2000,
+      "hash": "6d92eec165ff1256",
+      "size": 6999,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.256Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sound_config.h": {
+      "description": "UWM - new MIDI stuff *",
+      "tokens": 1555,
+      "hash": "7025a764748891d6",
+      "size": 5441,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.256Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/sound_switch.c": {
+      "description": "",
+      "tokens": 2593,
+      "hash": "94f4aed547599ee6",
+      "size": 9075,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.256Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/soundcard.c": {
+      "description": "",
+      "tokens": 2286,
+      "hash": "066e55be41f1fd2c",
+      "size": 8001,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.256Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/tuning.h": {
+      "description": "ifdef SEQUENCER_C",
+      "tokens": 354,
+      "hash": "a537ea42a17a2998",
+      "size": 1239,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.257Z",
+      "source": "scan"
+    },
+    "linux/drivers/sound/ulaw.h": {
+      "description": "",
+      "tokens": 956,
+      "hash": "ee0c6561c7a351c3",
+      "size": 3343,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.257Z",
+      "source": "scan"
+    },
+    "linux/fs/binfmt_coff.c": {
+      "description": "Declares char",
+      "tokens": 6080,
+      "hash": "aa9fffa0bf9cfb5b",
+      "size": 21278,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.257Z",
+      "source": "scan"
+    },
+    "linux/fs/binfmt_elf.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 5073,
+      "hash": "f65dba13c256702a",
+      "size": 17754,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.257Z",
+      "source": "scan"
+    },
+    "linux/fs/block_dev.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1369,
+      "hash": "2e6ac56a87a542d1",
+      "size": 4790,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.257Z",
+      "source": "scan"
+    },
+    "linux/fs/buffer.c": {
+      "description": "Declares that",
+      "tokens": 7013,
+      "hash": "3f486541474fbdcc",
+      "size": 24545,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.258Z",
+      "source": "scan"
+    },
+    "linux/fs/devices.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 1195,
+      "hash": "a5cecc92935cd19f",
+      "size": 4181,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.258Z",
+      "source": "scan"
+    },
+    "linux/fs/exec.c": {
+      "description": "Declares char",
+      "tokens": 6862,
+      "hash": "4749eddeaa66fb0e",
+      "size": 24017,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.258Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/dir.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 855,
+      "hash": "ccd32864f03aacd9",
+      "size": 2991,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.258Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/file.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1693,
+      "hash": "dda6082ccd454ca9",
+      "size": 5925,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.258Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/freelists.c": {
+      "description": "Declares struct",
+      "tokens": 2892,
+      "hash": "6c6c1caf17ddc315",
+      "size": 10122,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.258Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/fsync.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1009,
+      "hash": "786b7c3d23e89d59",
+      "size": 3531,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.259Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/inode.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 3046,
+      "hash": "e06d5fdaf7bcfe31",
+      "size": 10661,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.259Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/Makefile": {
+      "description": "Make build targets",
+      "tokens": 175,
+      "hash": "bbb0ad79651008ce",
+      "size": 653,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.259Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/namei.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 6364,
+      "hash": "562ca984e831ecaf",
+      "size": 22271,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.259Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/symlink.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 587,
+      "hash": "a082596a152e6c7d",
+      "size": 2052,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.259Z",
+      "source": "scan"
+    },
+    "linux/fs/ext/truncate.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 1513,
+      "hash": "43d7a7002e1511dc",
+      "size": 5293,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.259Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/acl.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 269,
+      "hash": "0a636e2161d6ead2",
+      "size": 940,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/balloc.c": {
+      "description": "Declares reads",
+      "tokens": 5329,
+      "hash": "8411b386c4caf36b",
+      "size": 18651,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/bitmap.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 193,
+      "hash": "0a7cd0ac6a0f112d",
+      "size": 673,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/CHANGES": {
+      "description": "",
+      "tokens": 1522,
+      "hash": "56f87c8171127bd9",
+      "size": 5706,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/dcache.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 2128,
+      "hash": "3715d7a6732a29ff",
+      "size": 7445,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/dir.c": {
+      "description": "",
+      "tokens": 1274,
+      "hash": "04c66a365908e63e",
+      "size": 4456,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/file.c": {
+      "description": "Declares in",
+      "tokens": 1978,
+      "hash": "e903bbefdac5d5e2",
+      "size": 6920,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.260Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/fsync.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1140,
+      "hash": "122bfac93796ebf3",
+      "size": 3987,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.261Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/ialloc.c": {
+      "description": "Declares reads",
+      "tokens": 4639,
+      "hash": "32c178f2e934fd78",
+      "size": 16236,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.261Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/inode.c": {
+      "description": "",
+      "tokens": 4903,
+      "hash": "918b88688f94805c",
+      "size": 17158,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.261Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/ioctl.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 422,
+      "hash": "d946b9d725b3da07",
+      "size": 1476,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.261Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/Makefile": {
+      "description": "Make build targets",
+      "tokens": 188,
+      "hash": "96957492a8b99484",
+      "size": 702,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.261Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/namei.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 7740,
+      "hash": "62dbd9f54ef1b195",
+      "size": 27089,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.261Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/super.c": {
+      "description": "include <stdarg.h>",
+      "tokens": 5531,
+      "hash": "86a126c1988347e6",
+      "size": 19357,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.262Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/symlink.c": {
+      "description": "",
+      "tokens": 748,
+      "hash": "19fc755ac012c602",
+      "size": 2615,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.262Z",
+      "source": "scan"
+    },
+    "linux/fs/ext2/truncate.c": {
+      "description": "",
+      "tokens": 2543,
+      "hash": "f6b669207f9ebabc",
+      "size": 8898,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.262Z",
+      "source": "scan"
+    },
+    "linux/fs/fcntl.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 715,
+      "hash": "599710ce87da57f7",
+      "size": 2501,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.262Z",
+      "source": "scan"
+    },
+    "linux/fs/fifo.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 1148,
+      "hash": "5808c639200c6c32",
+      "size": 4016,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.262Z",
+      "source": "scan"
+    },
+    "linux/fs/file_table.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 470,
+      "hash": "5a661728ee90009d",
+      "size": 1643,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.262Z",
+      "source": "scan"
+    },
+    "linux/fs/filesystems.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 423,
+      "hash": "4788fc1f2d27d1e0",
+      "size": 1478,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.263Z",
+      "source": "scan"
+    },
+    "linux/fs/hpfs/hpfs_fs.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 11445,
+      "hash": "209fef17d32937e7",
+      "size": 40056,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.263Z",
+      "source": "scan"
+    },
+    "linux/fs/hpfs/hpfs.h": {
+      "description": "",
+      "tokens": 4704,
+      "hash": "cee2280ffac3f76e",
+      "size": 16463,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.263Z",
+      "source": "scan"
+    },
+    "linux/fs/hpfs/Makefile": {
+      "description": "Make build targets",
+      "tokens": 158,
+      "hash": "fdbac113dd4dc3c0",
+      "size": 589,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.263Z",
+      "source": "scan"
+    },
+    "linux/fs/hpfs/README": {
+      "description": "",
+      "tokens": 245,
+      "hash": "bce683ee517f2ee1",
+      "size": 917,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.264Z",
+      "source": "scan"
+    },
+    "linux/fs/inode.c": {
+      "description": "include <linux/stat.h>",
+      "tokens": 3371,
+      "hash": "fbeff5955d79291a",
+      "size": 11797,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.264Z",
+      "source": "scan"
+    },
+    "linux/fs/ioctl.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 650,
+      "hash": "1125841c14a7440e",
+      "size": 2274,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.264Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/dir.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1860,
+      "hash": "72ff89275da507bc",
+      "size": 6509,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.264Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/file.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 2033,
+      "hash": "874b5a2954d72e6f",
+      "size": 7114,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.264Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/inode.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 5508,
+      "hash": "8cbfef81799bdd3e",
+      "size": 19275,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/Makefile": {
+      "description": "Make build targets",
+      "tokens": 171,
+      "hash": "f2bc956e180db5ff",
+      "size": 639,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/namei.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 1990,
+      "hash": "e6a036aa40ffe08d",
+      "size": 6963,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/rock.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 3730,
+      "hash": "1462cdf6c6d4fb2a",
+      "size": 13052,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/rock.h": {
+      "description": "",
+      "tokens": 572,
+      "hash": "87cbaabf93118572",
+      "size": 2000,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/symlink.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 598,
+      "hash": "529ec94f832be64f",
+      "size": 2092,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/isofs/util.c": {
+      "description": "",
+      "tokens": 715,
+      "hash": "20395cddfe7dbdf2",
+      "size": 2501,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.265Z",
+      "source": "scan"
+    },
+    "linux/fs/locks.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 3268,
+      "hash": "ac8904e776252553",
+      "size": 11435,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.267Z",
+      "source": "scan"
+    },
+    "linux/fs/Makefile": {
+      "description": "Make build targets",
+      "tokens": 490,
+      "hash": "55225433a1f01ed4",
+      "size": 1835,
+      "mtimeMs": 1785601238180.3481,
+      "updatedAt": "2026-08-01T19:00:20.267Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/bitmap.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 1570,
+      "hash": "deb7c06356a9f23e",
+      "size": 5493,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.267Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/dir.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 712,
+      "hash": "33a8ab5ebbee7ddc",
+      "size": 2489,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.268Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/file.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1671,
+      "hash": "4ec5506c132d9bc4",
+      "size": 5848,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.268Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/fsync.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 848,
+      "hash": "764f3198a36f7fd5",
+      "size": 2967,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.268Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/inode.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 3634,
+      "hash": "548c6a530592f4ce",
+      "size": 12716,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.268Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/Makefile": {
+      "description": "Make build targets",
+      "tokens": 175,
+      "hash": "8061bc6d64ea0185",
+      "size": 656,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.268Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/namei.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 5417,
+      "hash": "ba8b10a97f28b876",
+      "size": 18958,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.268Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/symlink.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 565,
+      "hash": "b3f3f58997e44426",
+      "size": 1977,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.269Z",
+      "source": "scan"
+    },
+    "linux/fs/minix/truncate.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1108,
+      "hash": "0324da7ee05c5913",
+      "size": 3875,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.269Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/dir.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 845,
+      "hash": "dac0466771882092",
+      "size": 2957,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.269Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/fat.c": {
+      "description": "include <linux/msdos_fs.h>",
+      "tokens": 2039,
+      "hash": "6ac9d5dd4beb173a",
+      "size": 7136,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.269Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/file.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1559,
+      "hash": "0e6069bb29e91e9e",
+      "size": 5454,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.269Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/inode.c": {
+      "description": "include <linux/msdos_fs.h>",
+      "tokens": 3845,
+      "hash": "03285bf18d2a44ba",
+      "size": 13455,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.270Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/Makefile": {
+      "description": "Make build targets",
+      "tokens": 168,
+      "hash": "01c3ac43530758a7",
+      "size": 629,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.270Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/misc.c": {
+      "description": "include <linux/fs.h>",
+      "tokens": 3906,
+      "hash": "f1617a9d5301423f",
+      "size": 13668,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.270Z",
+      "source": "scan"
+    },
+    "linux/fs/msdos/namei.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 4336,
+      "hash": "7413b4f8c1d8ca5b",
+      "size": 15176,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.270Z",
+      "source": "scan"
+    },
+    "linux/fs/namei.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 4324,
+      "hash": "0ab24e9d82b9cb67",
+      "size": 15132,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.271Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/dir.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 4504,
+      "hash": "9841eefcce3a75da",
+      "size": 15761,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.271Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/file.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1017,
+      "hash": "5376c4d5e3a7ab67",
+      "size": 3558,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.271Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/inode.c": {
+      "description": "include <asm/system.h>",
+      "tokens": 1816,
+      "hash": "09121814eeaa4834",
+      "size": 6354,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.271Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/Makefile": {
+      "description": "Make build targets",
+      "tokens": 170,
+      "hash": "1c9e4c23aebb6a85",
+      "size": 635,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.271Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/mmap.c": {
+      "description": "include <linux/stat.h>",
+      "tokens": 1068,
+      "hash": "bf08fd8422636562",
+      "size": 3738,
+      "mtimeMs": 1785601238184.3484,
+      "updatedAt": "2026-08-01T19:00:20.271Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/proc.c": {
+      "description": "Declares char",
+      "tokens": 5937,
+      "hash": "25b255135d083d3c",
+      "size": 20779,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.272Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/sock.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 1296,
+      "hash": "fee6e711f0f2421e",
+      "size": 4536,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.272Z",
+      "source": "scan"
+    },
+    "linux/fs/nfs/symlink.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 646,
+      "hash": "e70e794f2b131b30",
+      "size": 2260,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.272Z",
+      "source": "scan"
+    },
+    "linux/fs/open.c": {
+      "description": "include <linux/vfs.h>",
+      "tokens": 3152,
+      "hash": "c383aa1cfdb11132",
+      "size": 11029,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.272Z",
+      "source": "scan"
+    },
+    "linux/fs/pipe.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 2806,
+      "hash": "745e247c38a92d4b",
+      "size": 9819,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.272Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/array.c": {
+      "description": "",
+      "tokens": 3597,
+      "hash": "eb4a32f3b17cbac7",
+      "size": 12588,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.273Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/base.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1033,
+      "hash": "a71db9c22de426b2",
+      "size": 3614,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.273Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/fd.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1169,
+      "hash": "d27ea9d832c77360",
+      "size": 4090,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.273Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/inode.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 1248,
+      "hash": "03004fbb7d87c0e4",
+      "size": 4368,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.273Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/kmsg.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 458,
+      "hash": "42ee0aa078d26522",
+      "size": 1602,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.273Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/link.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 744,
+      "hash": "0441f9607bdd751c",
+      "size": 2602,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.274Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/Makefile": {
+      "description": "Make build targets",
+      "tokens": 172,
+      "hash": "075c1ecff162752a",
+      "size": 644,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.274Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/mem.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 997,
+      "hash": "bec0d663c978b333",
+      "size": 3488,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.274Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/net.c": {
+      "description": "Declares char",
+      "tokens": 1444,
+      "hash": "c74aa0c6e89334b1",
+      "size": 5052,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.274Z",
+      "source": "scan"
+    },
+    "linux/fs/proc/root.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1062,
+      "hash": "c7cb881f9f27d936",
+      "size": 3716,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.274Z",
+      "source": "scan"
+    },
+    "linux/fs/read_write.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 718,
+      "hash": "2953c5fd317cbc9e",
+      "size": 2513,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.274Z",
+      "source": "scan"
+    },
+    "linux/fs/select.c": {
+      "description": "include <linux/types.h>",
+      "tokens": 1898,
+      "hash": "e42b1d44fee7cc59",
+      "size": 6642,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.275Z",
+      "source": "scan"
+    },
+    "linux/fs/stat.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1381,
+      "hash": "03b75a1dc2eaad0f",
+      "size": 4832,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.275Z",
+      "source": "scan"
+    },
+    "linux/fs/super.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 3571,
+      "hash": "61845ca2ddbf80c8",
+      "size": 12496,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.275Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/balloc.c": {
+      "description": "",
+      "tokens": 3174,
+      "hash": "6a87b697726cb829",
+      "size": 11109,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.276Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/dir.c": {
+      "description": "",
+      "tokens": 834,
+      "hash": "658a7557d85cbb32",
+      "size": 2916,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.276Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/file.c": {
+      "description": "Declares in",
+      "tokens": 2260,
+      "hash": "06854279b3404099",
+      "size": 7909,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.276Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/fsync.c": {
+      "description": "",
+      "tokens": 1252,
+      "hash": "ea6a79edb1109f3f",
+      "size": 4379,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.276Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/ialloc.c": {
+      "description": "Declares struct",
+      "tokens": 1862,
+      "hash": "abbcc1f4ee819bee",
+      "size": 6516,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.276Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/inode.c": {
+      "description": "Declares char",
+      "tokens": 6645,
+      "hash": "0850bbc83e24bc77",
+      "size": 23255,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.277Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/INTRO": {
+      "description": "",
+      "tokens": 1998,
+      "hash": "53df18949a535470",
+      "size": 7491,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.277Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/Makefile": {
+      "description": "Make build targets",
+      "tokens": 183,
+      "hash": "cc8ffdbb3e553b8d",
+      "size": 683,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.277Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/namei.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 5612,
+      "hash": "06ae6000cecede04",
+      "size": 19640,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.277Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/README": {
+      "description": "Declares names",
+      "tokens": 321,
+      "hash": "503c49633bf62014",
+      "size": 1201,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.277Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/symlink.c": {
+      "description": "",
+      "tokens": 643,
+      "hash": "04861246f1368242",
+      "size": 2248,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.277Z",
+      "source": "scan"
+    },
+    "linux/fs/sysv/truncate.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 3642,
+      "hash": "046ea98ec8622ebe",
+      "size": 12745,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.278Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/bitmap.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 2963,
+      "hash": "18c05cc4ae671c86",
+      "size": 10368,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.278Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/dir.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1014,
+      "hash": "e2d402894c7ebae1",
+      "size": 3547,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.278Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/file.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 1871,
+      "hash": "a355fb5f241552da",
+      "size": 6548,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.278Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/fsync.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 861,
+      "hash": "4fcca85f514b3193",
+      "size": 3013,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.278Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/inode.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 4096,
+      "hash": "87e538aa19317be5",
+      "size": 14336,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.279Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/Makefile": {
+      "description": "Make build targets",
+      "tokens": 174,
+      "hash": "8ed7494bb41816c4",
+      "size": 650,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.279Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/namei.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 6355,
+      "hash": "3abdb61d3270f6e3",
+      "size": 22240,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.279Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/symlink.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 704,
+      "hash": "528ef49086eccf92",
+      "size": 2461,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.279Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/truncate.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1374,
+      "hash": "f88656e457d3cef7",
+      "size": 4809,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.279Z",
+      "source": "scan"
+    },
+    "linux/fs/xiafs/xiafs_mac.h": {
+      "description": "",
+      "tokens": 396,
+      "hash": "36808e861d98d96d",
+      "size": 1386,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.279Z",
+      "source": "scan"
+    },
+    "linux/ibcs/emulate.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 151,
+      "hash": "482aba8e16fef701",
+      "size": 527,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.280Z",
+      "source": "scan"
+    },
+    "linux/ibcs/Makefile": {
+      "description": "Make build targets",
+      "tokens": 190,
+      "hash": "b6214080a47d6c03",
+      "size": 709,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.280Z",
+      "source": "scan"
+    },
+    "linux/include/asm/bitops.h": {
+      "description": "ifndef _ASM_BITOPS_H",
+      "tokens": 673,
+      "hash": "7121483a35b0a10d",
+      "size": 2354,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.280Z",
+      "source": "scan"
+    },
+    "linux/include/asm/dma.h": {
+      "description": "ifndef _ASM_DMA_H",
+      "tokens": 2571,
+      "hash": "b6e0817a402fc4ac",
+      "size": 8998,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.280Z",
+      "source": "scan"
+    },
+    "linux/include/asm/io.h": {
+      "description": "ifndef _ASM_IO_H",
+      "tokens": 1309,
+      "hash": "71f79c705724f34b",
+      "size": 4581,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.281Z",
+      "source": "scan"
+    },
+    "linux/include/asm/irq.h": {
+      "description": "ifndef _ASM_IRQ_H",
+      "tokens": 1139,
+      "hash": "ea500b9cf2eeec84",
+      "size": 3984,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.281Z",
+      "source": "scan"
+    },
+    "linux/include/asm/segment.h": {
+      "description": "ifndef _ASM_SEGMENT_H",
+      "tokens": 1365,
+      "hash": "4a1ce5f3f00605b6",
+      "size": 4775,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.281Z",
+      "source": "scan"
+    },
+    "linux/include/asm/system.h": {
+      "description": "ifndef __ASM_SYSTEM_H",
+      "tokens": 770,
+      "hash": "e54de62a6c6ca0f4",
+      "size": 2695,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.281Z",
+      "source": "scan"
+    },
+    "linux/include/linux/a.out.h": {
+      "description": "ifndef __A_OUT_GNU_H__",
+      "tokens": 2167,
+      "hash": "d0b2150fa3e37932",
+      "size": 7584,
+      "mtimeMs": 1785601238188.3489,
+      "updatedAt": "2026-08-01T19:00:20.282Z",
+      "source": "scan"
+    },
+    "linux/include/linux/binfmts.h": {
+      "description": "ifndef _LINUX_BINFMTS_H",
+      "tokens": 385,
+      "hash": "473b572d00a6716d",
+      "size": 1346,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.282Z",
+      "source": "scan"
+    },
+    "linux/include/linux/busmouse.h": {
+      "description": "ifndef _LINUX_BUSMOUSE_H",
+      "tokens": 851,
+      "hash": "7cabe6808071a702",
+      "size": 2977,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.282Z",
+      "source": "scan"
+    },
+    "linux/include/linux/cdrom.h": {
+      "description": "*************************************************************************************",
+      "tokens": 2460,
+      "hash": "be4a7bdfcdb922ee",
+      "size": 8608,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.282Z",
+      "source": "scan"
+    },
+    "linux/include/linux/cdu31a.h": {
+      "description": "Declares CDROM",
+      "tokens": 2712,
+      "hash": "16177665d8a80fb7",
+      "size": 9490,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/coff.h": {
+      "description": "coff information for Intel 386/486.",
+      "tokens": 3544,
+      "hash": "3295dd0c580ebc65",
+      "size": 12402,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/config.h": {
+      "description": "ifndef _LINUX_CONFIG_H",
+      "tokens": 613,
+      "hash": "039ecf626e4d1959",
+      "size": 2144,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ctype.h": {
+      "description": "ifndef _LINUX_CTYPE_H",
+      "tokens": 304,
+      "hash": "1a65972f9e741674",
+      "size": 1061,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ddi.h": {
+      "description": "ifndef _LINUX_DDI_H",
+      "tokens": 730,
+      "hash": "24ab73553bd72297",
+      "size": 2552,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/debugreg.h": {
+      "description": "ifndef _LINUX_DEBUGREG_H",
+      "tokens": 775,
+      "hash": "3da7a3722dd4fcbd",
+      "size": 2710,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/delay.h": {
+      "description": "ifndef _LINUX_DELAY_H",
+      "tokens": 261,
+      "hash": "5fa03b36f7fe4a09",
+      "size": 912,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.283Z",
+      "source": "scan"
+    },
+    "linux/include/linux/dirent.h": {
+      "description": "ifndef _LINUX_DIRENT_H",
+      "tokens": 53,
+      "hash": "07f17532604ef905",
+      "size": 185,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.284Z",
+      "source": "scan"
+    },
+    "linux/include/linux/elf.h": {
+      "description": "ifndef _ELF_H",
+      "tokens": 850,
+      "hash": "37729af8dcc4fb63",
+      "size": 2974,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.284Z",
+      "source": "scan"
+    },
+    "linux/include/linux/errno.h": {
+      "description": "ifndef _LINUX_ERRNO_H",
+      "tokens": 1786,
+      "hash": "8e5bc3975c112aa9",
+      "size": 6251,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.284Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ext_fs_i.h": {
+      "description": "ifndef _EXT_FS_I",
+      "tokens": 44,
+      "hash": "7f047f812dbb4a11",
+      "size": 151,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.284Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ext_fs_sb.h": {
+      "description": "ifndef _EXT_FS_SB",
+      "tokens": 148,
+      "hash": "d450b83002538362",
+      "size": 515,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.284Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ext_fs.h": {
+      "description": "ifndef _LINUX_EXT_FS_H",
+      "tokens": 1042,
+      "hash": "013ecadbe70b00d5",
+      "size": 3645,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.284Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ext2_fs_i.h": {
+      "description": "ifndef _LINUX_EXT2_FS_I",
+      "tokens": 277,
+      "hash": "d4b727960c2cd0f8",
+      "size": 967,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.285Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ext2_fs_sb.h": {
+      "description": "ifndef _LINUX_EXT2_FS_SB",
+      "tokens": 534,
+      "hash": "3ebbaf5c6ad9b3c8",
+      "size": 1869,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.285Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ext2_fs.h": {
+      "description": "ifndef _LINUX_EXT2_FS_H",
+      "tokens": 4112,
+      "hash": "5494d47f63fbcd54",
+      "size": 14391,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.285Z",
+      "source": "scan"
+    },
+    "linux/include/linux/fcntl.h": {
+      "description": "ifndef _LINUX_FCNTL_H",
+      "tokens": 313,
+      "hash": "5226c747afb3b3c0",
+      "size": 1093,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.285Z",
+      "source": "scan"
+    },
+    "linux/include/linux/fd.h": {
+      "description": "ifndef _LINUX_FD_H",
+      "tokens": 468,
+      "hash": "d930c4f10e1ebd5f",
+      "size": 1637,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.285Z",
+      "source": "scan"
+    },
+    "linux/include/linux/fdreg.h": {
+      "description": "ifndef _LINUX_FDREG_H",
+      "tokens": 749,
+      "hash": "fad0ed8314611bb3",
+      "size": 2620,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.285Z",
+      "source": "scan"
+    },
+    "linux/include/linux/fs.h": {
+      "description": "ifndef _LINUX_FS_H",
+      "tokens": 4018,
+      "hash": "f91037bcaeae8f9c",
+      "size": 14062,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/genhd.h": {
+      "description": "ifndef _LINUX_GENHD_H",
+      "tokens": 418,
+      "hash": "a8b04de113b96cbd",
+      "size": 1462,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/hdreg.h": {
+      "description": "ifndef _LINUX_HDREG_H",
+      "tokens": 544,
+      "hash": "8a30b218a01bc12e",
+      "size": 1901,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/head.h": {
+      "description": "ifndef _LINUX_HEAD_H",
+      "tokens": 93,
+      "hash": "71b4089f83571e3f",
+      "size": 324,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/hpfs_fs_i.h": {
+      "description": "ifndef _HPFS_FS_I",
+      "tokens": 254,
+      "hash": "8d1e0ca4117eceb3",
+      "size": 886,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/hpfs_fs_sb.h": {
+      "description": "ifndef _HPFS_FS_SB",
+      "tokens": 356,
+      "hash": "1ba4ba466ce3b0d4",
+      "size": 1243,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/hpfs_fs.h": {
+      "description": "ifndef _LINUX_HPFS_FS_H",
+      "tokens": 73,
+      "hash": "53a58d243680eb61",
+      "size": 255,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.286Z",
+      "source": "scan"
+    },
+    "linux/include/linux/icmp.h": {
+      "description": "Declares as",
+      "tokens": 730,
+      "hash": "ab4f551f67a26f5a",
+      "size": 2552,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.287Z",
+      "source": "scan"
+    },
+    "linux/include/linux/if_arp.h": {
+      "description": "Declares as",
+      "tokens": 882,
+      "hash": "2e03e20e01da9b6c",
+      "size": 3087,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.287Z",
+      "source": "scan"
+    },
+    "linux/include/linux/if_ether.h": {
+      "description": "Declares as",
+      "tokens": 857,
+      "hash": "115242e7ce0401d9",
+      "size": 2999,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.287Z",
+      "source": "scan"
+    },
+    "linux/include/linux/if.h": {
+      "description": "Declares as",
+      "tokens": 1484,
+      "hash": "d43b9c26b5866a5c",
+      "size": 5194,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.287Z",
+      "source": "scan"
+    },
+    "linux/include/linux/in_systm.h": {
+      "description": "Declares as",
+      "tokens": 347,
+      "hash": "9b552b1697266637",
+      "size": 1214,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.287Z",
+      "source": "scan"
+    },
+    "linux/include/linux/in.h": {
+      "description": "Declares as",
+      "tokens": 1509,
+      "hash": "ee4757906c97b0b6",
+      "size": 5281,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/interrupt.h": {
+      "description": "ifndef _LINUX_INTERRUPT_H",
+      "tokens": 213,
+      "hash": "cd374c871c9750fd",
+      "size": 745,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ioctl.h": {
+      "description": "ifndef _LINUX_IOCTL_H",
+      "tokens": 478,
+      "hash": "c8e37d6d56d49542",
+      "size": 1671,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ioport.h": {
+      "description": "ifndef _LINUX_PORTIO_H",
+      "tokens": 220,
+      "hash": "20c103855d0e56e3",
+      "size": 770,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ip.h": {
+      "description": "Declares as",
+      "tokens": 489,
+      "hash": "f3f9a9a2b133f75e",
+      "size": 1711,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ipc.h": {
+      "description": "ifndef _LINUX_IPC_H",
+      "tokens": 434,
+      "hash": "8b99946bc31e1169",
+      "size": 1518,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/iso_fs_i.h": {
+      "description": "ifndef _ISO_FS_I",
+      "tokens": 56,
+      "hash": "d301c72ca5c20aa7",
+      "size": 196,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.288Z",
+      "source": "scan"
+    },
+    "linux/include/linux/iso_fs_sb.h": {
+      "description": "ifndef _ISOFS_FS_SB",
+      "tokens": 148,
+      "hash": "5ee306ef33e02621",
+      "size": 518,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/iso_fs.h": {
+      "description": "ifndef _ISOFS_FS_H",
+      "tokens": 2199,
+      "hash": "a57dd61a9b098e0c",
+      "size": 7694,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/kd.h": {
+      "description": "ifndef _LINUX_KD_H",
+      "tokens": 2294,
+      "hash": "4588b98f9760b88f",
+      "size": 8028,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/kernel_stat.h": {
+      "description": "ifndef _LINUX_KERNEL_STAT_H",
+      "tokens": 179,
+      "hash": "b63173cb334e70f9",
+      "size": 625,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/kernel.h": {
+      "description": "ifndef _LINUX_KERNEL_H",
+      "tokens": 733,
+      "hash": "04061ddf7a62ea60",
+      "size": 2565,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/keyboard.h": {
+      "description": "ifndef __LINUX_KEYBOARD_H",
+      "tokens": 1173,
+      "hash": "6ba14aa29ae8227f",
+      "size": 4104,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ldt.h": {
+      "description": "ifndef _LINUX_LDT_H",
+      "tokens": 230,
+      "hash": "2721d154630d65dc",
+      "size": 802,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/limits.h": {
+      "description": "ifndef _LINUX_LIMITS_H",
+      "tokens": 206,
+      "hash": "ccb99736e3b5b5b6",
+      "size": 720,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.289Z",
+      "source": "scan"
+    },
+    "linux/include/linux/linkage.h": {
+      "description": "ifndef _LINUX_LINKAGE_H",
+      "tokens": 40,
+      "hash": "f902194159a76c33",
+      "size": 140,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.290Z",
+      "source": "scan"
+    },
+    "linux/include/linux/locks.h": {
+      "description": "ifndef _LINUX_LOCKS_H",
+      "tokens": 305,
+      "hash": "b8f767e9ada4be75",
+      "size": 1067,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.290Z",
+      "source": "scan"
+    },
+    "linux/include/linux/lp.h": {
+      "description": "ifndef _LINUX_LP_H",
+      "tokens": 1361,
+      "hash": "b309b0edeeddacca",
+      "size": 4761,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.290Z",
+      "source": "scan"
+    },
+    "linux/include/linux/major.h": {
+      "description": "ifndef _LINUX_MAJOR_H",
+      "tokens": 645,
+      "hash": "752cead3987eb9aa",
+      "size": 2256,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.290Z",
+      "source": "scan"
+    },
+    "linux/include/linux/malloc.h": {
+      "description": "ifndef _LINUX_MALLOC_H",
+      "tokens": 256,
+      "hash": "880e6ec9acec70f0",
+      "size": 894,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/math_emu.h": {
+      "description": "ifndef _LINUX_MATH_EMU_H",
+      "tokens": 214,
+      "hash": "542d1796869643ea",
+      "size": 748,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mc146818rtc.h": {
+      "description": "*******************************************************************",
+      "tokens": 1019,
+      "hash": "4b72d4187c103f06",
+      "size": 3565,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mcd.h": {
+      "description": "",
+      "tokens": 818,
+      "hash": "51ec9b81193fbe6f",
+      "size": 2863,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/minix_fs_i.h": {
+      "description": "ifndef _MINIX_FS_I",
+      "tokens": 42,
+      "hash": "08184068c08bb316",
+      "size": 146,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/minix_fs_sb.h": {
+      "description": "ifndef _MINIX_FS_SB",
+      "tokens": 161,
+      "hash": "a9f399c43edc427a",
+      "size": 562,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/minix_fs.h": {
+      "description": "ifndef _LINUX_MINIX_FS_H",
+      "tokens": 1193,
+      "hash": "c84fc691cea3e025",
+      "size": 4174,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mktime.h": {
+      "description": "ifndef _LINUX_MKTIME_H",
+      "tokens": 40,
+      "hash": "854a39f1f303f338",
+      "size": 138,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.291Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mm.h": {
+      "description": "ifndef _LINUX_MM_H",
+      "tokens": 2034,
+      "hash": "86337045daf28500",
+      "size": 7119,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.292Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mman.h": {
+      "description": "ifndef _LINUX_MMAN_H",
+      "tokens": 179,
+      "hash": "4d0ec9c17003b9e4",
+      "size": 625,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.292Z",
+      "source": "scan"
+    },
+    "linux/include/linux/module.h": {
+      "description": "ifndef _LINUX_MODULE_H",
+      "tokens": 332,
+      "hash": "731a8a4d90e08d6d",
+      "size": 1159,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.292Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mouse.h": {
+      "description": "ifndef _LINUX_MOUSE_H",
+      "tokens": 59,
+      "hash": "9a2636ea8cbc9a73",
+      "size": 206,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.292Z",
+      "source": "scan"
+    },
+    "linux/include/linux/msdos_fs_i.h": {
+      "description": "ifndef _MSDOS_FS_I",
+      "tokens": 148,
+      "hash": "5c07de6b6d54337e",
+      "size": 518,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.292Z",
+      "source": "scan"
+    },
+    "linux/include/linux/msdos_fs_sb.h": {
+      "description": "ifndef _MSDOS_FS_SB",
+      "tokens": 256,
+      "hash": "28b2bf3a724a227d",
+      "size": 894,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.292Z",
+      "source": "scan"
+    },
+    "linux/include/linux/msdos_fs.h": {
+      "description": "ifndef _LINUX_MSDOS_FS_H",
+      "tokens": 1916,
+      "hash": "e38aca8d73ede572",
+      "size": 6703,
+      "mtimeMs": 1785601238192.349,
+      "updatedAt": "2026-08-01T19:00:20.293Z",
+      "source": "scan"
+    },
+    "linux/include/linux/msg.h": {
+      "description": "ifndef _LINUX_MSG_H",
+      "tokens": 664,
+      "hash": "fbde4cbebd3eedbd",
+      "size": 2323,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.293Z",
+      "source": "scan"
+    },
+    "linux/include/linux/mtio.h": {
+      "description": "ifndef _LINUX_MTIO_H",
+      "tokens": 1700,
+      "hash": "0bb19ba030e68ee6",
+      "size": 5947,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.293Z",
+      "source": "scan"
+    },
+    "linux/include/linux/net.h": {
+      "description": "",
+      "tokens": 1314,
+      "hash": "80c71ecfef84e3ff",
+      "size": 4599,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.293Z",
+      "source": "scan"
+    },
+    "linux/include/linux/nfs_fs_i.h": {
+      "description": "ifndef _NFS_FS_I",
+      "tokens": 46,
+      "hash": "24f750904499f14f",
+      "size": 158,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.293Z",
+      "source": "scan"
+    },
+    "linux/include/linux/nfs_fs_sb.h": {
+      "description": "ifndef _NFS_FS_SB",
+      "tokens": 118,
+      "hash": "db0be9988140dae5",
+      "size": 413,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.293Z",
+      "source": "scan"
+    },
+    "linux/include/linux/nfs_fs.h": {
+      "description": "ifndef _LINUX_NFS_FS_H",
+      "tokens": 1232,
+      "hash": "664452df36bcb1bc",
+      "size": 4309,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/nfs_mount.h": {
+      "description": "ifndef _LINUX_NFS_MOUNT_H",
+      "tokens": 354,
+      "hash": "c4bd9d048da8fad7",
+      "size": 1238,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/nfs.h": {
+      "description": "ifndef _LINUX_NFS_H",
+      "tokens": 824,
+      "hash": "cb1046d4453fb5e8",
+      "size": 2883,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/page.h": {
+      "description": "ifndef _LINUX_PAGE_H",
+      "tokens": 344,
+      "hash": "9e99d838908ad0b0",
+      "size": 1202,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/param.h": {
+      "description": "ifndef _LINUX_PARAM_H",
+      "tokens": 75,
+      "hash": "6277d3717fd445c2",
+      "size": 262,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/pipe_fs_i.h": {
+      "description": "ifndef _LINUX_PIPE_FS_I_H",
+      "tokens": 337,
+      "hash": "2d2d4a1c6028ffbb",
+      "size": 1177,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/proc_fs.h": {
+      "description": "ifndef _LINUX_PROC_FS_H",
+      "tokens": 338,
+      "hash": "0d6719d2a48c374c",
+      "size": 1182,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ptrace.h": {
+      "description": "ifndef _LINUX_PTRACE_H",
+      "tokens": 383,
+      "hash": "4d8a4acc9760370b",
+      "size": 1339,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.294Z",
+      "source": "scan"
+    },
+    "linux/include/linux/resource.h": {
+      "description": "ifndef _LINUX_RESOURCE_H",
+      "tokens": 559,
+      "hash": "2943f08a47be89df",
+      "size": 1955,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.295Z",
+      "source": "scan"
+    },
+    "linux/include/linux/route.h": {
+      "description": "Declares as",
+      "tokens": 543,
+      "hash": "484c8e680e5ee29d",
+      "size": 1899,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.295Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sbpcd.h": {
+      "description": "Declares address",
+      "tokens": 4023,
+      "hash": "8b50b71f9a880e17",
+      "size": 14079,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.295Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sched.h": {
+      "description": "ifndef _LINUX_SCHED_H",
+      "tokens": 4236,
+      "hash": "25b6534b7b7a0f59",
+      "size": 14823,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.295Z",
+      "source": "scan"
+    },
+    "linux/include/linux/segment.h": {
+      "description": "ifndef _LINUX_SEGMENT_H",
+      "tokens": 43,
+      "hash": "a414618efa7ce438",
+      "size": 150,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.295Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sem.h": {
+      "description": "ifndef _LINUX_SEM_H",
+      "tokens": 884,
+      "hash": "be96813c5bee5f79",
+      "size": 3092,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.295Z",
+      "source": "scan"
+    },
+    "linux/include/linux/serial.h": {
+      "description": "",
+      "tokens": 1673,
+      "hash": "db493cc1dab430b5",
+      "size": 5854,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.296Z",
+      "source": "scan"
+    },
+    "linux/include/linux/shm.h": {
+      "description": "ifndef _LINUX_SHM_H_",
+      "tokens": 1012,
+      "hash": "7e19e5b3117a6f6e",
+      "size": 3542,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.296Z",
+      "source": "scan"
+    },
+    "linux/include/linux/signal.h": {
+      "description": "ifndef _LINUX_SIGNAL_H",
+      "tokens": 616,
+      "hash": "1f08b0421a72e562",
+      "size": 2154,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.296Z",
+      "source": "scan"
+    },
+    "linux/include/linux/socket.h": {
+      "description": "ifndef _LINUX_SOCKET_H",
+      "tokens": 627,
+      "hash": "4ac772bfd1373fb3",
+      "size": 2193,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.296Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sockios.h": {
+      "description": "Declares as",
+      "tokens": 847,
+      "hash": "e6a8573df6106c85",
+      "size": 2964,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.296Z",
+      "source": "scan"
+    },
+    "linux/include/linux/soundcard.h": {
+      "description": "********************************",
+      "tokens": 7850,
+      "hash": "e2f108e93bf9d7b8",
+      "size": 27474,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.297Z",
+      "source": "scan"
+    },
+    "linux/include/linux/stat.h": {
+      "description": "ifndef _LINUX_STAT_H",
+      "tokens": 583,
+      "hash": "e82188d0bab4841d",
+      "size": 2039,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.297Z",
+      "source": "scan"
+    },
+    "linux/include/linux/stddef.h": {
+      "description": "ifndef _LINUX_STDDEF_H",
+      "tokens": 70,
+      "hash": "6c613c87203c46a9",
+      "size": 243,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.297Z",
+      "source": "scan"
+    },
+    "linux/include/linux/string.h": {
+      "description": "ifndef _LINUX_STRING_H_",
+      "tokens": 2364,
+      "hash": "7057bec66ddc795b",
+      "size": 8273,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.297Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sys.h": {
+      "description": "ifndef _LINUX_SYS_H",
+      "tokens": 1398,
+      "hash": "a9720de71d060ddd",
+      "size": 4893,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.297Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sysv_fs_i.h": {
+      "description": "ifndef _SYSV_FS_I",
+      "tokens": 148,
+      "hash": "1b9388212bf785c0",
+      "size": 516,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.297Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sysv_fs_sb.h": {
+      "description": "ifndef _SYSV_FS_SB",
+      "tokens": 1554,
+      "hash": "f9342127758f4158",
+      "size": 5438,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.299Z",
+      "source": "scan"
+    },
+    "linux/include/linux/sysv_fs.h": {
+      "description": "ifndef _LINUX_SYSV_FS_H",
+      "tokens": 4778,
+      "hash": "ed2bd4239a9aedd1",
+      "size": 16722,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.299Z",
+      "source": "scan"
+    },
+    "linux/include/linux/tasks.h": {
+      "description": "ifndef _LINUX_TASKS_H",
+      "tokens": 42,
+      "hash": "2d99e477f63e7761",
+      "size": 145,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.299Z",
+      "source": "scan"
+    },
+    "linux/include/linux/tcp.h": {
+      "description": "Declares as",
+      "tokens": 383,
+      "hash": "012ab571ec1d199b",
+      "size": 1340,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.300Z",
+      "source": "scan"
+    },
+    "linux/include/linux/termios.h": {
+      "description": "ifndef _LINUX_TERMIOS_H",
+      "tokens": 1578,
+      "hash": "5c0bb14b018f3887",
+      "size": 5522,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.300Z",
+      "source": "scan"
+    },
+    "linux/include/linux/time.h": {
+      "description": "ifndef _LINUX_TIME_H",
+      "tokens": 222,
+      "hash": "f532056c0afe381c",
+      "size": 777,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.300Z",
+      "source": "scan"
+    },
+    "linux/include/linux/timer.h": {
+      "description": "ifndef _LINUX_TIMER_H",
+      "tokens": 574,
+      "hash": "87fe7938acc82ba9",
+      "size": 2006,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.300Z",
+      "source": "scan"
+    },
+    "linux/include/linux/times.h": {
+      "description": "ifndef _LINUX_TIMES_H",
+      "tokens": 44,
+      "hash": "eba1cc92f9c33bac",
+      "size": 153,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.300Z",
+      "source": "scan"
+    },
+    "linux/include/linux/timex.h": {
+      "description": "**************************************************************************",
+      "tokens": 1695,
+      "hash": "57c5220deef43350",
+      "size": 5931,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.300Z",
+      "source": "scan"
+    },
+    "linux/include/linux/tpqic02.h": {
+      "description": "******** START OF USER CONFIGURABLE SECTION ***********",
+      "tokens": 4204,
+      "hash": "075f697d6834bd7d",
+      "size": 14713,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.301Z",
+      "source": "scan"
+    },
+    "linux/include/linux/tty.h": {
+      "description": "ifndef _LINUX_TTY_H",
+      "tokens": 4535,
+      "hash": "abacecc089ddd4c2",
+      "size": 15871,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.301Z",
+      "source": "scan"
+    },
+    "linux/include/linux/types.h": {
+      "description": "ifndef _LINUX_TYPES_H",
+      "tokens": 788,
+      "hash": "68e9d785fbf3ba90",
+      "size": 2757,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.301Z",
+      "source": "scan"
+    },
+    "linux/include/linux/udp.h": {
+      "description": "Declares as",
+      "tokens": 228,
+      "hash": "8437defcd25fee26",
+      "size": 795,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.301Z",
+      "source": "scan"
+    },
+    "linux/include/linux/ultrasound.h": {
+      "description": "ifndef _ULTRASOUND_H_",
+      "tokens": 1600,
+      "hash": "928249d0c5eea6a9",
+      "size": 5599,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.301Z",
+      "source": "scan"
+    },
+    "linux/include/linux/un.h": {
+      "description": "ifndef _LINUX_UN_H",
+      "tokens": 49,
+      "hash": "760217a973f20afe",
+      "size": 170,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.301Z",
+      "source": "scan"
+    },
+    "linux/include/linux/unistd.h": {
+      "description": "ifndef _LINUX_UNISTD_H",
+      "tokens": 1571,
+      "hash": "7d670b8d3bfe4391",
+      "size": 5496,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.302Z",
+      "source": "scan"
+    },
+    "linux/include/linux/user.h": {
+      "description": "ifndef _LINUX_USER_H",
+      "tokens": 1020,
+      "hash": "b6d0372a07bd507e",
+      "size": 3570,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.302Z",
+      "source": "scan"
+    },
+    "linux/include/linux/utime.h": {
+      "description": "ifndef _LINUX_UTIME_H",
+      "tokens": 31,
+      "hash": "61919fe08efc94f2",
+      "size": 108,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.302Z",
+      "source": "scan"
+    },
+    "linux/include/linux/utsname.h": {
+      "description": "ifndef _LINUX_UTSNAME_H",
+      "tokens": 153,
+      "hash": "48eb7f1e6b5cd131",
+      "size": 535,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.302Z",
+      "source": "scan"
+    },
+    "linux/include/linux/vfs.h": {
+      "description": "ifndef _LINUX_VFS_H",
+      "tokens": 78,
+      "hash": "f35e1bfc5fff9809",
+      "size": 272,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.302Z",
+      "source": "scan"
+    },
+    "linux/include/linux/vm86.h": {
+      "description": "ifndef _LINUX_VM86_H",
+      "tokens": 284,
+      "hash": "b7a53377d386b8d0",
+      "size": 992,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/include/linux/vt.h": {
+      "description": "ifndef _LINUX_VT_H",
+      "tokens": 312,
+      "hash": "953afa5485fb67b7",
+      "size": 1092,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/include/linux/wait.h": {
+      "description": "ifndef _LINUX_WAIT_H",
+      "tokens": 172,
+      "hash": "75b19c8173634474",
+      "size": 600,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/include/linux/xd.h": {
+      "description": "ifndef _LINUX_XD_H",
+      "tokens": 1671,
+      "hash": "daf5ccef2dcce40d",
+      "size": 5847,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/include/linux/xia_fs_i.h": {
+      "description": "ifndef _XIA_FS_I_H",
+      "tokens": 109,
+      "hash": "c529eac9793fe1ca",
+      "size": 379,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/include/linux/xia_fs_sb.h": {
+      "description": "ifndef _XIA_FS_SB_H",
+      "tokens": 265,
+      "hash": "f6b887f316ace5cc",
+      "size": 927,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/include/linux/xia_fs.h": {
+      "description": "ifndef _XIA_FS_H",
+      "tokens": 1146,
+      "hash": "1c6c071b9333f870",
+      "size": 4011,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.303Z",
+      "source": "scan"
+    },
+    "linux/init/main.c": {
+      "description": "include <stdarg.h>",
+      "tokens": 3972,
+      "hash": "5e883ad54eb3969f",
+      "size": 13900,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.304Z",
+      "source": "scan"
+    },
+    "linux/ipc/Makefile": {
+      "description": "Make build targets",
+      "tokens": 186,
+      "hash": "9dfb37e5292851b5",
+      "size": 694,
+      "mtimeMs": 1785601238196.3494,
+      "updatedAt": "2026-08-01T19:00:20.304Z",
+      "source": "scan"
+    },
+    "linux/ipc/msg.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 2814,
+      "hash": "d25efeda4ecf72b4",
+      "size": 9848,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.304Z",
+      "source": "scan"
+    },
+    "linux/ipc/sem.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 3526,
+      "hash": "dadec3782b119bce",
+      "size": 12341,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.304Z",
+      "source": "scan"
+    },
+    "linux/ipc/shm.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 5216,
+      "hash": "ff3ffc64578039b0",
+      "size": 18255,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.305Z",
+      "source": "scan"
+    },
+    "linux/ipc/util.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 1064,
+      "hash": "441257717ab7f145",
+      "size": 3723,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.305Z",
+      "source": "scan"
+    },
+    "linux/kernel/dma.c": {
+      "description": "include <linux/kernel.h>",
+      "tokens": 705,
+      "hash": "0d06a0fe0a9a3143",
+      "size": 2465,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.305Z",
+      "source": "scan"
+    },
+    "linux/kernel/exit.c": {
+      "description": "define DEBUG_PROC_TREE",
+      "tokens": 4173,
+      "hash": "dbc449a89189c622",
+      "size": 14604,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.305Z",
+      "source": "scan"
+    },
+    "linux/kernel/fork.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1748,
+      "hash": "46c3dfa19b2f546c",
+      "size": 6118,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.306Z",
+      "source": "scan"
+    },
+    "linux/kernel/info.c": {
+      "description": "include <asm/segment.h>",
+      "tokens": 255,
+      "hash": "a51bb25876b1c0e5",
+      "size": 892,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.306Z",
+      "source": "scan"
+    },
+    "linux/kernel/ioport.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 1185,
+      "hash": "2d7b794cafed2352",
+      "size": 4146,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.306Z",
+      "source": "scan"
+    },
+    "linux/kernel/irq.c": {
+      "description": "Declares called",
+      "tokens": 2444,
+      "hash": "6277f302ced648f2",
+      "size": 8552,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.306Z",
+      "source": "scan"
+    },
+    "linux/kernel/itimer.c": {
+      "description": "include <linux/signal.h>",
+      "tokens": 803,
+      "hash": "f67d4d122b7c4ca9",
+      "size": 2810,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.306Z",
+      "source": "scan"
+    },
+    "linux/kernel/ksyms.S": {
+      "description": "include <linux/autoconf.h>",
+      "tokens": 129,
+      "hash": "2dd2447e496ecae2",
+      "size": 481,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.307Z",
+      "source": "scan"
+    },
+    "linux/kernel/ksyms.sh": {
+      "description": "This program will construct ksyms.s.  Ksyms.s contains a symbol table",
+      "tokens": 303,
+      "hash": "6ea27895ff84cf72",
+      "size": 1058,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.307Z",
+      "source": "scan"
+    },
+    "linux/kernel/ldt.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 690,
+      "hash": "3b9166758a47a192",
+      "size": 2414,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.307Z",
+      "source": "scan"
+    },
+    "linux/kernel/Makefile": {
+      "description": "Make build targets",
+      "tokens": 289,
+      "hash": "421e8df60dc7f4ad",
+      "size": 1081,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.307Z",
+      "source": "scan"
+    },
+    "linux/kernel/mktime.c": {
+      "description": "include <linux/mktime.h>",
+      "tokens": 424,
+      "hash": "9a746926def8a5f5",
+      "size": 1483,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.307Z",
+      "source": "scan"
+    },
+    "linux/kernel/module.c": {
+      "description": "include <linux/errno.h>",
+      "tokens": 1697,
+      "hash": "16a8de8b17aa7345",
+      "size": 5938,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.307Z",
+      "source": "scan"
+    },
+    "linux/kernel/panic.c": {
+      "description": "include <stdarg.h>",
+      "tokens": 199,
+      "hash": "6149ca0353fd853a",
+      "size": 695,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.308Z",
+      "source": "scan"
+    },
+    "linux/kernel/printk.c": {
+      "description": "include <stdarg.h>",
+      "tokens": 1514,
+      "hash": "b292773c7315d1cc",
+      "size": 5299,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.308Z",
+      "source": "scan"
+    },
+    "linux/kernel/ptrace.c": {
+      "description": "include <linux/head.h>",
+      "tokens": 3651,
+      "hash": "42be8f8d14a5e710",
+      "size": 12776,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.308Z",
+      "source": "scan"
+    },
+    "linux/kernel/sched.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 6145,
+      "hash": "ce871b6c0c13a077",
+      "size": 21507,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.308Z",
+      "source": "scan"
+    },
+    "linux/kernel/signal.c": {
+      "description": "include <linux/sched.h>",
+      "tokens": 3264,
+      "hash": "5386c98899347119",
+      "size": 11424,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.308Z",
+      "source": "scan"
+    },
+    "linux/kernel/sys_call.S": {
+      "description": "",
+      "tokens": 1988,
+      "hash": "acd6b3b0aefa47ef",
+      "size": 7455,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.309Z",
+      "source": "scan"
+    },
+    "linux/kernel/sys.c": {
+      "description": "include <linux/config.h>",
+      "tokens": 5277,
+      "hash": "757d8c9ec24ea144",
+      "size": 18468,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.309Z",
+      "source": "scan"
+    },
+    "linux/kernel/time.c": {
+      "description": "Declares functions",
+      "tokens": 3578,
+      "hash": "3af75f55ba29ca84",
+      "size": 12522,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.309Z",
+      "source": "scan"
+    },
+    "linux/kernel/traps.c": {
+      "description": "include <linux/head.h>",
+      "tokens": 2036,
+      "hash": "e328ce18bf5a6731",
+      "size": 7123,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.309Z",
+      "source": "scan"
+    },
+    "linux/Makefile": {
+      "description": "Make build targets",
+      "tokens": 1845,
+      "hash": "26ff0a2f92e34443",
+      "size": 6918,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.309Z",
+      "source": "scan"
+    },
+    "linux/makever.sh": {
+      "description": "",
+      "tokens": 48,
+      "hash": "c329f189175b9b09",
+      "size": 166,
+      "mtimeMs": 1785601238200.3496,
+      "updatedAt": "2026-08-01T19:00:20.309Z",
+      "source": "scan"
+    },
+    "linux/README": {
+      "description": "contains: addresses",
+      "tokens": 2276,
+      "hash": "a02bc10cf2b1f27a",
+      "size": 8535,
+      "mtimeMs": 1785601238152.3462,
+      "updatedAt": "2026-08-01T19:00:20.310Z",
+      "source": "scan"
+    }
+  }
+}

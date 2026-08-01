@@ -1,0 +1,4 @@
+# MM/中断模块用到 x86_64 crate 与 nightly-only feature，固定 nightly
+[toolchain]
+channel = "nightly"
+targets = ["x86_64-unknown-none"]

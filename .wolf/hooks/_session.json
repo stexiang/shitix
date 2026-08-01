@@ -1,0 +1,38 @@
+{
+  "session_id": "session-2026-08-01-0300",
+  "started": "2026-08-01T19:00:28.499Z",
+  "files_read": {
+    "/root/shitix/src/lib.rs": {
+      "count": 1,
+      "tokens": 0,
+      "first_read": "2026-08-01T19:03:33.665Z"
+    },
+    "/root/shitix/Cargo.toml": {
+      "count": 1,
+      "tokens": 82,
+      "first_read": "2026-08-01T19:03:33.848Z"
+    },
+    "/root/shitix/src/console.rs": {
+      "count": 1,
+      "tokens": 0,
+      "first_read": "2026-08-01T19:03:42.072Z"
+    },
+    "/root/shitix/src/serial.rs": {
+      "count": 1,
+      "tokens": 0,
+      "first_read": "2026-08-01T19:03:42.574Z"
+    },
+    "/tmp/vga.png": {
+      "count": 1,
+      "tokens": 0,
+      "first_read": "2026-08-01T19:08:17.664Z"
+    }
+  },
+  "files_written": [],
+  "edit_counts": {},
+  "anatomy_hits": 1,
+  "anatomy_misses": 4,
+  "repeated_reads_warned": 0,
+  "cerebrum_warnings": 0,
+  "stop_count": 2
+}

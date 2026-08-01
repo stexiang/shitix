@@ -1,0 +1,8 @@
+[2026-08-01T19:00:20.477Z] [INFO] Scheduled task: Full anatomy rescan (0 */6 * * *)
+[2026-08-01T19:00:20.480Z] [INFO] Scheduled task: Consolidate old memory (0 2 * * *)
+[2026-08-01T19:00:20.481Z] [INFO] Scheduled task: Token audit report (0 0 * * 1)
+[2026-08-01T19:00:20.482Z] [INFO] Scheduled task: Cerebrum reflection (0 3 * * 0)
+[2026-08-01T19:00:20.483Z] [INFO] Scheduled task: AI suggestions (0 4 * * 1)
+[2026-08-01T19:00:20.485Z] [INFO] File watcher started on .wolf/
+[2026-08-01T19:00:20.486Z] [INFO] OpenWolf daemon started
+[2026-08-01T19:00:20.493Z] [INFO] Dashboard server listening on 127.0.0.1:18793
