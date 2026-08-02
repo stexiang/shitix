@@ -6,7 +6,7 @@
       "auto_scan_on_init": true,
       "rescan_interval_hours": 6,
       "max_description_length": 100,
-      "max_files": 500,
+      "max_files": 900,
       "exclude_patterns": [
         "node_modules",
         ".git",

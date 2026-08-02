@@ -8,10 +8,183 @@
       "file": "src/mm/page_alloc.rs",
       "root_cause": "mem_init 把 E820 报告为 usable 的页全部放进空闲链表，但低 1MB 里塞着启动期结构：0x70000-0x72FFF 的四级页表、0x90000 机器参数区、0x9E000 的 E820 数组。E820 并不把这些标为 reserved，于是分配器第一次就把 PML4/PDPT/PD 所在的页派了出去，get_free_page 的清零动作直接抹掉当前 cr3 指向的页表，导致三重错误。另外 mem_map 表体紧贴内核镜像（约 0x48000）向后放，表一大就会自己盖住 0x70000 的页表。",
       "fix": "在 page_alloc.rs 加 MIN_USABLE_PHYS = 0x100000：(1) mem_map 基址用 page_align(kernel_end).max(MIN_USABLE_PHYS)，保证表体在 1MB 之上；(2) 空闲页下界 map_end 同样 .max(MIN_USABLE_PHYS)，整个低 1MB 永不进空闲链表。原版靠 mem_init 的 start_low_mem 参数和 0xA0000 硬编码绕开这块，我们没有等价参数，索引干脆整块保留。",
-      "tags": ["mm", "page-alloc", "triple-fault", "e820", "paging", "boot"],
+      "tags": [
+        "mm",
+        "page-alloc",
+        "triple-fault",
+        "e820",
+        "paging",
+        "boot"
+      ],
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-02T03:30:00Z"
+    },
+    {
+      "id": "bug-002",
+      "timestamp": "2026-08-02T12:34:21.876351",
+      "error_message": "klib selftest: number: FAIL —— number() 右对齐时补位宽度翻倍（\"%8d\" 输出 16 列）",
+      "file": "src/klib/vsprintf.rs",
+      "root_cause": "原版 C 的 number() 用 `while(size-->0) *str++=' ';` 补位，循环退出时 size 已被自减消耗为负；后面第二段 `if(!(type&LEFT)) while(size-->0)` 因此不会再补。Rust 版把两段都写成 `if size>0 { push_n(size) }`，size 没被消耗，于是补了两遍。",
+      "fix": "两段补位分支里补完后显式 `size = 0;`，复现 C 版 `size--` 的副作用，并加注释说明为何要这么写。",
+      "tags": [
+        "vsprintf",
+        "number",
+        "printf",
+        "padding",
+        "c-to-rust",
+        "port-semantics"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T12:34:21.876351"
+    },
+    {
+      "id": "bug-003",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "代码段描述符同时置 L(bit53) 与 D(bit54) → 加载 CS 时 #GP(0x08)，随即 double fault、Triple fault、CPU Reset。QEMU -d int 显示 v=0d e=0008 紧跟 v=08。",
+      "file": "src/desc.rs",
+      "root_cause": "init_gdt 里把 LIMIT_FLAT 常量写成 `0xF_0000_0000_FFFF | (1<<55) | (1<<54)`，把 G(粒度) 和 D/B(默认操作数宽度) 混在同一个常量里，于是内核代码段既有 L=1 又有 D=1。x86_64 规定 64 位代码段的 L=1 时 D 必须为 0，L=1&&D=1 是保留组合，加载这样的 CS 一律 #GP。",
+      "fix": "把 GRANULARITY(bit55) 和 DEFAULT_SIZE(bit54) 拆成两个独立常量：代码段用 `common|EXECUTABLE|WRITABLE|LONG_MODE`（不含 DEFAULT_SIZE），数据段用 `common|WRITABLE|DEFAULT_SIZE`。结果与 head.S 里手写的 0x00AF9A.../0x00CF92... 逐位一致。",
+      "tags": [
+        "gdt",
+        "descriptor",
+        "long-mode",
+        "triple-fault",
+        "x86_64"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-004",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "异常自检里 int3/div/ud2 三个探针各自打印 true，但 `int3_ok && div_ok && ud_ok` 求值为 false。",
+      "file": "src/lib.rs",
+      "root_cause": "两个叠加的编译器优化问题。(1) 三个 asm! 上写了 `options(nomem, nostack)`：nomem 让 LLVM 认为异常处理函数不会改 TRAP_COUNT，把探针前后的两次读 CSE 成一次；nostack 让它把局部变量放到 rsp 以下，而这三条指令都会压入整个 pt_regs 帧并在当前栈上跑完 printk，把那些变量覆盖掉。(2) 即使改成 volatile 读，`after == before + 1` 内联后仍被下沉到各使用点，导致 `&&` 处和 kprintln! 处读到不同的值。",
+      "fix": "三处 asm! 去掉 nomem 和 nostack（这两条声明都是假的）；比较逻辑抽成 `#[inline(never)] fn probe_bumped(after, before) -> bool`，阻止读-比较对被下沉复制。",
+      "tags": [
+        "asm",
+        "options",
+        "nomem",
+        "nostack",
+        "llvm",
+        "cse",
+        "selftest",
+        "red-zone"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-005",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "trap_count() 用普通读取，探针前后差值恒为 0。",
+      "file": "src/traps.rs",
+      "root_cause": "TRAP_COUNT 只在异常处理函数里自增，从编译器视角看两次读之间没有可见的写，于是合并成一次读。",
+      "fix": "trap_count() 改用 core::ptr::read_volatile。",
+      "tags": [
+        "volatile",
+        "cse",
+        "counter",
+        "traps"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-006",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "开中断后 `while sched::jiffies() < deadline` 变成死循环：QEMU -d int 显示 timer IRQ(v=20) 已触发 2936 次，但循环读到的 jiffies 不变。",
+      "file": "src/sched/mod.rs",
+      "root_cause": "jiffies() 用普通读取。它只在时钟中断里自增，编译器看不到可见的写，把读提到了循环外面。原版 sched.h 把它声明成 `unsigned long volatile jiffies` 正是为了这个。",
+      "fix": "jiffies() 改用 core::ptr::read_volatile，并在文档注释里写明原版的 volatile 限定符就是同一个用意。",
+      "tags": [
+        "volatile",
+        "jiffies",
+        "timer",
+        "infinite-loop",
+        "hoisting"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-007",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "schedule() 永远选中 task[0]，switches=0，新建的内核线程一次都跑不上。",
+      "file": "src/sched/mod.rs",
+      "root_cause": "候选扫描用 `for (nr, t) in tasks.iter().enumerate()` 遍历了**全部**槽位，包括 task[0]。原版的循环是 `next = p = &init_task; for(;;) { if ((p = p->next_task) == &init_task) goto confuse_gcc2; ... }`——先自增再判等，所以 init_task 自己从不参与比较，只作为兜底默认值。我们的 task[0] counter 恒为 priority(15) 而 worker 只有 10，一起比就永远赢。",
+      "fix": "候选扫描改成沿 next 指针走环、跳过 task[0]（`let mut nr = task(0).next; while nr != 0 {...}`）。注意时间片重发那段(`for_each_task`)仍要包括 task[0]，与原版一致。",
+      "tags": [
+        "scheduler",
+        "idle-task",
+        "init_task",
+        "ring",
+        "port-semantics"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-008",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "加了 need_resched 轮询后 switches 仍为 0，worker 计数为 0。",
+      "file": "src/sched/mod.rs",
+      "root_cause": "do_timer 里写了 `if current_nr() != 0` 守卫，想着「idle 不该参与时间片核算」。但 idle 循环正是靠轮询 need_resched 才会让出 CPU；counter 永不归零 → need_resched 永不置位 → 永不让出。原版 do_timer 对 current 无条件递减，不区分 task[0]。",
+      "fix": "去掉那个守卫，对 task[0] 也递减 counter 并在归零时置 need_resched。",
+      "tags": [
+        "scheduler",
+        "do_timer",
+        "need_resched",
+        "idle",
+        "port-semantics"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-009",
+      "timestamp": "2026-08-02T13:42:53.907141",
+      "error_message": "worker 用 yield_now() 时主自检永远回不来（挂死在 sched selftest）。",
+      "file": "src/lib.rs",
+      "root_cause": "task[0] 是 idle，只有在没有别的 Running 任务时才会被 schedule() 选中。两个 worker 光让出不睡，就一直乒乓，task[0] 再也拿不到 CPU。这不是 bug 而是原版调度语义，是自检写错了。",
+      "fix": "worker 改成每轮 sleep_ticks(3)；主自检的等待循环改成 idle 循环的形态（轮询 need_resched + hlt），并注释说明为何不能靠中断返回路径自动调度（ret_from_sys_call 只在返回用户态时检查 need_resched）。",
+      "tags": [
+        "scheduler",
+        "idle",
+        "selftest",
+        "yield",
+        "sleep"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T13:42:53.907141"
+    },
+    {
+      "id": "bug-010",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "ERROR: ld.so: object '/usr/local/usranalyse/lib/libusranalyse.so' from /etc/ld.so.preload cannot be preloaded (failed to map segment from shared object): ignored.",
+      "file": "scripts/build.sh",
+      "root_cause": "与内核无关的环境噪音。/etc/ld.so.preload 全局注册了宿主机统计库 /usr/local/usranalyse/lib/libusranalyse.so；本机 cargo/rustc 是 snap 安装的（/snap/bin/cargo -> rustup.cargo），启动经过 snap-confine，而 snap-confine 的 AppArmor profile 不允许 mmap /usr/local/**。dmesg 可见 apparmor=\"DENIED\" operation=\"file_mmap\" profile=\".../snap-confine\" requested_mask=\"m\"。ld.so 打完这行就 ignored 继续，编译结果不受影响。非 snap 的 as/ld/objcopy/qemu 都不报。",
+      "fix": "不动 /etc/ld.so.preload（属宿主环境，删除会影响全系统）。build.sh 里 cargo build 的 stderr 经 `2> >(grep -v 'ld\\.so\\.preload' >&2 || true)` 过滤掉这一行，其余 stderr 保留。",
+      "tags": [
+        "environment",
+        "snap",
+        "apparmor",
+        "ld.so.preload",
+        "build",
+        "false-alarm"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
     }
   ]
 }

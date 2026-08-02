@@ -31,19 +31,23 @@ done
 mkdir -p "$OUT"
 
 step "编译 Rust 内核 ($PROFILE)"
-cargo build "${CARGO_FLAGS[@]}"
+# snap 版 cargo/rustc 走 snap-confine，而 snap-confine 的 AppArmor profile
+# 不允许 mmap /usr/local/**，于是 /etc/ld.so.preload 里的宿主机统计库加载失败，
+# ld.so 会打一行 "cannot be preloaded ... ignored"。纯噪音，滤掉但保留其余 stderr。
+cargo build "${CARGO_FLAGS[@]}" 2> >(grep -v 'ld\.so\.preload' >&2 || true)
 [[ -f "$CARGO_OUT" ]] || die "找不到 $CARGO_OUT"
 
 step "汇编 bootsect / setup / head"
 as --32 -o "$OUT/bootsect.o" boot/bootsect.S
 as --32 -o "$OUT/setup.o"    boot/setup.S
 as --64 -o "$OUT/head.o"     boot/head.S
+as --64 -o "$OUT/entry.o"    boot/entry.S
 
 step "链接"
 ld -m elf_i386 -T boot/bootsect.ld -o "$OUT/bootsect.elf" "$OUT/bootsect.o"
 ld -m elf_i386 -T boot/setup.ld    -o "$OUT/setup.elf"    "$OUT/setup.o"
 ld -m elf_x86_64 -n -T boot/kernel.ld -o "$OUT/system.elf" \
-    "$OUT/head.o" "$CARGO_OUT"
+    "$OUT/head.o" "$OUT/entry.o" "$CARGO_OUT"
 
 objcopy -O binary --set-section-flags .bss=alloc,load,contents \
     "$OUT/bootsect.elf" "$OUT/bootsect.bin"

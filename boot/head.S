@@ -42,7 +42,12 @@ _head_start:
     cld
     rep     stosb
 
-    /* 填好 256 个门再 lidt（顺序不能反，否则装的是空表）*/
+    /*
+     * 早期兜底 IDT：256 个门全指向 ignore_int。
+     * Rust 侧的 desc::init_idt() 会在 start_kernel 里重装一张真正的 IDT，
+     * 但在那之前如果发生异常（比如 mm::init 出错），有这张表至少不会
+     * 三重错误重启，而是静默 iretq 后继续跑到能打印的地方。
+     */
     call    setup_idt
     lidt    idt_descr(%rip)
 
@@ -118,6 +123,8 @@ idt:
     .space  256*16
 
     .align 4096
+    .global stack_bottom
 stack_bottom:
     .space  16384                       /* 16KB 内核栈 */
+    .global stack_top
 stack_top:

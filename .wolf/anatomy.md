@@ -1,18 +1,19 @@
 # anatomy.md
 
-> Auto-maintained by OpenWolf. Last scanned: 2026-08-01T19:00:20.316Z
-> Files: 503 tracked | Anatomy hits: 0 | Misses: 0
+> Auto-maintained by OpenWolf. Last scanned: 2026-08-02T05:45:11.384Z
+> Files: 602 tracked | Anatomy hits: 0 | Misses: 0
 
 ## ./
 
 - `.gitignore` — Git ignore rules (~3 tok)
-- `Cargo.toml` — Rust package manifest (~82 tok)
+- `Cargo.toml` — Rust package manifest (~110 tok)
 - `CLAUDE.md` — OpenWolf (~364 tok)
+- `rust-toolchain.toml` — MM/中断模块用到 x86_64 crate 与 nightly-only feature，固定 nightly (~36 tok)
 
 ## .claude/
 
 - `settings.json` (~514 tok)
-- `settings.local.json` (~152 tok)
+- `settings.local.json` (~497 tok)
 
 ## .claude/commands/
 
@@ -31,36 +32,11 @@
 
 - `bootsect.ld` (~62 tok)
 - `bootsect.S` (~1074 tok)
-- `head.S` (~802 tok)
+- `entry.S` (~2628 tok)
+- `head.S` (~856 tok)
 - `kernel.ld` (~171 tok)
 - `setup.ld` (~52 tok)
 - `setup.S` (~1260 tok)
-
-## src/
-
-- `lib.rs` — 内核入口 `start_kernel(*const BootParams)`（head.S 用 SysV ABI 调用，rdi=0x90000）；调 `mm::init` 并跑 `mm_selftest()`（页分配/kmalloc/页表三条路径）；`#[panic_handler]` 白字红底 + 串口 `SHITIX_PANIC` (~2000 tok)
-- `console.rs` — VGA 文本模式 0xB8000 80x25：`Color`/`ColorCode`/`Writer`（实现 `fmt::Write`），滚屏、\t\r\b 处理、0x3D4/0x3D5 硬件光标；导出 `print!`/`println!`/`cprint!`/`cprintln!` (~1500 tok)
-- `serial.rs` — COM1 0x3F8 轮询输出，38400 8N1；`Writer` 实现 `fmt::Write`，导出 `sprint!`/`sprintln!`/`kprintln!`（后者同时写 VGA 和串口）(~900 tok)
-- `e820.rs` — 包装 setup.S 留在 0x901E0/0x9E000 的 E820 表为 `Entry` 迭代器；`usable()` 产出 `(base,len)` 给 mm，条目数按 128 截断 (~700 tok)
-
-## src/mm/
-
-对应原版 `linux/mm/`。未移植：swap（缺块设备）、mmap/vmalloc（缺进程）。
-
-- `mod.rs` — 子系统入口 `mm::init(kernel_end, regions)`，re-export kmalloc/free_page 等；含与原版的对应关系表 (~450 tok)
-- `page.rs` — `PAGE_SHIFT/SIZE/MASK`、`page_align`、`map_nr`；对应原版 `include/linux/page.h`。64 位下 `PTRS_PER_PAGE` 是 512 而非 1024 (~350 tok)
-- `page_alloc.rs` — 物理页帧分配器，对应 `mm/memory.c: mem_init()` + `mm/swap.c: __get_free_page/free_page`。`mem_map` 每页一个 u16 引用计数 + `MAP_PAGE_RESERVED`；空闲页单链表指针存在空闲页自身头 8 字节。**关键：`MIN_USABLE_PHYS=0x100000` 保留整个低 1MB，见 buglog bug-001** (~2200 tok)
-- `kmalloc.rs` — 小块分配器，对应 `mm/kmalloc.c`。`sizes[]` 八档 (32..4080) + `PageDescriptor`/`BlockHeader` + `MF_USED/MF_FREE` 魔数；整页空闲则还给页帧分配器。header 因不用 union 而是 24B（原版 8B），档位按 64 位重算 (~2400 tok)
-- `paging.rs` — 四级页表操作，对应 `mm/memory.c: put_page/remap_page_range/invalidate`。`map_page`/`map_range`/`translate`/`unmap_page` + `flags` 子模块；能识别 setup.S 建的 2MB 大页。注意 `unmap_page` 只清 PTE，不回收中间级页表 (~2000 tok)
-
-## scripts/
-
-- `build.sh` — 编译 staticlib + 汇编 bootsect/setup/head，ld 链接成 system，拼 `target/boot/shitix.img`
-- `test.sh` — 一键构建 + QEMU（`if=ide`, `-m 256M`）无头启动，抓串口日志匹配 `SHITIX_BOOT_OK`；子命令 `run` / `debug`
-
-## ./ (新增)
-
-- `rust-toolchain.toml` — 固定 nightly + `x86_64-unknown-none` target（mm/中断要用 nightly-only feature 与 `x86_64` crate）
 
 ## linux/
 
@@ -627,3 +603,285 @@
 - `sys.c` — include <linux/config.h> (~5277 tok)
 - `time.c` — Declares functions (~3578 tok)
 - `traps.c` — include <linux/head.h> (~2036 tok)
+- `vsprintf.c` — include <stdarg.h> (~1579 tok)
+
+## linux/lib/
+
+- `_exit.c` — define __LIBRARY__ (~86 tok)
+- `close.c` — define __LIBRARY__ (~44 tok)
+- `ctype.c` — include <linux/ctype.h> (~350 tok)
+- `dup.c` — define __LIBRARY__ (~43 tok)
+- `errno.c` (~26 tok)
+- `execve.c` — define __LIBRARY__ (~56 tok)
+- `Makefile` — Make build targets (~164 tok)
+- `malloc.c` (~0 tok)
+- `open.c` — define __LIBRARY__ (~126 tok)
+- `setsid.c` — define __LIBRARY__ (~51 tok)
+- `string.c` — ifndef __GNUC__ (~65 tok)
+- `wait.c` — define __LIBRARY__ (~80 tok)
+- `write.c` — define __LIBRARY__ (~60 tok)
+
+## linux/mm/
+
+- `kmalloc.c` — include <linux/mm.h> (~2603 tok)
+- `Makefile` — Make build targets (~163 tok)
+- `memory.c` — Declares clears (~9302 tok)
+- `mmap.c` — include <linux/stat.h> (~3529 tok)
+- `swap.c` — include <linux/mm.h> (~5800 tok)
+- `vmalloc.c` — include <asm/system.h> (~1298 tok)
+
+## linux/net/
+
+- `ddi.c` — include <asm/segment.h> (~616 tok)
+- `Makefile` — Make build targets (~273 tok)
+- `socket.c` — Declares char (~8134 tok)
+- `Space.c` — include <linux/config.h> (~655 tok)
+
+## linux/net/inet/
+
+- `arp.c` — Declares as (~7284 tok)
+- `arp.h` — Declares as (~580 tok)
+- `datagram.c` (~1413 tok)
+- `dev.c` — Declares as (~7070 tok)
+- `dev.h` — Declares as (~1919 tok)
+- `eth.c` — Declares as (~1422 tok)
+- `eth.h` — Declares as (~350 tok)
+- `icmp.c` — Declares as (~3952 tok)
+- `icmp.h` — Declares as (~328 tok)
+- `inet.h` — Declares as (~1020 tok)
+- `ip.c` — Declares as (~11799 tok)
+- `ip.h` — Declares as (~859 tok)
+- `loopback.c` — Declares as (~961 tok)
+- `Makefile` — Make build targets (~240 tok)
+- `packet.c` — Declares as (~1800 tok)
+- `proc.c` — Declares as (~1115 tok)
+- `protocol.c` — Declares as (~1152 tok)
+- `protocol.h` — Declares as (~526 tok)
+- `raw.c` — Declares as (~2716 tok)
+- `raw.h` — Declares as (~365 tok)
+- `README` (~411 tok)
+- `route.c` — Declares as (~2828 tok)
+- `route.h` — Declares as (~402 tok)
+- `skbuff.c` — Declares as (~2898 tok)
+- `skbuff.h` — Declares as (~1112 tok)
+- `sock.c` — Declares as (~12153 tok)
+- `sock.h` — Declares as (~2570 tok)
+- `tcp.c` — as: tweaked (~27306 tok)
+- `tcp.h` — Declares as (~1161 tok)
+- `timer.c` — Declares as (~1994 tok)
+- `udp.c` — Declares as (~4305 tok)
+- `udp.h` — Declares as (~470 tok)
+- `utils.c` — Declares as (~804 tok)
+
+## linux/net/unix/
+
+- `Makefile` — Make build targets (~170 tok)
+- `proc.c` — Declares as (~640 tok)
+- `sock.c` — Declares as (~7018 tok)
+- `unix.h` — Declares as (~594 tok)
+
+## linux/tools/
+
+- `build.c` (~1630 tok)
+- `version.c` — include <linux/config.h> (~127 tok)
+
+## linux/zBoot/
+
+- `crypt.h` — ifdef CRYPT (~73 tok)
+- `gzip.h` — if defined(__STDC__) || defined(PROTO) (~2723 tok)
+- `head.S` (~340 tok)
+- `inflate.c` — define DEBG(x) (~6341 tok)
+- `lzw.h` — if !defined(OF) && defined(lint) (~425 tok)
+- `Makefile` — Make build targets (~158 tok)
+- `misc.c` — include "gzip.h" (~2855 tok)
+- `piggyback.c` — include <stdio.h> (~415 tok)
+- `unzip.c` (~1538 tok)
+- `xtract.c` — include <stdio.h>	/* fprintf */ (~438 tok)
+
+## scripts/
+
+- `build.sh` — 构建 shitix：bootsect + setup + system(head.S + Rust) -> 可引导磁盘镜像 (~857 tok)
+- `test.sh` — 一键编译 + 在 QEMU 中启动 + 校验启动结果 (~557 tok)
+
+## src/
+
+- `console.rs` — VGA 文本模式控制台（0xB8000, 80x25, 16 色） (~2006 tok)
+  - class `Color` L26-47 (~107 tok)
+  - class `ColorCode` L48-49 (~8 tok)
+  - section `ColorCode` L50-58 (~57 tok)
+  - class `ScreenChar` L59-66 (~55 tok)
+  - class `Writer` L67-79 (~84 tok)
+  - fn `writer` L80-85 (~54 tok)
+  - section `Writer` L86-160 (~672 tok)
+  - section `Writer` L161-172 (~60 tok)
+  - fn `clear` L173-185 (~67 tok)
+  - fn `set_color` L186-193 (~51 tok)
+  - fn `restore_color` L194-198 (~30 tok)
+  - fn `_print` L199-206 (~58 tok)
+  - fn `_print_colored` L207-213 (~50 tok)
+  - fn `sync_cursor` L214-220 (~49 tok)
+  - fn `set_cursor` L221-271 (~393 tok)
+- `desc.rs` — GDT / TSS / IDT 的建立与装载。 (~3996 tok)
+  - class `ExcStack` L68-78 (~105 tok)
+  - class `GdtEntry` L79-89 (~94 tok)
+  - class `Tss` L90-116 (~192 tok)
+  - class `DescriptorTablePointer` L117-227 (~1108 tok)
+  - fn `rsp0` L228-233 (~41 tok)
+  - fn `dump` L234-249 (~129 tok)
+  - class `IdtEntry` L250-261 (~69 tok)
+  - section `IdtEntry` L262-289 (~240 tok)
+  - class `GateKind` L290-425 (~1423 tok)
+- `e820.rs` — E820 内存图访问。 (~497 tok)
+- `irq.rs` — 硬件中断（IRQ）与 8259A PIC。对应 linux-1.0.9 的 `kernel/irq.c`。 (~4322 tok)
+  - class `IrqAction` L69-78 (~63 tok)
+  - section `IrqAction` L79-111 (~251 tok)
+  - fn `irq_stub` L112-209 (~725 tok)
+  - fn `irqs_enabled` L210-220 (~90 tok)
+  - fn `disable_irq` L221-243 (~171 tok)
+  - fn `enable_irq` L244-269 (~205 tok)
+  - fn `irq_mask` L270-285 (~124 tok)
+  - fn `request_irq` L286-310 (~225 tok)
+  - fn `free_irq` L311-327 (~124 tok)
+  - fn `irq_count` L328-336 (~62 tok)
+  - fn `spurious_count` L337-410 (~650 tok)
+  - fn `init_bh` L411-419 (~71 tok)
+  - fn `mark_bh` L420-505 (~816 tok)
+  - fn `no_action` L506-508 (~28 tok)
+  - fn `dump` L509-519 (~100 tok)
+- `lib.rs` — shitix 内核入口 (~6516 tok)
+  - class `BootParams` L32-122 (~872 tok)
+  - fn `mm_selftest` L123-203 (~935 tok)
+  - fn `klib_selftest` L204-373 (~2142 tok)
+  - fn `probe_bumped` L374-379 (~43 tok)
+  - fn `trap_selftest` L380-438 (~605 tok)
+  - fn `syscall_selftest` L439-486 (~493 tok)
+  - fn `sched_selftest` L487-561 (~771 tok)
+  - fn `worker` L562-577 (~153 tok)
+  - fn `idle_loop` L578-591 (~139 tok)
+  - fn `halt_loop` L592-599 (~52 tok)
+  - fn `panic` L600-616 (~116 tok)
+- `serial.rs` — COM1 (0x3F8) 串口输出，供 QEMU `-serial stdio` 抓取，测试脚本据此判定启动结果。 (~723 tok)
+  - fn `init` L24-36 (~120 tok)
+  - fn `putc` L37-44 (~46 tok)
+  - fn `print` L45-54 (~49 tok)
+  - class `Writer` L55-56 (~6 tok)
+  - section `Writer` L57-64 (~51 tok)
+  - fn `_print` L65-93 (~191 tok)
+  - fn `print_dec` L94-111 (~86 tok)
+- `traps.rs` — 异常与陷阱处理。对应 linux-1.0.9 的 `kernel/traps.c`。 (~3243 tok)
+  - class `PtRegs` L28-57 (~174 tok)
+  - section `PtRegs` L58-73 (~92 tok)
+  - class `TrapInfo` L74-133 (~730 tok)
+  - fn `trap_count` L134-164 (~230 tok)
+  - fn `last_trap_vector` L165-226 (~570 tok)
+  - fn `send_sig_stub` L227-239 (~155 tok)
+  - fn `die_if_kernel` L240-301 (~769 tok)
+  - fn `dump_counts` L302-317 (~120 tok)
+  - fn `dump_segments` L318-329 (~129 tok)
+
+## src/klib/
+
+- `ctype.rs` — 字符分类表。对应 linux-1.0.9 的 `lib/ctype.c` + `include/linux/ctype.h`。 (~901 tok)
+- `errno.rs` — 错误码。对应 linux-1.0.9 的 `include/linux/errno.h`（表体）+ (~1985 tok)
+  - fn `from_raw` L15-20 (~45 tok)
+  - fn `to_raw` L21-178 (~1818 tok)
+- `mod.rs` — 内核基础库。对应 linux-1.0.9 的 `lib/` 目录 + 被它引用的两个内核文件。 (~255 tok)
+- `printk.rs` — 内核日志。对应 linux-1.0.9 的 `kernel/printk.c` + (~2287 tok)
+  - class `Level` L20-38 (~83 tok)
+  - section `Level` L39-88 (~448 tok)
+  - class `LogBuf` L89-117 (~236 tok)
+  - fn `set_console_loglevel` L118-128 (~70 tok)
+  - fn `console_loglevel` L129-134 (~37 tok)
+  - fn `set_serial_echo` L135-140 (~44 tok)
+  - fn `logged_chars` L141-146 (~41 tok)
+  - fn `log_size` L147-152 (~42 tok)
+  - fn `read_log` L153-171 (~160 tok)
+  - fn `_printk` L172-190 (~176 tok)
+  - fn `_printk_level` L191-198 (~68 tok)
+  - fn `emit` L199-290 (~715 tok)
+- `string.rs` — C 风格字符串与内存块操作。对应 linux-1.0.9 的 `include/linux/string.h` (~3116 tok)
+- `vsprintf.rs` — 数值/格式化输出。对应 linux-1.0.9 的 `kernel/vsprintf.c`。 (~2848 tok)
+  - fn `skip_atoi` L84-96 (~90 tok)
+  - class `NumFlags` L97-98 (~9 tok)
+  - section `NumFlags` L99-123 (~181 tok)
+  - section `NumFlags` L124-130 (~44 tok)
+  - section `NumFlags` L131-138 (~57 tok)
+  - class `Cursor` L139-144 (~32 tok)
+  - section `Cursor` L145-207 (~365 tok)
+  - section `Cursor` L208-226 (~176 tok)
+  - fn `number` L227-246 (~190 tok)
+  - fn `number_u64` L247-252 (~74 tok)
+  - fn `number_inner` L253-352 (~716 tok)
+  - fn `vsprintf` L353-362 (~85 tok)
+  - fn `sprintf` L363-380 (~152 tok)
+
+## src/mm/
+
+- `kmalloc.rs` — 内核小块内存分配器。 (~2177 tok)
+  - class `BlockHeader` L29-40 (~78 tok)
+  - class `PageDescriptor` L41-53 (~82 tok)
+  - fn `page_desc_of` L54-59 (~35 tok)
+  - class `SizeDescriptor` L60-88 (~241 tok)
+  - fn `get_order` L89-99 (~97 tok)
+  - fn `kmalloc` L100-174 (~696 tok)
+  - fn `kzalloc` L175-240 (~607 tok)
+  - fn `stats` L241-250 (~67 tok)
+- `mod.rs` — 内存管理子系统。 (~318 tok)
+- `page_alloc.rs` — 物理页帧分配器。 (~2412 tok)
+  - class `MemInfo` L42-178 (~1239 tok)
+  - fn `get_free_page_raw` L179-203 (~253 tok)
+  - fn `get_free_page` L204-214 (~84 tok)
+  - fn `free_page` L215-243 (~257 tok)
+  - fn `get_page` L244-258 (~94 tok)
+  - fn `nr_free_pages` L259-263 (~32 tok)
+  - fn `page_count` L264-273 (~66 tok)
+- `page.rs` — 分页相关的基本常量与换算。 (~287 tok)
+- `paging.rs` — 页表操作：建立映射、查询、撤销。 (~2141 tok)
+  - fn `pml4_index` L40-43 (~20 tok)
+  - fn `pdpt_index` L44-47 (~20 tok)
+  - fn `pd_index` L48-51 (~19 tok)
+  - fn `pt_index` L52-56 (~38 tok)
+  - fn `invalidate` L57-66 (~101 tok)
+  - fn `invalidate_page` L67-74 (~66 tok)
+  - fn `current_pml4` L75-244 (~1512 tok)
+
+## src/sched/
+
+- `mod.rs` — 进程调度。对应 linux-1.0.9 的 `kernel/sched.c` + `kernel/fork.c`。 (~7116 tok)
+  - fn `current_nr` L74-102 (~230 tok)
+  - fn `jiffies` L103-108 (~49 tok)
+  - fn `context_switches` L109-115 (~50 tok)
+  - fn `set_need_resched` L116-319 (~1884 tok)
+  - fn `do_timer` L320-352 (~287 tok)
+  - class `WaitQueue` L353-361 (~62 tok)
+  - section `WaitQueue` L362-577 (~1846 tok)
+  - fn `kernel_thread` L578-765 (~1786 tok)
+  - fn `print_current` L766-776 (~107 tok)
+  - fn `show_state` L777-788 (~104 tok)
+- `task.rs` — 进程控制块。对应 linux-1.0.9 的 `include/linux/sched.h` 里的 (~1904 tok)
+  - class `TaskState` L29-74 (~374 tok)
+  - class `Tss` L75-89 (~110 tok)
+  - section `Tss` L90-97 (~52 tok)
+  - class `Task` L98-154 (~439 tok)
+  - section `Task` L155-234 (~658 tok)
+
+## src/syscall/
+
+- `mod.rs` — 系统调用。对应 linux-1.0.9 的 `kernel/sys_call.S` 的分发部分 + (~1913 tok)
+  - class `SysArgs` L63-71 (~36 tok)
+  - section `SysArgs` L72-107 (~277 tok)
+  - fn `syscall_count` L108-169 (~562 tok)
+  - fn `set_carry` L170-218 (~365 tok)
+  - fn `dump` L219-223 (~41 tok)
+- `sys.rs` — 系统调用的具体实现。对应 linux-1.0.9 的 `kernel/sys.c` 与 (~1562 tok)
+  - fn `ni_syscall` L17-21 (~38 tok)
+  - fn `getpid` L22-28 (~64 tok)
+  - fn `getppid` L29-37 (~77 tok)
+  - fn `getpgrp` L38-46 (~77 tok)
+  - fn `pause` L47-66 (~187 tok)
+  - fn `times` L67-81 (~140 tok)
+  - fn `write` L82-117 (~318 tok)
+  - fn `exit` L118-142 (~241 tok)
+  - fn `uname` L143-152 (~115 tok)
+  - fn `idle` L153-164 (~97 tok)
+  - fn `not_implemented` L165-174 (~64 tok)
