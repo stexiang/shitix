@@ -43,5 +43,5 @@ This project uses OpenWolf for context management. Read and follow .wolf/OPENWOL
 | 0x901E0 | E820 条目数 |
 | 0x90200 | setup（4 个扇区）|
 | 0x9E000 | E820 条目数组（20 字节/条，最多 128 条）|
-| 0x70000-0x72FFF | PML4 / PDPT / PD，恒等映射低 1GB（2MB 大页）|
+| 0x4000-0x6FFF | PML4 / PDPT / PD，恒等映射低 1GB（2MB 大页）|
 | 0x10000 | system：head.S + Rust 内核 |

@@ -62,3 +62,42 @@
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|
+
+## Session: 2026-08-02 14:02
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-02 14:21
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-02 17:18
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## 2026-08-02 模块 5 收尾（fs + 驱动正确性）
+| 时间 | 动作 | 文件 | 结果 | ~tokens |
+|------|------|------|------|---------|
+| --:-- | 修正自检 4/5 用只写 fd 去读（sys_creat 给的是 O_WRONLY）| src/lib.rs | 8/8 子测试通过 | ~3k |
+| --:-- | 自检 1 用 bread 取代 getblk（部分写要先读，否则残留写回盘）| src/lib.rs | 修掉根文件系统随机损坏 | ~2k |
+| --:-- | mount_root + fs 自检移入内核线程 fs_init_thread | src/lib.rs | fs 终于在可睡眠上下文跑 | ~5k |
+| --:-- | 内核栈改静态池 4 页 + 栈魔数自检 | src/sched/mod.rs | 修掉 CORRUPTED STACK | ~4k |
+| --:-- | kernel.ld 加 ASSERT(_kernel_end <= 0x90000)（已验证会触发）| boot/kernel.ld | 链接期拦住 BSS 越界 | ~1k |
+| --:-- | 修 make_request / wait_on_buffer / add_request 三处丢失唤醒与临界区 | ll_rw.rs, buffer.rs, inode.rs, super_block.rs | 失败率 从 ~35% 降到 ~15% | ~8k |
+| --:-- | printk/console 加中断临界区（补上上阶段已知缺口）| klib/printk.rs, console.rs | — | ~2k |
+| --:-- | panic 走串口 + Display info.message() | src/lib.rs | 诊断从「一无所知」到「一行定位」 | ~2k |
+| --:-- | 加一批不变量护栏（bh/inode 下标、data 空指针、链表下标、低端页、mkfs 写后读）| 多处 | 随机 page fault → 确定性断言 | ~5k |
+| --:-- | **遗留**：约 15% 概率的 fs 自检失败未定位，见 buglog bug-023 | — | 未解决 | — |
+
+## Session: 2026-08-02 19:50
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-02 04:00
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|

@@ -12,8 +12,10 @@ use core::fmt;
 
 /// VGA 文本缓冲区物理地址。setup.S 建的恒等映射覆盖低 1GB，可直接用物理地址访问。
 const VGA_BUF: *mut ScreenChar = 0xB_8000 as *mut ScreenChar;
-const COLS: usize = 80;
-const ROWS: usize = 25;
+/// 文本模式列数。给 tty 的 `winsize` 用。
+pub const COLS: usize = 80;
+/// 文本模式行数。
+pub const ROWS: usize = 25;
 
 /// CRT 控制器索引/数据端口，同原版 console.c 的 `video_port_reg/video_port_val`。
 const CRT_REG: u16 = 0x3D4;
@@ -182,6 +184,15 @@ pub fn clear() {
     set_cursor(0, 0);
 }
 
+/// 写一个字节并同步硬件光标。给 `drivers/char_dev/console.rs`（tty 的输出端）用。
+///
+/// 原版对应的是 `console.c:con_write()` 里那个 `switch` 的默认分支
+/// （直接把字符送显存）加上末尾的 `set_cursor()`。
+pub fn putb(b: u8) {
+    writer().putc(b);
+    sync_cursor();
+}
+
 /// 设置后续输出的前景/背景色，返回旧属性以便调用方恢复。
 pub fn set_color(fg: Color, bg: Color) -> ColorCode {
     let w = writer();
@@ -198,9 +209,17 @@ pub fn restore_color(c: ColorCode) {
 /// `print!` / `cprint!` 的实际实现，不要直接调用。
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
+    // 关中断跑完整段。Writer 的 row/col 是非原子的多步更新，CRT 的
+    // 索引/数据两次 outb 也必须成对；中断里也会打印（do_timer/do_trap
+    // 都会），插进来就会写坏光标位置。原版的 console 输出同样在
+    // `cli()`/`restore_flags()` 之间。
+    // SAFETY: 只是关中断再恢复；重入由关中断本身排除。
+    let flags = unsafe { crate::irq::local_irq_save() };
     // write_str 的实现永不返回 Err，unwrap 会引入 panic 路径，故显式忽略。
     let _ = writer().write_fmt(args);
     sync_cursor();
+    // SAFETY: flags 来自上面的 local_irq_save。
+    unsafe { crate::irq::restore_flags(flags) }
 }
 
 /// 以指定颜色输出一段格式化内容，结束后恢复原属性。

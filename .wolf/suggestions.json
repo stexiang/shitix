@@ -1,4 +1,39 @@
 {
-  "suggestions": [],
-  "generated_at": null
+  "generated_at": "2026-08-02T20:01:08.671Z",
+  "achievements": [
+    "模块 3（klib）落地：src/klib/ 下 ctype/string/errno/vsprintf/printk 五个模块移植完成，klib_selftest 6 组全绿，debug+release 双 profile 零警告启动",
+    "模块 4（中断/调度/系统调用）打通：boot/entry.S 定下 pt_regs ABI（21 异常桩 + 16 IRQ 桩 + system_call + switch_to + ret_from_fork），src/desc.rs 接管 GDT/TSS/IDT，src/traps.rs 统一 21 向量分发，src/irq.rs 完成 8259A 重映射到 0x20-0x2F 与 request/free_irq + bottom half，src/sched/ 实现 task_struct + 两遍扫描 schedule + WaitQueue + kernel_thread，src/syscall/ 打通 int 0x80 链路（9 个 sys_*）；跨 -m 32M/1G × debug/release 四轮验证 42 次上下文切换全 PASS",
+    "模块 5（fs + 驱动）成型：src/fs/（buffer cache、inode、super_block、file_table、namei、open、read_write、stat、devices）+ src/fs/minix/（bitmap/dir/file/inode_ops/namei/truncate/mkfs）+ src/drivers/（ramdisk、ll_rw 请求队列、tty、keyboard、console、mem），fs 自检 8/8 子测试可通过",
+    "并发正确性一轮硬修：printk::emit 与 console::_print 加中断临界区；add_request / make_request / wait_on_buffer 三处丢失唤醒与临界区补齐，fs 自检失败率从 ~35% 降到 ~15%",
+    "可诊断性大幅提升：panic 走串口 + Display info.message()（定位从「一无所知」变成「一行够」），内核栈改静态 4 页池 + 栈魔数自检修掉 CORRUPTED STACK，kernel.ld 加 ASSERT(_kernel_end <= 0x90000) 在链接期拦 BSS 越界",
+    "工具链与流程稳定：nightly + rust-toolchain.toml 固定；build.sh 过滤 snap-confine 的 ld.so.preload 噪音；anatomy 索引上限 500→900，src/ 树终于进索引（629 文件）"
+  ],
+  "improvements": [
+    "为 buffer cache 加环形事件追踪（getblk/brelse/add_request/end_request 各记 dev/block/b_size/caller/jiffies，事后 dump），这是定位 bug-023 的正确下一步——护栏已饱和，再加断言收益为零",
+    "BufferHead 加显式构造不变量：b_size 只允许在 init 路径写入，其他路径 debug_assert b_size != 0；把「未 init 却挂进链」变成编译期难以表达的形状（如 data 指针与 b_size 打包成一个不可分构造的结构）",
+    "把 cli/sti 手工配对全部换成 RAII guard（mm/kmalloc.rs 里已有 IrqGuard，推广到 irq.rs / buffer.rs / ll_rw.rs / inode.rs / super_block.rs），消除新增 early-return 时漏 restore_flags 的整类 bug",
+    "所有「仅被中断修改」的全局量统一封成 Volatile<T> 小包装（jiffies、TRAP_COUNT、need_resched、IRQ 计数），而不是靠每个读取点记得 read_volatile——这是已重复踩过两次的坑（bug-005/006）",
+    "src/lib.rs 已 ~10.7k tokens 且塞了 7 个 selftest 函数，把它们拆到 src/selftest/{mm,klib,traps,syscall,sched,fs}.rs，并用 cfg feature 控制，让 lib.rs 回到纯 boot 序列",
+    "klib::printk::emit 的 SAFETY 注释仍写着「假设不与中断并发」，实际已加锁——注释与实现不一致，需同步（安全注释失真比没注释更危险）",
+    "x86_64 crate 目前实际未使用（手写描述符已成定局），移除依赖以减小构建面与 nightly 漂移风险",
+    "traps.rs 的 die_if_kernel 输出加寄存器+栈回溯（沿 rbp 链走 8 层），fork/signal 阶段的调试会立刻受益"
+  ],
+  "next_tasks": [
+    "【最高优先】收尾 bug-023：按 STATUS.md 计划用 qemu -d int + 事件环形缓冲复现 b_size==0 的缓冲头来源；先跑 100 次自动化循环统计失败率基线（scripts 里加 stress 目标），修完再跑 100 次确认归零。不要在 15% 随机失败之上叠加 signal/fork——那会让所有新 bug 都不可归因",
+    "src/signal.rs：移植 kernel/signal.c 的 sigaction/sigset/send_sig/do_signal；src/sched/task.rs 补 sigaction[32] 与 exit_signal；traps.rs 的 send_sig_stub 换成真 send_sig（验收：用户态 page fault 真的杀进程）",
+    "boot/entry.S 的 ret_from_sys_call 里插 do_signal 调用（对应原版 signal_return），确保返回用户态前投递待处理信号",
+    "src/exit.rs：do_exit → TASK_ZOMBIE → notify_parent → sys_waitpid → release 回收内核栈；task.rs 补 p_cptr/p_ysptr/p_osptr 亲子链。这同时消掉「内核线程退出泄漏一页栈」的已知缺口",
+    "src/fork.rs + mm/paging.rs 的 copy_page_tables/clone_page_tables：sys_fork 复制出真子进程，父子返回不同 pid（这是接用户态的前提，也是第一次真正压测页分配器的引用计数）",
+    "scripts/test.sh 加 --repeat N 与失败工件归档（serial.log + screendump 按次编号存），把「15% 概率」这类问题从人工重跑变成一条命令",
+    "决定 entry.S:syscall_entry 是否本阶段启用——建议推迟到 fork/exit 稳定后，因为它需要 per-cpu 用户栈暂存位，而 per-cpu 基建现在没有"
+  ],
+  "risks": [
+    "bug-023 未定位是当前最大风险：症状（b_size==0、缓冲里出现 BIOS ROM 的 0xf000ff53、mount 找不到魔数、漏一个 zone）表明仍有一处非原子的链表/指针更新与中断交错。带着 15% 随机失败进入 signal/fork/copy_page_tables 阶段，新 bug 与旧 bug 将无法区分，回归成本会指数上升",
+    "sys_write 缺 verify_area，目前只接受落在恒等映射低 1GB 内的地址。fork 之后有了真进程地址空间，这个漏洞会从「限制」变成「随机内核内存写坏」。真正修好要等 mm/mmap.c 的 vm_area_struct——需要提前决定过渡方案（至少加范围+权限白名单检查）",
+    "内核镜像被 kernel.ld 的 ASSERT 约束在 _kernel_end <= 0x90000（该断言已被触发过一次）。fs/drivers 的静态表已经很占地方，signal+fork+mmap 的静态结构可能再次撞线；建议现在就把大表改成启动期动态分配（mem_map 已有 .max(0x100000) 的先例）",
+    "内核栈是固定 4 页静态池：任务数上限与栈深都是硬约束，fork 一旦能产出多进程会迅速耗尽；release 回收路径不落地前，栈池就是拒绝服务点",
+    "并发原语过于原始——全靠 cli/restore_flags，没有任何锁抽象。当前是单核所以能撑住，但每个新增睡眠点（fs 已经证明）都可能引入丢失唤醒；WaitQueue 的 sleep_on/wake_up 竞态需要一次专门审计而不是逐 bug 修",
+    "手写 GDT/IDT 位拼装已经因 L&&D 非法组合导致过一次三重错误（bug-003），且 nightly 无版本上界固定（rust-toolchain.toml 若写的是浮动 channel，某次 asm!/裸函数语义变化会直接炸），建议钉死具体 nightly 日期",
+    "回归覆盖依赖内核内自检 + 串口日志断言，没有独立测试框架；自检本身出错过（4/5 用只写 fd 去读、自检 1 用 getblk 导致残留写回）——即「测试说谎」已发生过，绿灯的可信度需要靠 stress 重复次数来补"
+  ]
 }

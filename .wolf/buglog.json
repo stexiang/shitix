@@ -185,6 +185,249 @@
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-011",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "完全空白的串口日志；qemu -d cpu_reset 显示三重错误、寄存器全零",
+      "file": "boot/setup.S",
+      "root_cause": "模块 5 让内核 BSS 长到 _kernel_end=0x76680，盖住了 setup.S 在 0x70000-0x72FFF 建的四级页表；head.S 清 BSS 时把页表清零，切 long mode 立刻三重错误。",
+      "fix": "页表搬到 0x4000/0x5000/0x6000（long mode 之后这段没人用，且 page_alloc 的 MIN_USABLE_PHYS=0x100000 保证它不会进空闲链表）。",
+      "tags": [
+        "boot",
+        "bss",
+        "page-table",
+        "triple-fault",
+        "linker"
+      ],
+      "related_bugs": [
+        "bug-001",
+        "bug-002"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-012",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "fs 自检 6 间歇性失败：free zones 235 -> 234（约 1/10 概率漏一个 zone），漏的块号每次不同",
+      "file": "src/lib.rs",
+      "root_cause": "mount_root 和整个 fs 自检跑在 task[0] 里。fs/buffer 全路径的契约都是「可能会睡」（getblk 等 buffer_wait、wait_on_buffer 等 b_lock、iget 等 i_lock），而 sleep_on 对 task[0] 是 panic。缓冲够用时侥幸跑通，一旦竞态分支被触及就出现丢块/目录项 inode 号损坏（观察到 ino=65189）。原版的 mount_root 是在 init 进程（task[1]）里跑的，idle 从不碰文件系统。",
+      "fix": "新增内核线程 fs_init_thread 承担 mkfs/mount_root/fs_selftest，task[0] 轮询 FS_INIT_DONE 等它完成。",
+      "tags": [
+        "fs",
+        "buffer",
+        "sleep",
+        "task0",
+        "scheduler",
+        "nondeterministic"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-013",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "[WARN] minix_getblk: block>big 刷屏两万多行；根文件系统随机损坏",
+      "file": "src/lib.rs",
+      "root_cause": "自检 1 用 getblk 拿块 200，只覆盖头 8 字节就置 b_uptodate 并 sync_dev。getblk 给的是刚回收的缓冲，剩下 1016 字节是上一个块的残留，于是残留被当作块 200 的内容写回盘上，破坏文件系统元数据。",
+      "fix": "改用 bread（先把真实内容读进来）再局部覆盖——正是 minix/file.rs 里「部分写要先读」那条注释说的坑。",
+      "tags": [
+        "fs",
+        "buffer",
+        "partial-write",
+        "uptodate",
+        "selftest"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-014",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "fsinit 线程出现 CORRUPTED STACK + CR2=0xffffffffffffffe9 的 page fault",
+      "file": "src/sched/mod.rs",
+      "root_cause": "内核线程栈只给一页（照搬原版 kernel_stack_page）。x86_64 的栈帧比 i386 大一倍（指针 8 字节、寄存器多一半），而 fs 调用链很深（sys_open→namei→dir_namei→minix_lookup→find_entry→minix_bread→getblk→ll_rw_block→do_rd_request），再加上自检里两个 1KB 的栈上数组，一页不够。",
+      "fix": "内核栈改成从静态池分配 2 页（KSTACK_PAGES=2, KSTACK_SLOTS=4）；自检的 1KB 缓冲移到 static；跑完显式查栈底魔数。",
+      "tags": [
+        "stack-overflow",
+        "kernel-thread",
+        "x86_64",
+        "fs"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-015",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "内核栈静态池把 BSS 顶到 0xb4e70，mm 初始化前就 panic（内存大小是垃圾值）",
+      "file": "boot/kernel.ld",
+      "root_cause": "按 NR_TASKS(16) × 4 页开池 = 240KB，BSS 长过 0x90000，盖掉 setup.S 留在 0x90000 的机器参数和 0x9E000 的 E820 表。",
+      "fix": "池缩到 4 份 × 2 页；并在 kernel.ld 里加 ASSERT(_kernel_end <= 0x90000) 在链接期拦住这类事故（已验证会触发）。",
+      "tags": [
+        "bss",
+        "linker",
+        "boot",
+        "setup-params"
+      ],
+      "related_bugs": [
+        "bug-011"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-016",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "make_request 里丢失唤醒：等请求槽位的任务可能永久睡死",
+      "file": "src/drivers/block/ll_rw.rs",
+      "root_cause": "原版是 `repeat: cli(); ... sleep_on(&wait_for_request); sti(); goto repeat;`——带着关中断状态去睡。我移植时在 sleep_on 之前就 restore_flags，于是「get_request 返回 NIL」和「挂上等待队列」之间有窗口，end_request 在这个窗口里的 wake_up 就丢了。",
+      "fix": "把 restore_flags 移到 sleep_on 之后（sleep_on 内部会在 schedule 前 sti，不会真的关着中断睡）。",
+      "tags": [
+        "lost-wakeup",
+        "interrupt",
+        "block-layer",
+        "race"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-017",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "minix_truncate: giving up after 17 retries；某个缓冲 b_count 卡在 2 不回落，导致漏块",
+      "file": "src/fs/buffer.rs",
+      "root_cause": "wait_on_buffer 写成 `while b_lock { sleep_on() }`，先判条件后挂队列。原版 __wait_on_buffer 的顺序相反：先 add_wait_queue、再在循环里 `state=UNINTERRUPTIBLE; if (b_lock) schedule();`。先判后挂之间的窗口会丢掉 end_request 的 wake_up，任务永久睡死、b_count 再也回不到 1。",
+      "fix": "新增 sched::WaitQueue::sleep_on_while（先挂队列、关中断下反复复查条件），wait_on_buffer/wait_on_inode/wait_on_super 都改用它。",
+      "tags": [
+        "lost-wakeup",
+        "buffer",
+        "truncate",
+        "race",
+        "sleep"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-018",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "改用 sleep_on_while 后立刻三重错误、串口零字节输出",
+      "file": "src/fs/buffer.rs",
+      "root_cause": "闭包写成 `(*addr_of_mut!(bh(n).b_wait)).sleep_on_while(|| bh(n).b_lock)`：通过 bh() 同时取 &mut b_wait 和读 b_lock，是对同一个 static mut 的两条重叠可变借用路径，优化后读到过期值。",
+      "fix": "先把 &mut *bh(n) 化成裸指针，再分别取 b_wait 和 b_lock 的指针，条件用 read_volatile 读。",
+      "tags": [
+        "static-mut",
+        "aliasing",
+        "UB",
+        "volatile",
+        "triple-fault"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-019",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "panic 信息只出现在 VGA 上，无头测试的串口日志里只有一行 SHITIX_PANIC",
+      "file": "src/lib.rs",
+      "root_cause": "panic handler 用 println!（只写 VGA）而不是 kprintln!（VGA + 串口）。",
+      "fix": "panic handler 改用 kprintln!。这直接把后续几个 bug 的定位时间从「一无所知」变成「一行就够」。",
+      "tags": [
+        "panic",
+        "serial",
+        "diagnostics",
+        "logging"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-020",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "printk / console 输出与中断上下文并发，写坏 log_buf 下标和 VGA 光标",
+      "file": "src/klib/printk.rs",
+      "root_cause": "emit() 的 SAFETY 注释假设「不与中断上下文并发」，但 do_timer/do_IRQ/do_trap 都会 printk。log_buf 的 head/total 和 Writer 的 row/col 都是非原子多步更新，CRT 的索引/数据两次 outb 也必须成对。原版 printk 用 cli()/restore_flags() 保护。这是 STATUS.md 里已记录的已知缺口，此次真的崩了。",
+      "fix": "emit() 拆成 emit_locked，外层用 local_irq_save/restore_flags 包住；console::_print 同样加上。",
+      "tags": [
+        "printk",
+        "console",
+        "interrupt",
+        "critical-section",
+        "race"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-021",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "add_request 不关中断操作 current_request 链表",
+      "file": "src/drivers/block/ll_rw.rs",
+      "root_cause": "原版 add_request 是 `req->next=NULL; cli(); ...; (dev->request_fn)(); sti();`——cli 一直罩到 request_fn 调完。我移植时整段没关中断，而 end_request 也会摘链（原版在中断上下文跑，中断本来就是关的）。两边交错时请求的 bh 指针错位，「读块 1」会把别的块的内容填进块 1 的缓冲并置上 b_uptodate。",
+      "fix": "整段用 local_irq_save/restore_flags 包住，含 request_fn 调用。",
+      "tags": [
+        "block-layer",
+        "interrupt",
+        "critical-section",
+        "race",
+        "request-queue"
+      ],
+      "related_bugs": [
+        "bug-016"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-022",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "panic 日志里只有 `KERNEL PANIC: at file:line`，assert! 里打的下标全丢",
+      "file": "src/lib.rs",
+      "root_cause": "用了 `info.message().as_str()`。as_str() 只对**字面量**消息返回 Some；带格式参数的（`assert!(c, \"idx={}\", i)`）一律 None——而那些恰恰是携带诊断值的。",
+      "fix": "直接 Display `info.message()`（PanicMessage 实现了 Display）。",
+      "tags": [
+        "panic",
+        "diagnostics",
+        "logging",
+        "assert"
+      ],
+      "related_bugs": [
+        "bug-019"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-023",
+      "timestamp": "2026-08-02T00:00:00Z",
+      "error_message": "【未解决】fs 自检约 15% 概率失败：buf 0 bytes / 链接下标含 0xf000ff53 / mount 找不到魔数 / 漏一个 zone",
+      "file": "src/fs/buffer.rs",
+      "root_cause": "未定位。已排除：页分配器重复派页、缓冲数据页落在低端内存、ramdisk PAGES 未初始化、缓冲重复（一块两缓冲）、空闲环下标越界、栈溢出。已确认的现象：某个缓冲头的 b_size 变成 0（说明它从没 init 过却挂进了链），以及缓冲内容出现 BIOS ROM 的 0xf000ff53 IRET stub。指向仍有一处非原子的链表/指针更新与中断交错。",
+      "fix": "未修复。已加的诊断护栏（保留）：bh()/inode() 下标断言、BufferHead::data/data_mut 的空指针检查、store_inode/parse_inode/write_u16 的边界断言、空闲环下标断言、buffer::init 的低端页断言、ramdisk block_addr 的未分配页断言、buffer::check_duplicates、mkfs 写后读校验、fsinit 栈魔数检查。下一步应该用 QEMU 的 -d int 配合在 add_request/end_request 里记录事件序列。",
+      "tags": [
+        "fs",
+        "buffer",
+        "race",
+        "interrupt",
+        "UNRESOLVED"
+      ],
+      "related_bugs": [
+        "bug-016",
+        "bug-017",
+        "bug-021"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-02T00:00:00Z"
     }
   ]
 }

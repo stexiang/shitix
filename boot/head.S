@@ -123,8 +123,27 @@ idt:
     .space  256*16
 
     .align 4096
+    /*
+     * 栈溢出护栏。task[0]（start_kernel 的执行流）用的就是这个栈，
+     * 而链接器把它排在 .bss 里 Rust 那些 static mut 表（BUFFERS /
+     * INODES / TASKS）的**后面**——地址更高。栈向下增长，溢出就会
+     * 从高地址往低地址踩进 BUFFERS，症状是缓冲头的 b_size/b_data 变
+     * 成 0（越界那一头正好落在 BUFFERS 的高下标上），或者链接下标里
+     * 出现别的表的字节。这类损坏离原因很远，所以在栈底之下留一页
+     * 哨兵，由 stack_guard_ok() 检查（见 src/sched/mod.rs）。
+     */
+    .align 4096
+    .global stack_guard
+stack_guard:
+    .space  512                         /* 哨兵：512 字节够检出连续下溢 */
     .global stack_bottom
 stack_bottom:
-    .space  16384                       /* 16KB 内核栈 */
+    /*
+     * task[0] 的栈。8KB：实测高水位 3832 字节（见 stack_high_water），
+     * 而 task[0] 不碰文件系统（那条深调用链在 fsinit 内核线程里跑），
+     * 所以不需要 16KB。省下的 8KB 留给 .bss 里的静态表——BSS 顶到
+     * 0x90000 就会盖掉 setup 参数区（链接脚本里有 ASSERT 拦住）。
+     */
+    .space  8192
     .global stack_top
 stack_top:
