@@ -500,7 +500,6 @@ pub unsafe fn put_super(dev: u16) {
 /// # Safety
 /// 启动期调用一次，需在 `fs::init()` 与驱动 `init()` 之后。
 pub unsafe fn mount_root(dev: u16, flags: u64) -> bool {
-    // SAFETY: 契约转交。
     unsafe {
         *core::ptr::addr_of_mut!(ROOT_DEV) = dev;
         *core::ptr::addr_of_mut!(ROOT_MOUNTFLAGS) = flags;
@@ -515,15 +514,13 @@ pub unsafe fn mount_root(dev: u16, flags: u64) -> bool {
         }
         // 见函数文档：逻辑上被引用 4 次
         (*inode::inode_ptr(root)).i_count += 3;
-        (*sb_ptr(n)).s_covered = root;
+        // s_covered 表示「被这个文件系统盖住的父文件系统目录」，根文件
+        // 系统没有父文件系统，必须保持 NIL（SuperBlock::new() 的默认值）——
+        // 之前这里误写成 root，把「盖住的目录」和「自己的根」搞混了。
         (*sb_ptr(n)).s_flags = flags;
 
-        // 原版：current->pwd = current->root = inode。
-        // 我们的 Task 还没有 pwd/root 字段（见 sched/task.rs 的取舍说明），
-        // 所以存在这里，由 namei 从这里取根。
         set_root_inode(root);
 
-        // 挂完立刻自检一遍关键字段，见 [`check_mounted`]
         check_mounted(n);
 
         pr_info!(
@@ -637,17 +634,16 @@ pub unsafe fn do_mount(dev_inode: usize, dir_inode: usize, flags: u64) -> i64 {
 /// # Safety
 /// 只能在进程上下文调用。
 pub unsafe fn do_umount(dev: u16) -> i64 {
-    // SAFETY: 契约转交。
     unsafe {
         let n = get_super(dev);
         if n == NIL {
             return -(ENOENT as i64);
         }
         if dev == root_dev() {
-            // 原版：根文件系统不能卸载，只能重挂成只读
-            if (*sb_ptr(n)).s_covered != root_inode() {
-                return -(EBUSY as i64);
-            }
+            // get_super(dev) with dev==root_dev() already guarantees `n`
+            // is the root superblock — no further check needed (and
+            // s_covered is NIL for root, so there's nothing meaningful
+            // to compare it against).
             buffer::fsync_dev(dev);
             sb(n).s_flags |= MS_RDONLY;
             sb(n).s_rd_only = true;
