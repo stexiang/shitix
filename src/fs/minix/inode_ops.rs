@@ -192,7 +192,9 @@ pub unsafe fn read_super(n: usize, silent: bool) -> bool {
         // 求值顺序依赖优化，踩过一次同类问题（见 fs::buffer::buf_ptr）。
         let (im0, zm0) = { let p = sb(n); (p.s_imap[0], p.s_zmap[0]) };
         bh(im0).data_mut()[0] |= 1;
+        buffer::mark_buffer_dirty(im0);
         bh(zm0).data_mut()[0] |= 1;
+        buffer::mark_buffer_dirty(zm0);
         super_block::unlock_super(n);
 
         // 现在能读 inode 了，取根 inode
