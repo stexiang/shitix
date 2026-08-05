@@ -14,6 +14,7 @@ pub mod fs;
 pub mod irq;
 pub mod klib;
 pub mod mm;
+pub mod net;
 pub mod sched;
 pub mod serial;
 pub mod syscall;
@@ -93,6 +94,7 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
 
     mm_selftest();
     klib_selftest();
+    net_selftest();
 
     // ---- 模块 4：描述符表 / 中断 / 系统调用 / 调度 ----
     // 顺序对应原版 start_kernel()：trap_init() → init_IRQ() → sched_init()
@@ -539,6 +541,12 @@ fn syscall_selftest() {
     unsafe { syscall::syscall0(nr::UNAME) };
     syscall::dump();
     serial::print("syscall: selftest done\n");
+}
+
+/// 网络协议栈自检。
+/// 测试覆盖：SkBuff、IP 校验和、地址转换、Ethernet、ARP、路由、Socket。
+fn net_selftest() {
+    net::tests::run_all();
 }
 
 /// 调度器自检：开中断验证时钟计数，再造两个内核线程看它们是否轮转。
