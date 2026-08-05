@@ -308,6 +308,7 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::GETCWD] = sys::getcwd;
     t[nr::RENAME] = sys::rename;
     t[nr::MKNOD] = sys::mknod;
+    t[nr::EXECVE] = sys::execve;
     t
 };
 

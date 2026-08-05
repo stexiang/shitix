@@ -18,6 +18,24 @@ pub fn ni_syscall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     -(EINVAL as i64)
 }
 
+/// 执行程序。对应原版 `fs/exec.c:sys_execve()`。
+///
+/// 参数：
+/// - a0: 文件名
+/// - a1: 参数数组
+/// - a2: 环境变量数组
+pub fn execve(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // TODO: 实现真正的程序加载
+    // 需要：
+    // 1. 解析 ELF 文件格式
+    // 2. 分配用户内存空间
+    // 3. 加载代码段和数据段
+    // 4. 设置栈
+    // 5. 切换到用户态
+    crate::pr_warn!("sys_execve: not implemented");
+    -(ENOSYS as i64)
+}
+
 /// 返回当前进程 pid。对应原版 `sched.c:sys_getpid()`。
 pub fn getpid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // SAFETY: 系统调用上下文里 current 必然有效。
