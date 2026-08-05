@@ -38,6 +38,15 @@
 - `src/net/inet/eth.rs` - Ethernet 处理
 - `src/net/inet/dev.rs` - 网络设备接口
 - `src/net/unix/mod.rs` - Unix domain socket
+- `src/net/tests.rs` - 自检测试（17 个测试全部通过）
+
+自检测试覆盖：
+- SkBuff: 创建、引用计数、队列、头部大小
+- IP: 校验和、地址转换、协议常量
+- Ethernet: 协议常量、广播/多播检测
+- ARP: 协议常量、缓存操作
+- 路由: 表创建、查找
+- Socket: 状态枚举、标志、哈希表
 
 TODO:
 - [ ] 实现 slab 分配器
