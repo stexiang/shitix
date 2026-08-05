@@ -831,3 +831,131 @@ pub fn getrlimit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if !rlim.is_null() { unsafe { (*rlim).rlim_cur = -1i64 as u64; (*rlim).rlim_max = -1i64 as u64; } }
     0
 }
+
+/// socket 创建。对应原版 `net/socket.c:sys_socket()`。
+pub fn socket(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let domain = args.a0 as i32;
+    let socket_type = args.a1 as i32;
+    let protocol = args.a2 as i32;
+    crate::pr_warn!("sys_socket: domain={}, type={}, protocol={} (stub)", domain, socket_type, protocol);
+    -(ENOSYS as i64)
+}
+
+/// socket 绑定。
+pub fn bind(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket 连接。
+pub fn connect(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket 监听。
+pub fn listen(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket 接受连接。
+pub fn accept(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket 发送数据。
+pub fn sendto(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket 接收数据。
+pub fn recvfrom(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket 关闭。
+pub fn shutdown(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取 socket 名称。
+pub fn getsockname(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取 peer 名称。
+pub fn getpeername(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置 socket 选项。
+pub fn setsockopt(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取 socket 选项。
+pub fn getsockopt(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// socket pair。
+pub fn socketpair(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 发送消息。
+pub fn sendmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 接收消息。
+pub fn recvmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 接收多消息。
+pub fn recvmmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 发送多消息。
+pub fn sendmmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// clone/fork。对应原版 `kernel/sched.c:sys_fork()`。
+pub fn fork(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    crate::pr_warn!("sys_fork: not implemented");
+    -(ENOSYS as i64)
+}
+
+/// vfork。对应原版 `kernel/sched.c:sys_vfork()`。
+pub fn vfork(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    crate::pr_warn!("sys_vfork: not implemented");
+    -(ENOSYS as i64)
+}
+
+/// wait4 对应原版 `kernel/exit.c:sys_wait4()`。
+pub fn wait4(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pid = args.a0 as i32;
+    let status = args.a1 as *mut i32;
+    let options = args.a2 as i32;
+    crate::pr_warn!("sys_wait4: pid={}, options={} (stub)", pid, options);
+    -(ENOSYS as i64)
+}
+
+/// 设置定时器。
+pub fn setitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取定时器。
+pub fn getitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 原子内存操作。
+pub fn mlock(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn munlock(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn mlockall(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn munlockall(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn mremap(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn msync(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 共享内存。
+pub fn shmget(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn shmat(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn shmdt(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn shmctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 信号量。
+pub fn semget(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn semop(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn semtimedop(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn semctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 消息队列。
+pub fn msgget(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn msgsnd(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn msgrcv(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn msgctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 获取进程优先级。
+pub fn getpriority(args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置进程优先级。
+pub fn setpriority(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 设置 hostname。
+pub fn sethostname(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置 domainname。
+pub fn setdomainname(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// 获取 CPU 信息。
+pub fn getcpu(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let cpu = args.a0 as *mut u32;
+    let node = args.a1 as *mut u32;
+    let tp = args.a2 as *mut u64;
+    if !cpu.is_null() { unsafe { *cpu = 0; } }
+    if !node.is_null() { unsafe { *node = 0; } }
+    if !tp.is_null() { unsafe { *tp = 0; } }
+    0
+}
+
+/// nanosleep。
+pub fn clock_nanosleep(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取时钟时间。
+pub fn clock_gettime(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置时钟时间。
+pub fn clock_settime(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取时钟分辨率。
+pub fn clock_getres(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// prlimit64。
+pub fn prlimit(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }

@@ -340,6 +340,61 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::REBOOT] = sys::reboot;
     t[nr::GETRUSAGE] = sys::getrusage;
     t[nr::GETRLIMIT] = sys::getrlimit;
+    // Socket syscalls
+    t[nr::SOCKET] = sys::socket;
+    t[nr::BIND] = sys::bind;
+    t[nr::CONNECT] = sys::connect;
+    t[nr::LISTEN] = sys::listen;
+    t[nr::ACCEPT] = sys::accept;
+    t[nr::SENDTO] = sys::sendto;
+    t[nr::RECVFROM] = sys::recvfrom;
+    t[nr::SHUTDOWN] = sys::shutdown;
+    t[nr::GETSOCKNAME] = sys::getsockname;
+    t[nr::GETPEERNAME] = sys::getpeername;
+    t[nr::SETSOCKOPT] = sys::setsockopt;
+    t[nr::GETSOCKOPT] = sys::getsockopt;
+    t[nr::SOCKETPAIR] = sys::socketpair;
+    // Process syscalls
+    t[nr::FORK] = sys::fork;
+    t[nr::VFORK] = sys::vfork;
+    t[nr::WAIT4] = sys::wait4;
+    // Timer syscalls
+    t[nr::SETITIMER] = sys::setitimer;
+    t[nr::GETITIMER] = sys::getitimer;
+    // Memory syscalls
+    t[nr::MLOCK] = sys::mlock;
+    t[nr::MUNLOCK] = sys::munlock;
+    t[nr::MLOCKALL] = sys::mlockall;
+    t[nr::MUNLOCKALL] = sys::munlockall;
+    t[nr::MREMAP] = sys::mremap;
+    t[nr::MSYNC] = sys::msync;
+    // IPC syscalls
+    t[nr::SHMGET] = sys::shmget;
+    t[nr::SHMAT] = sys::shmat;
+    t[nr::SHMDT] = sys::shmdt;
+    t[nr::SHMCTL] = sys::shmctl;
+    t[nr::SEMGET] = sys::semget;
+    t[nr::SEMOP] = sys::semop;
+    t[nr::SEMCTL] = sys::semctl;
+    t[nr::SEMTIMEDOP] = sys::semtimedop;
+    t[nr::MSGGET] = sys::msgget;
+    t[nr::MSGSND] = sys::msgsnd;
+    t[nr::MSGRCV] = sys::msgrcv;
+    t[nr::MSGCTL] = sys::msgctl;
+    // Priority syscalls
+    t[nr::GETPRIORITY] = sys::getpriority;
+    t[nr::SETPRIORITY] = sys::setpriority;
+    // Hostname syscalls
+    t[nr::SETHOSTNAME] = sys::sethostname;
+    t[nr::SETDOMAINNAME] = sys::setdomainname;
+    // CPU/Clock syscalls
+    t[nr::GETCPU] = sys::getcpu;
+    t[nr::CLOCK_GETTIME] = sys::clock_gettime;
+    t[nr::CLOCK_SETTIME] = sys::clock_settime;
+    t[nr::CLOCK_GETRES] = sys::clock_getres;
+    t[nr::CLOCK_NANOSLEEP] = sys::clock_nanosleep;
+    // Other
+    t[nr::PRLIMIT] = sys::prlimit;
     t
 };
 

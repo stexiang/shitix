@@ -18,9 +18,11 @@ pub mod irq;
 pub mod klib;
 pub mod mm;
 pub mod net;
+pub mod pci;
 pub mod sched;
 pub mod serial;
 pub mod signal;
+pub mod smp;
 pub mod syscall;
 pub mod traps;
 
