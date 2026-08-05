@@ -113,10 +113,16 @@ pub unsafe fn task(nr: usize) -> &'static mut Task {
 /// `nr < NR_TASKS`（内部断言）；调用者负责关中断或独占。
 #[inline]
 #[track_caller]
-unsafe fn task_ptr(nr: usize) -> *mut Task {
+pub unsafe fn task_ptr(nr: usize) -> *mut Task {
     assert!(nr < NR_TASKS, "task_ptr(): index {} out of range", nr);
     // SAFETY: 下标已校验；TASKS 是地址恒定的静态数组。
     unsafe { (*core::ptr::addr_of_mut!(TASKS)).as_mut_ptr().add(nr) }
+}
+
+/// 当前任务的下标。等价于 `current_nr()`。
+#[inline]
+pub fn current_index() -> usize {
+    current_nr()
 }
 
 /// 当前 jiffies。对应原版直接读全局 `jiffies`。
