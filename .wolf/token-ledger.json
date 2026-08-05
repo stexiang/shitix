@@ -5,7 +5,7 @@
     "total_tokens_estimated": 1021,
     "total_reads": 15,
     "total_writes": 0,
-    "total_sessions": 6,
+    "total_sessions": 17,
     "anatomy_hits": 3,
     "anatomy_misses": 12,
     "repeated_reads_blocked": 0,
@@ -229,9 +229,43 @@
     }
   ],
   "daemon_usage": [],
-  "waste_flags": [],
+  "waste_flags": [
+    {
+      "pattern": "anatomy_miss_rate",
+      "description": "80% of file lookups missed anatomy in session session-2026-08-01-0300",
+      "tokens_wasted": 0,
+      "suggestion": "Run openwolf scan to refresh anatomy.md.",
+      "detected_at": "2026-08-02T16:00:00.011Z"
+    },
+    {
+      "pattern": "anatomy_miss_rate",
+      "description": "80% of file lookups missed anatomy in session session-2026-08-01-0300",
+      "tokens_wasted": 0,
+      "suggestion": "Run openwolf scan to refresh anatomy.md.",
+      "detected_at": "2026-08-02T16:00:00.011Z"
+    },
+    {
+      "pattern": "anatomy_miss_rate",
+      "description": "100% of file lookups missed anatomy in session session-2026-08-02-1217",
+      "tokens_wasted": 0,
+      "suggestion": "Run openwolf scan to refresh anatomy.md.",
+      "detected_at": "2026-08-02T16:00:00.011Z"
+    },
+    {
+      "pattern": "anatomy_miss_rate",
+      "description": "100% of file lookups missed anatomy in session session-2026-08-02-1217",
+      "tokens_wasted": 0,
+      "suggestion": "Run openwolf scan to refresh anatomy.md.",
+      "detected_at": "2026-08-02T16:00:00.011Z"
+    }
+  ],
   "optimization_report": {
-    "last_generated": null,
-    "patterns": []
+    "last_generated": "2026-08-02T16:00:00.012Z",
+    "patterns": [
+      "anatomy_miss_rate",
+      "anatomy_miss_rate",
+      "anatomy_miss_rate",
+      "anatomy_miss_rate"
+    ]
   }
 }

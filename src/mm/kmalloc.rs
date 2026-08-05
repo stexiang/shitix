@@ -103,8 +103,13 @@ pub fn kmalloc(size: usize) -> *mut u8 {
         return core::ptr::null_mut();
     };
 
-    // SAFETY: 内核早期单线程独占档位表；页描述符与块头都在自己分配的页内。
+    // 原版 `kmalloc` 全程 `cli()`（它注释里明说 "This is a very simple
+    // and stupid ... we have to be careful about interrupts"）。档位表的
+    // `firstfree` 链和页内的空闲块链都是读—改—写，中断里也可能 kmalloc，
+    // 交错会把同一个块派两次。
+    // SAFETY: 全程关中断，独占档位表；页描述符与块头都在自己分配的页内。
     unsafe {
+        let _guard = IrqGuard::new();
         let tbl = sizes();
 
         // 先看该档位有没有现成的空闲块。同原版第一段。
@@ -192,6 +197,7 @@ pub unsafe fn kfree(ptr: *mut u8) {
     // SAFETY: 由调用者契约保证 ptr 来自 kmalloc，故其前 HDR 字节是合法的
     // BlockHeader，且所在页开头是我们写入的 PageDescriptor。
     unsafe {
+        let _guard = IrqGuard::new();
         let p = ptr as usize - HDR;
         let hdr = p as *mut BlockHeader;
         let page = page_desc_of(p) as *mut PageDescriptor;
@@ -246,4 +252,25 @@ pub fn stats() -> [usize; MAX_ORDER + 1] {
         out[i] = s.npages;
     }
     out
+}
+
+/// 关中断的 RAII 守卫。`kmalloc`/`kfree` 里有多个 `return`，用守卫比
+/// 在每条返回路径上手写 `restore_flags` 可靠。原版靠 C 的单出口 +
+/// `restore_flags(flags)` 达到同样效果。
+struct IrqGuard(u64);
+
+impl IrqGuard {
+    /// # Safety
+    /// 调用者负责在守卫存活期间不睡（睡会带着关中断状态切走）。
+    unsafe fn new() -> Self {
+        // SAFETY: 契约转交；与 Drop 里的 restore 配对。
+        Self(unsafe { crate::irq::local_irq_save() })
+    }
+}
+
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        // SAFETY: self.0 是 new() 里存下的原始 flags，与之配对恢复。
+        unsafe { crate::irq::restore_flags(self.0) }
+    }
 }

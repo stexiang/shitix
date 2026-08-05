@@ -8,7 +8,9 @@
 
 pub mod console;
 pub mod desc;
+pub mod drivers;
 pub mod e820;
+pub mod fs;
 pub mod irq;
 pub mod klib;
 pub mod mm;
@@ -60,6 +62,11 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     // u16 字段，无对齐或有效性要求上的额外风险。
     let bp = unsafe { &*params };
 
+    // 先铺 task[0] 静态栈的哨兵：链接器把 head.S 的栈排在 Rust 那些
+    // static mut 表之后（地址更高），栈往下溢出会直接踩进 fs::buffer::BUFFERS。
+    // SAFETY: 启动最早期，只写 .bss 里那一页哨兵。
+    unsafe { sched::init_stack_guard() };
+
     println!("mem (int 15h/88h): {} KB", bp.ext_mem_k);
     println!("video mode: {:#04x}, {} cols", bp.video_mode & 0xFF, bp.video_mode >> 8);
     println!("e820 entries: {}, raw usable: {} MB",
@@ -108,6 +115,57 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     trap_selftest();
     syscall_selftest();
     sched_selftest();
+
+    // ---- 模块 5：文件系统与设备驱动 ----
+    // 顺序对应原版 start_kernel()：buffer_init/inode_init/file_table_init
+    // → blk_dev_init/chr_dev_init → mount_root
+    // SAFETY: mm 与调度器已就绪，各只调一次；fs::init 必须在
+    // drivers::init 之前（驱动要往设备表里注册）。
+    unsafe {
+        fs::init();
+        drivers::init();
+    }
+
+    // mount_root 与文件系统自检**必须在 task[0] 之外**跑。
+    //
+    // 整条 fs/buffer 路径的契约都是「可能会睡」：`getblk` 找不到干净缓冲
+    // 时 `sleep_on(&buffer_wait)`、`wait_on_buffer` 等 b_lock、`iget` 等
+    // i_lock。而 `sleep_on` 对 task[0] 是 `panic!("task[0] trying to
+    // sleep")`（原版同样是 `panic("task[0] trying to sleep")`）——原版的
+    // idle 任务从不碰文件系统，`mount_root` 是在 init 进程（task[1]，由
+    // `start_kernel` 末尾 `fork` 出来的那个）里跑的。
+    //
+    // 在 task[0] 里直接跑这些是踩过的坑：缓冲够用时能侥幸跑通，一旦
+    // 64 个缓冲全被占住就 panic；更隐蔽的是那些「睡醒后重新校验」的
+    // 竞态分支（`getblk` 的三个 goto repeat、`*_getblk` 的 repeat）
+    // 在不睡的执行流里从来不被走到，等于没测。
+    //
+    // 所以这里起一个内核线程当 init 用，主流程等它跑完。
+    let init_thread = sched::kernel_thread("fsinit", fs_init_thread, 0, 15);
+    if init_thread.is_err() {
+        panic!("cannot create fs init thread");
+    }
+    // 等它把 FS_INIT_DONE 置位。形态同上面 sched_selftest 里的等待循环：
+    // task[0] 只能轮询 need_resched + hlt（见那里的注释）。
+    loop {
+        // SAFETY: 只读一个 u8；由别的任务上下文写，必须 volatile。
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(FS_INIT_DONE)) } != 0 {
+            break;
+        }
+        // SAFETY: 只读一个 i32。
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(sched::need_resched)) } != 0 {
+            // SAFETY: task[0] 的正常上下文，不在中断里。
+            unsafe { sched::schedule() };
+        }
+        // SAFETY: 中断已开，hlt 会被时钟唤醒。
+        unsafe { // `hlt` 不能声明 `nomem`：它等的就是中断，而中断处理函数会改
+        // jiffies / 各种计数器，而外层循环正是在读这些量。声明「不碰
+        // 内存」会让 LLVM 把循环里的读提到 hlt 之前缓存住 —— 等待循环
+        // 变死循环，或读到过期的计数（见 cerebrum Do-Not-Repeat 里
+        // 关于 int3/div 的同一条）。`nostack` 同样不成立：中断会在当前
+        // 栈上压 pt_regs 并跑完整个 printk。
+        core::arch::asm!("hlt") }
+    }
 
     cprintln!(Color::Yellow, Color::Black, "shitix: boot ok, idling.");
     serial::print("shitix: boot ok\n");
@@ -497,7 +555,13 @@ fn sched_selftest() {
     let mut spins = 0u64;
     while sched::jiffies() < deadline && spins < 100_000_000 {
         // SAFETY: hlt 在开中断状态下会被时钟唤醒。
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) }
+        unsafe { // `hlt` 不能声明 `nomem`：它等的就是中断，而中断处理函数会改
+        // jiffies / 各种计数器，而外层循环正是在读这些量。声明「不碰
+        // 内存」会让 LLVM 把循环里的读提到 hlt 之前缓存住 —— 等待循环
+        // 变死循环，或读到过期的计数（见 cerebrum Do-Not-Repeat 里
+        // 关于 int3/div 的同一条）。`nostack` 同样不成立：中断会在当前
+        // 栈上压 pt_regs 并跑完整个 printk。
+        core::arch::asm!("hlt") }
         spins += 1;
     }
     let ticks = sched::jiffies() - j0;
@@ -534,7 +598,13 @@ fn sched_selftest() {
             unsafe { sched::schedule() };
         }
         // SAFETY: 中断已开，hlt 会被时钟唤醒。
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) }
+        unsafe { // `hlt` 不能声明 `nomem`：它等的就是中断，而中断处理函数会改
+        // jiffies / 各种计数器，而外层循环正是在读这些量。声明「不碰
+        // 内存」会让 LLVM 把循环里的读提到 hlt 之前缓存住 —— 等待循环
+        // 变死循环，或读到过期的计数（见 cerebrum Do-Not-Repeat 里
+        // 关于 int3/div 的同一条）。`nostack` 同样不成立：中断会在当前
+        // 栈上压 pt_regs 并跑完整个 printk。
+        core::arch::asm!("hlt") }
     }
 
     // SAFETY: 只读两个 u64。volatile：worker 是在别的任务上下文里写的，
@@ -548,7 +618,69 @@ fn sched_selftest() {
 
     sched::show_state();
     irq::dump();
+    kprintln!("stack[0]: high water {} bytes, guard {}",
+              sched::stack_high_water(),
+              if sched::stack_guard_ok() { "ok" } else { "SMASHED" });
     serial::print("sched: selftest done\n");
+}
+
+/// 子测试 4 的判定。见调用点关于 `#[inline(never)]` 的注释。
+#[inline(never)]
+fn roundtrip_ok(w: i64, sk: i64, r: i64, eof: i64, end: i64, got: &[u8], want: &[u8]) -> bool {
+    w == want.len() as i64
+        && sk == 0
+        && r == want.len() as i64
+        && eof == 0
+        && end == want.len() as i64
+        && got == want
+}
+
+/// 自检用的 1KB 块缓冲。**不能放在栈上**：内核线程的栈只有一页
+/// （同原版 `kernel_stack_page`），两个 1KB 数组加上 fs 的调用链
+/// （`sys_open` → `namei` → `minix_bread` → `getblk` → `ll_rw_block`）
+/// 就会溢出，表现为 `show_state` 里的 `CORRUPTED STACK` 加一个
+/// CR2 是小负数的 page fault。踩过一次。
+static mut BIG_WBUF: [u8; 1024] = [0; 1024];
+static mut BIG_RBUF: [u8; 1024] = [0; 1024];
+
+/// `fs_init_thread` 跑完的标志。0 = 未完成，1 = 完成，2 = 失败。
+static mut FS_INIT_DONE: u8 = 0;
+
+/// 顶替原版 init 进程的内核线程：造根文件系统、挂载、跑自检。
+///
+/// 见 `start_kernel` 里创建它的地方那段注释：这些活都可能睡，不能在
+/// task[0] 里干。
+fn fs_init_thread(_arg: u64) {
+    // 造根文件系统。原版这一步是 rd_load() 从软驱读现成映像，
+    // 我们在内存里现造（见 src/fs/minix/mkfs.rs 的模块文档）。
+    // SAFETY: ramdisk 已 init，缓冲缓存里还没有本设备的块。
+    let layout = unsafe { fs::minix::mkfs(drivers::block::ramdisk::RD_BLOCKS as u32, 512) };
+    if layout.is_none() {
+        panic!("mkfs.minix failed");
+    }
+
+    // 对应原版 start_kernel 末尾的 mount_root()
+    // SAFETY: 根设备可读，fs 表已建好，且我们不是 task[0]。
+    let mounted = unsafe { fs::mount_root(drivers::block::ramdisk::RAMDISK_DEV, 0) };
+    if !mounted {
+        panic!("VFS: Unable to mount root");
+    }
+
+    fs_selftest();
+
+    // 栈底魔数还在吗？内核线程只有一页栈，fs 的调用链又深，溢出是
+    // 真实风险（踩过一次）。这里显式查一次，比事后从 page fault 的
+    // CR2 反推快得多。
+    // SAFETY: 进程上下文，只读当前任务的栈魔数。
+    let stack_ok = unsafe { sched::current().stack_ok() };
+    kprintln!("fs: init thread stack magic -> {}, high water {}/{} bytes",
+              if stack_ok { "ok" } else { "OVERFLOWED" },
+              sched::kstack_high_water(), sched::KSTACK_SIZE);
+
+    // SAFETY: 单核，只有 task[0] 在轮询这个字节。
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1) }
+    // 直接返回即可：kernel_thread 的蹦床会接住返回并调 do_kthread_exit
+    // （见 sched::kernel_thread 的文档）。
 }
 
 /// 两个测试线程各自的运行计数。
@@ -572,6 +704,306 @@ fn worker(id: u64) {
     }
 }
 
+/// 文件系统与块设备自检。原版没有对应物。
+///
+/// 覆盖六条路径，每条都是「写进去 → 读回来 → 比对」而不是只看返回值：
+/// 1. 块设备 I/O：`bread`/`getblk`/`brelse` 与 ramdisk 的请求队列
+/// 2. 挂载：根 inode 的 mode/nlink 与 mkfs 写下去的一致
+/// 3. 目录：`readdir` 能列出 `.` 与 `..`
+/// 4. 文件：`create` → `write` → `lseek` → `read` 往返一致
+/// 5. 跨块与间接块：写 9KB（超过 7 个直接块，用到一级间接）后读回比对
+/// 6. 目录操作：`mkdir`/`unlink`/`rmdir` 与位图回收
+fn fs_selftest() {
+    use fs::buffer;
+    use fs::inode;
+
+    kprintln!("--- fs selftest ---");
+    let dev = drivers::block::ramdisk::RAMDISK_DEV;
+
+    // ---- 1. 块设备 I/O ----
+    // SAFETY: 启动期、进程上下文（我们是 task[0] 的执行流，但此时
+    // 没有其他任务在跑 fs 代码，且下面的调用都不会真的睡——ramdisk
+    // 的 I/O 是同步 memcpy，缓冲也够用）。
+    let blkio_ok = unsafe {
+        // 挑一个数据区里 mkfs 清过零的块
+        let probe = 200u32;
+        // 用 bread 而不是 getblk：我们只覆盖块里的头 8 字节，剩下 1016 字节
+        // 必须是这一块**真正的**内容。getblk 给的是刚回收的缓冲，里面残留
+        // 着上一个块的数据，直接置 b_uptodate 再 sync 就会把那些残留写到
+        // block 200 上去（这正是 minix/file.rs 里「部分写要先读进来」那条
+        // 注释说的坑；踩过一次：残留内容随缓冲淘汰顺序变化，表现为随机
+        // 出现的文件系统损坏）。
+        let b = match buffer::bread(dev, probe, fs::BLOCK_SIZE) {
+            Some(b) => b,
+            None => {
+                kprintln!("fs: bread failed");
+                return;
+            }
+        };
+        buffer::bh(b).data_mut()[..8].copy_from_slice(b"SHITIXFS");
+        buffer::mark_buffer_dirty(b);
+        buffer::brelse(b);
+        // 回写到 ramdisk，强制真的走一遍请求队列。
+        // 注意**不能**在这里 invalidate_buffers：已挂载的超级块正持有
+        // s_sbh/s_imap/s_zmap 三批缓冲，把它们标成非 uptodate 会让
+        // 后续的位图分配读到重新从盘上取的旧内容。原版同样只在
+        // umount 之后才 invalidate。
+        buffer::sync_dev(dev);
+
+        let b2 = buffer::bread(dev, probe, fs::BLOCK_SIZE);
+        match b2 {
+            Some(b2) => {
+                let ok = &buffer::bh(b2).data()[..8] == b"SHITIXFS";
+                buffer::brelse(b2);
+                ok
+            }
+            None => false,
+        }
+    };
+    kprintln!("fs: block r/w via request queue -> {}", if blkio_ok { "ok" } else { "FAIL" });
+
+    // ---- 2. 挂载状态 ----
+    // SAFETY: 同上；只读 inode 表与超级块。
+    let (root_mode, root_nlink, sb_magic) = unsafe {
+        let r = fs::super_block::root_inode();
+        let i = inode::inode(r);
+        let sb_nr = i.i_sb;
+        (i.i_mode, i.i_nlink, fs::super_block::sb(sb_nr).s_magic)
+    };
+    kprintln!(
+        "fs: root mode={:#o} nlink={} magic={:#x} -> {}",
+        root_mode,
+        root_nlink,
+        sb_magic,
+        if fs::mode::is_dir(root_mode)
+            && root_nlink == 2
+            && sb_magic == fs::minix::MINIX_SUPER_MAGIC
+        {
+            "ok"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // ---- 3. 目录列举 ----
+    // SAFETY: 同上。
+    let (nent, has_dot, has_dotdot) = unsafe {
+        let r = fs::super_block::root_inode();
+        let mut pos = 0u64;
+        let (mut n, mut d, mut dd) = (0, false, false);
+        while let Some(e) = fs::minix::dir::readdir(r, pos) {
+            let name = &e.name[..e.name_len];
+            if name == b"." {
+                d = true;
+            }
+            if name == b".." {
+                dd = true;
+            }
+            n += 1;
+            pos = e.offset + 16;
+            if n > 8 {
+                break;
+            }
+        }
+        (n, d, dd)
+    };
+    kprintln!(
+        "fs: readdir / -> {} entries, . = {} .. = {} -> {}",
+        nent,
+        has_dot,
+        has_dotdot,
+        if has_dot && has_dotdot { "ok" } else { "FAIL" }
+    );
+
+    // 位图基线：必须在**任何**测试文件创建之前取。子测试 6 会把所有
+    // 创建出来的东西删干净，届时空闲 zone 数应当精确回到这个值——
+    // 「>= 基线」那种弱断言无法区分「全部回收」和「回收了一部分」。
+    // SAFETY: 只读超级块与位图缓冲。
+    let zones_baseline = unsafe {
+        let r = fs::super_block::root_inode();
+        let sb_nr = inode::inode(r).i_sb;
+        fs::minix::bitmap::count_free(sb_nr, true)
+    };
+
+    // ---- 4. 创建 / 写 / 读回 ----
+    const MSG: &[u8] = b"hello from shitix minix fs\n";
+    // SAFETY: 同上；open/write/read 都是进程上下文的正常调用。
+    let file_ok = unsafe {
+        let fd = fs::open::sys_creat(b"/hello.txt", 0o644);
+        if fd < 0 {
+            kprintln!("fs: creat failed: {}", klib::errno::strerror(-fd as i32));
+            return;
+        }
+        let fd = fd as usize;
+        let w = fs::read_write::write(fd, MSG);
+        fs::open::sys_close(fd);
+
+        // sys_creat 给的是**只写** fd（O_WRONLY），读它会正确地返回
+        // -EBADF。要读回来必须重新以 O_RDONLY 打开——这也顺带验证了
+        // 第二次 open 走的是 namei 查已存在文件的那条路径。
+        let fd = fs::open::sys_open(b"/hello.txt", fs::oflags::O_RDONLY, 0);
+        if fd < 0 {
+            kprintln!("fs: reopen failed: {}", klib::errno::strerror(-fd as i32));
+            return;
+        }
+        let fd = fd as usize;
+        let mut buf = [0u8; 64];
+        // 先读掉前 8 字节，再 lseek 回 0 重读整段：这样 lseek 的返回值和
+        // 它对 f_pos 的作用都被验证了（只 lseek(0) 不读的话，测试通不通过
+        // 与 lseek 是否真的生效无关）。
+        let _ = fs::read_write::read(fd, &mut buf[..8]);
+        let sk = fs::read_write::lseek(fd, 0, fs::SEEK_SET);
+        let r = fs::read_write::read(fd, &mut buf[..MSG.len()]);
+        // 再读一次应该是 EOF
+        let eof = fs::read_write::read(fd, &mut buf[MSG.len()..MSG.len() + 1]);
+        // SEEK_END 应当等于 i_size
+        let end = fs::read_write::lseek(fd, 0, fs::SEEK_END);
+        fs::open::sys_close(fd);
+        // 判定抽成 #[inline(never)]：内联时 LLVM 会把「读—比较」对下沉
+        // 复制到每个使用点，表现为打印出来的每个值都对、`&&` 的结果却是
+        // false（见 cerebrum 里自检那条）。
+        let ok = roundtrip_ok(w, sk, r, eof, end, &buf[..MSG.len()], MSG);
+        if !ok {
+            kprintln!("fs:   w={} sk={} r={} eof={} end={} got={:?}",
+                      w, sk, r, eof, end, core::str::from_utf8(&buf[..MSG.len()]));
+        }
+        ok
+    };
+    kprintln!("fs: creat/write/lseek/read roundtrip -> {}", if file_ok { "ok" } else { "FAIL" });
+
+    // ---- 5. 跨块 + 一级间接块 ----
+    // 9KB 需要 9 个块：7 个直接 + 2 个走一级间接。
+    const BIG: usize = 9 * 1024;
+    // SAFETY: 同上。
+    let big_ok = unsafe {
+        let fd = fs::open::sys_creat(b"/big.bin", 0o644);
+        if fd < 0 {
+            return;
+        }
+        let fd = fd as usize;
+        // 每块写一个可辨识的图案：块号的低字节重复
+        let mut ok = true;
+        for blk in 0..9u8 {
+            let page = &mut *core::ptr::addr_of_mut!(BIG_WBUF);
+            page.fill(blk.wrapping_mul(37).wrapping_add(1));
+            if fs::read_write::write(fd, page) != 1024 {
+                ok = false;
+                break;
+            }
+        }
+        // 同上：重新以 O_RDONLY 打开来读
+        fs::open::sys_close(fd);
+        let fd = fs::open::sys_open(b"/big.bin", fs::oflags::O_RDONLY, 0);
+        if fd < 0 {
+            return;
+        }
+        let fd = fd as usize;
+        for blk in 0..9u8 {
+            let page = &mut *core::ptr::addr_of_mut!(BIG_RBUF);
+            page.fill(0);
+            if fs::read_write::read(fd, page) != 1024 {
+                ok = false;
+                break;
+            }
+            let want = blk.wrapping_mul(37).wrapping_add(1);
+            if page.iter().any(|&b| b != want) {
+                ok = false;
+                break;
+            }
+        }
+        // 大小要正好是 9KB（说明 i_size 更新与间接块寻址都对）
+        let sz = {
+            let mut st = fs::stat::Stat::zeroed();
+            fs::stat::sys_fstat(fd, &mut st);
+            st.st_size
+        };
+        fs::open::sys_close(fd);
+        ok && sz == BIG as u32
+    };
+    kprintln!("fs: {}KB file (7 direct + indirect) -> {}", BIG / 1024, if big_ok { "ok" } else { "FAIL" });
+
+    // ---- 6. mkdir / unlink / rmdir 与位图回收 ----
+    // SAFETY: 同上。
+    let dir_ok = unsafe {
+        let mk = fs::namei::do_mkdir(b"/subdir", 0o755);
+        let sub = fs::namei::namei(b"/subdir");
+        let sub_is_dir = match sub {
+            Ok(n) => {
+                let d = fs::mode::is_dir(inode::inode(n).i_mode);
+                inode::iput(n);
+                d
+            }
+            Err(_) => false,
+        };
+        let rm = fs::namei::do_rmdir(b"/subdir");
+        // 把两个测试文件也删掉，块应该全部回到位图
+        let u1 = fs::namei::do_unlink(b"/hello.txt");
+        let u2 = fs::namei::do_unlink(b"/big.bin");
+        buffer::sync_dev(dev);
+        let free_after = {
+            let r = fs::super_block::root_inode();
+            let sb_nr = inode::inode(r).i_sb;
+            fs::minix::bitmap::count_free(sb_nr, true)
+        };
+        kprintln!(
+            "fs: mkdir={} rmdir={} unlink={},{} free zones {} -> {}",
+            mk, rm, u1, u2, zones_baseline, free_after
+        );
+        mk == 0
+            && sub_is_dir
+            && rm == 0
+            && u1 == 0
+            && u2 == 0
+            && free_after == zones_baseline
+    };
+    kprintln!("fs: mkdir/rmdir/unlink + zone reclaim -> {}", if dir_ok { "ok" } else { "FAIL" });
+
+    // ---- 字符设备：/dev/zero 与 /dev/null ----
+    // SAFETY: 同上。
+    let chr_ok = unsafe {
+        // 先造出设备节点（原版是 /dev 目录里现成的，由 mkfs 之外的
+        // 工具建；我们自己 mknod）
+        let mz = fs::namei::do_mknod(
+            b"/zero",
+            fs::mode::S_IFCHR | 0o666,
+            fs::mkdev(drivers::block::major::MEM_MAJOR, drivers::char_dev::mem::minor::ZERO),
+        );
+        let fd = fs::open::sys_open(b"/zero", fs::oflags::O_RDONLY, 0);
+        if mz != 0 || fd < 0 {
+            kprintln!("fs: mknod/open /zero failed ({}, {})", mz, fd);
+            false
+        } else {
+            let fd = fd as usize;
+            let mut buf = [0xffu8; 32];
+            let r = fs::read_write::read(fd, &mut buf);
+            fs::open::sys_close(fd);
+            fs::namei::do_unlink(b"/zero");
+            r == 32 && buf.iter().all(|&b| b == 0)
+        }
+    };
+    kprintln!("fs: /dev/zero via mknod+read -> {}", if chr_ok { "ok" } else { "FAIL" });
+
+    // 「一块一缓冲」不变量检查（见 buffer::check_duplicates 的文档）
+    // SAFETY: 进程上下文，只读缓冲头。
+    let dups = unsafe { buffer::check_duplicates() };
+    kprintln!("fs: buffer duplicate check -> {}", if dups == 0 { "ok" } else { "FAIL" });
+
+    // 统计
+    let (used, refd) = inode::stats();
+    buffer::show_buffers();
+    pr!(
+        klib::Level::Info,
+        "fs: {} inodes in use ({} referenced), {} open files, {} buffers",
+        used,
+        refd,
+        fs::file_table::nr_used(),
+        buffer::nr_buffers()
+    );
+    // SAFETY: 进程上下文，把所有脏数据落盘（原版 sys_sync）。
+    unsafe { buffer::sync_dev(0) };
+    kprintln!("fs: selftest done");
+}
+
 /// task[0] 的空转循环。对应原版 `sched.c:sys_idle()` 的主体
 /// （`for(;;) { if (need_resched) schedule(); }`）以及 `init/main.c` 末尾
 /// 那句 `for(;;) idle();`。
@@ -584,7 +1016,13 @@ fn idle_loop() -> ! {
         }
         // SAFETY: hlt 在 CPL=0 下合法，仅让 CPU 等待下一个中断，不访问内存。
         // 中断已开（sched::init 之后由 sched_selftest 打开），所以时钟能唤醒我们。
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) }
+        unsafe { // `hlt` 不能声明 `nomem`：它等的就是中断，而中断处理函数会改
+        // jiffies / 各种计数器，而外层循环正是在读这些量。声明「不碰
+        // 内存」会让 LLVM 把循环里的读提到 hlt 之前缓存住 —— 等待循环
+        // 变死循环，或读到过期的计数（见 cerebrum Do-Not-Repeat 里
+        // 关于 int3/div 的同一条）。`nostack` 同样不成立：中断会在当前
+        // 栈上压 pt_regs 并跑完整个 printk。
+        core::arch::asm!("hlt") }
     }
 }
 
@@ -592,7 +1030,7 @@ fn idle_loop() -> ! {
 fn halt_loop() -> ! {
     loop {
         // SAFETY: cli/hlt 在 CPL=0 下合法，不访问内存。
-        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
+        unsafe { core::arch::asm!("cli", "hlt") }
     }
 }
 
@@ -600,15 +1038,18 @@ fn halt_loop() -> ! {
 fn panic(info: &PanicInfo) -> ! {
     // 红底白字，和正常输出区分开
     console::set_color(Color::White, Color::Red);
-    println!();
-    print!("KERNEL PANIC: ");
-    if let Some(msg) = info.message().as_str() {
-        print!("{}", msg);
+    // 用 kprintln!（VGA + 串口）而不是 println!（只有 VGA）：panic 信息
+    // 只打到屏幕上的话，无头测试的串口日志里只剩一行 SHITIX_PANIC，
+    // 等于没有诊断信息。踩过一次。
+    kprintln!();
+    // 用 `info.message()`（PanicMessage: Display）而不是它的 `as_str()`：
+    // as_str() 只对字面量消息返回 Some，带格式参数的（`assert!(c, "x={}", v)`
+    // 之类）一律 None——而那些恰恰是携带诊断值的。踩过一次：日志里只剩
+    // 「KERNEL PANIC: at file:line」，断言里精心打的下标全丢了。
+    match info.location() {
+        Some(l) => kprintln!("KERNEL PANIC: {} at {}:{}", info.message(), l.file(), l.line()),
+        None => kprintln!("KERNEL PANIC: {}", info.message()),
     }
-    if let Some(loc) = info.location() {
-        print!(" at {}:{}", loc.file(), loc.line());
-    }
-    println!();
 
     serial::print("SHITIX_PANIC\n");
     halt_loop();

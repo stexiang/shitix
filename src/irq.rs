@@ -169,10 +169,19 @@ unsafe fn outb_p(port: u16, val: u8) {
 /// 返回值必须传给 [`restore_flags`]，否则中断状态会永久改变。
 pub unsafe fn local_irq_save() -> u64 {
     let flags: u64;
-    // SAFETY: pushfq/cli 在 CPL=0 合法。用 preserves_flags 是不对的
-    // （cli 改 IF），所以这里不加该选项。
+    // SAFETY: pushfq/cli 在 CPL=0 合法。
+    //
+    // **不能加 `options(nomem)`**（也不能加 `preserves_flags`：cli 改 IF）。
+    // `nomem` 的含义是「这段汇编不读写任何内存」，而 `pushfq` 就在写栈；
+    // 更要紧的是它让 LLVM 可以把临界区内外对全局变量的访问跨过这条屏障
+    // 缓存/重排。实测后果：`get_free_page_raw()` 里
+    // `let page = get_free_page_locked(); restore_flags(flags); page`
+    // 的返回值被优化成 0（编译器认为 restore_flags 不可能观察或影响
+    // 任何内存，于是自由重排了 FREE_PAGE_LIST 的读写），上层表现为
+    // 「还剩 65145 页却 out of memory」。默认（不写 options）就是
+    // 「可能读写任意内存」，正是我们要的完整屏障。
     unsafe {
-        core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem));
+        core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags);
     }
     flags
 }
@@ -183,8 +192,10 @@ pub unsafe fn local_irq_save() -> u64 {
 /// `flags` 必须来自同一执行路径上的 [`local_irq_save`]。
 pub unsafe fn restore_flags(flags: u64) {
     // SAFETY: popfq 在 CPL=0 合法；flags 来自本路径先前的 pushfq。
+    // 同 [`local_irq_save`]：不加 `options(nomem)`，这条指令既写栈
+    // 又是临界区的结束屏障。
     unsafe {
-        core::arch::asm!("push {}", "popfq", in(reg) flags, options(nomem));
+        core::arch::asm!("push {}", "popfq", in(reg) flags);
     }
 }
 
@@ -194,7 +205,9 @@ pub unsafe fn restore_flags(flags: u64) {
 /// 调用前必须保证 IDT 已装好、当前不在不可重入的临界区里。
 pub unsafe fn sti() {
     // SAFETY: 契约保证 IDT 就绪；sti 在 CPL=0 合法。
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)) }
+    // 不加 options：sti/cli 是临界区边界，`nomem` 会让编译器把区内外
+    // 对全局变量的访问跨过这条屏障重排（见 [`local_irq_save`] 的注释）。
+    unsafe { core::arch::asm!("sti") }
 }
 
 /// 关中断。对应原版 `cli()`。
@@ -203,14 +216,16 @@ pub unsafe fn sti() {
 /// 调用方负责最终重新开中断。
 pub unsafe fn cli() {
     // SAFETY: cli 在 CPL=0 合法。
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) }
+    // 同 [`sti`]：不加 options。
+    unsafe { core::arch::asm!("cli") }
 }
 
 /// 当前是否开着中断。
 pub fn irqs_enabled() -> bool {
     let flags: u64;
     // SAFETY: pushfq 只读标志寄存器。
-    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem)) }
+    // pushfq 写栈，所以既不能 `nostack` 也不能 `nomem`。
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags) }
     flags & 0x200 != 0
 }
 

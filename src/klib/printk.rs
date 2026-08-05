@@ -197,8 +197,25 @@ pub fn _printk_level(level: Level, args: core::fmt::Arguments) {
 
 /// 写环形缓冲 + 按级别决定去向。
 fn emit(level: Level, body: &[u8]) {
+    // 整个 emit 在关中断下跑。原版 `printk()` 同样是
+    // `save_flags(flags); cli(); ... restore_flags(flags);`。
+    //
+    // 这不是可选的谨慎：`do_timer`/`do_IRQ`/`do_trap` 都会 printk，
+    // 而 log_buf 的 head/total 和 VGA 的光标位置都是非原子的多步更新。
+    // 中断插在中间会写坏环形缓冲的下标，也会让控制台游标错位——观察到的
+    // 症状是 fsinit 里一个 CR2 为小负数的 page fault（游标算成负偏移）。
+    //
+    // SAFETY: 只是关中断再恢复，不改变别的状态；重入由关中断本身排除。
+    let flags = unsafe { crate::irq::local_irq_save() };
+    emit_locked(level, body);
+    // SAFETY: flags 来自上面的 local_irq_save。
+    unsafe { crate::irq::restore_flags(flags) }
+}
+
+/// [`emit`] 的主体，调用时必须已关中断。
+fn emit_locked(level: Level, body: &[u8]) {
     // 1. 无条件进环形缓冲（原版：不管 loglevel，log_buf 都记）
-    // SAFETY: 单核无抢占；调用方不应在中断里与非中断路径并发 printk。
+    // SAFETY: 调用方保证已关中断，故与中断上下文互斥。
     let lb = unsafe { log() };
     for &b in body {
         lb.buf[lb.head] = b;

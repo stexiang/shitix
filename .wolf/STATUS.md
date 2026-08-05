@@ -1,8 +1,9 @@
+<!-- Last updated: 2026-08-02 -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
 > Update this file at the end of every work phase so the next `/clear` resumes in 1 read.
-> Last updated: 2026-08-02 (模块 4 完成)
+> Last updated (was): 2026-08-02 (模块 4 完成)
 
 ---
 
@@ -51,9 +52,45 @@
 
 ---
 
+
+### 模块 5：文件系统与设备驱动（2026-08-02）
+22 个新文件，约 5000 行：缓冲缓存（`fs/buffer.c`）、块请求队列
+（`ll_rw_blk.c`）、ramdisk、tty/console/keyboard/mem 字符设备、
+VFS（inode/file_table/super_block/devices/namei/open/read_write/stat）、
+完整的 minix v1 文件系统（含原版没有的 `mkfs`）。零编译告警。
+
+内核能 mkfs → 挂载 minix 根文件系统 → 通过 8 项 fs 自检
+（块 I/O、挂载状态、readdir、文件读写往返、9KB 间接块文件、
+mkdir/rmdir/unlink + 位图回收、/dev/zero、缓冲去重检查）。
+debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
+
+本阶段修掉的 bug（详见 buglog bug-011..022）：
+- BSS 盖掉 0x70000 的四级页表 → 三重错误（页表搬到 0x4000，并在
+  kernel.ld 加 `ASSERT(_kernel_end <= 0x90000)`）
+- 在 task[0] 里跑 mount_root/fs 自检（fs 全路径都会睡，sleep_on 对
+  task[0] 是 panic）→ 改成内核线程 `fs_init_thread`
+- 内核线程栈一页不够 x86_64 的 fs 调用链 → 静态池 4 页
+- `make_request` 与 `wait_on_buffer` 的丢失唤醒（原版靠 cli 罩住 /
+  先挂队列再判条件）
+- `add_request` 没关中断操作请求队列
+- printk / console 输出没有临界区（原版用 cli/restore_flags）——
+  这是上阶段 STATUS 里记的已知缺口，本阶段补上
+- panic 信息只上 VGA 不上串口；`as_str()` 丢掉带格式的 assert 消息
+
 ## 🚀 Next phase
 
-**Goal:** 移植信号与进程生命周期 —— `kernel/signal.c` 的信号投递/`sigaction`、
+**Goal（先做）:** 收尾模块 5 的一个未解决缺陷 —— fs 自检约 **15%**
+概率失败（`buf 0 bytes` / 缓冲里出现 BIOS ROM 的 `0xf000ff53` /
+mount 找不到魔数 / 漏一个 zone）。详见 buglog **bug-023**。
+
+已排除：页分配器重复派页、缓冲数据页落在低端内存、ramdisk `PAGES`
+未初始化、一块两缓冲、空闲环下标越界、内核栈溢出。已确认现象：某个
+缓冲头的 `b_size` 变成 0（从没 init 过却挂进了链）。指向仍有一处非
+原子的链表/指针更新与中断交错。**下一步**：用 `qemu -d int` 配合在
+`add_request`/`end_request`/`getblk` 里记录事件序列（环形缓冲，事后
+dump），而不是继续加断言。护栏已就位，不要删。
+
+**Goal（然后）:** 移植信号与进程生命周期 —— `kernel/signal.c` 的信号投递/`sigaction`、
 `kernel/exit.c` 的 `do_exit`/`sys_waitpid` 收尸链、`kernel/fork.c` 的真正
 `sys_fork`。这三者互相咬合，且是把现有调度器接到用户态的前提。
 

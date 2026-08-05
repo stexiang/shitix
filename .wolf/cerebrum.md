@@ -83,3 +83,21 @@
 - [2026-08-02] **加了原版没有的 `kernel_thread()`**。原版 1.0.9 的 init 是 `sys_fork()` + `execve()` 出来的用户态进程，内核里没有「只跑内核代码的任务」这个概念。但 `sys_fork` 的完整语义要 `copy_page_tables`（依赖尚未移植的 `mm/mmap.c`），而调度器现在就该验证——内核线程共用内核页表，绕开整个 VM 复制问题。
 - [2026-08-02] **`vsprintf` 之后，异常/中断里的打印统一走 `klib::printk` 的 `pr_*!` 宏**而不是 `kprintln!`：环形缓冲能在 panic 后回放，且 `console_loglevel` 可以在噪声大的路径上调低（`die_if_kernel` 照原版 `console_verbose()` 把它提到 15）。
 - [2026-08-02] `syscall` 指令入口（`syscall_entry`）留了符号但**暂不启用**：它进入时不换栈，需要 per-cpu 的用户栈暂存位置。目前只走 `int 0x80`（原版唯一的路径）。
+
+- [2026-08-02] **凡是「可能会睡」的子系统都不能在 task[0] 里跑**。fs/buffer 的每个入口（getblk/wait_on_buffer/iget/bread）契约都写着会睡，而 `sleep_on` 对 task[0] 直接 panic。在 task[0] 里跑 mount_root 缓冲够用时能侥幸通过，一旦触到竞态分支就随机丢块、目录项 inode 号损坏。原版的 mount_root 在 init 进程（task[1]）里。要跑就起内核线程。详见 buglog bug-012。
+- [2026-08-02] **写缓冲只覆盖一部分时必须先 `bread` 而不是 `getblk`**。getblk 给的是刚回收的缓冲，未覆盖的字节是上一个块的残留；置 b_uptodate 再 sync 就把残留写回盘上。这条对自检代码同样成立——我自己在自检里踩了。详见 buglog bug-013。
+- [2026-08-02] 内核镜像 BSS 增长会静默盖掉 setup.S 在 0x70000 建的页表（head.S 清 BSS 时清掉页表 → 三重错误、串口全空）。加模块前先看 `_kernel_end`。已把页表搬到 0x4000。详见 buglog bug-011。
+- [2026-08-02] 诊断间歇性 bug 要建「收支账本」而不是逐点加日志：给 alloc/free 各打一行，再用脚本对账，能一步定位到「块 21 分配了从未释放」，比猜哪个分支错快得多。
+- [2026-08-02] 自检里的断言要用**精确相等**而不是 `>=`：`free_after >= free_before` 会把「只回收了一部分」判成通过。基线要在任何分配之前取。
+
+- [2026-08-02] **移植睡眠代码时，`cli()`/`sti()` 的位置和条件判断的顺序都是语义的一部分，不是噪音**。原版 `make_request` 带着关中断状态调 `sleep_on`；原版 `__wait_on_buffer` 先 `add_wait_queue` 再在循环里判条件。两处都是为了消掉「判完条件 → 挂上队列」之间的丢失唤醒窗口。照抄结构而漏掉顺序，症状是低概率的任务永久睡死（缓冲 b_count 卡住 → truncate 漏块）。详见 buglog bug-016/017。
+- [2026-08-02] **不要在同一个表达式里通过同一个 `static mut` 访问器取 `&mut` 字段和读另一个字段**。`(*addr_of_mut!(bh(n).b_wait)).sleep_on_while(|| bh(n).b_lock)` 是重叠可变借用，优化后闭包读到过期值，症状是直接三重错误。先把 `&mut *bh(n)` 降成裸指针，再分别取各字段指针，条件用 `read_volatile`。详见 buglog bug-018。
+- [2026-08-02] **panic handler 必须走串口**（`kprintln!` 而非 `println!`）。无头测试只能看串口，panic 信息只上 VGA 等于没有诊断。改完之后连续几个 bug 都是一行日志定位。详见 buglog bug-019。
+- [2026-08-02] x86_64 的内核栈需求比原版 i386 大得多（指针 8 字节、寄存器多一倍）。原版一页 `kernel_stack_page` 在这里不够跑 fs 调用链；栈上别放 KB 级数组。跑完显式查一次栈底魔数，比从 page fault 的 CR2 反推快。详见 buglog bug-014。
+- [2026-08-02] 链接脚本里加 `ASSERT` 拦住布局事故（`_kernel_end <= 0x90000`）。BSS 盖掉 setup.S 留下的参数区/E820 表已经发生过两次，加断言后是链接期报错而不是运行期玄学崩溃。加完记得故意改小阈值验证它真的会触发。详见 buglog bug-015。
+- [2026-08-02] 诊断顺序上，**先修「让症状可见」的东西**（panic 上串口、给 data()/inode() 加边界断言、给 mkfs 加写后读校验），再去查根因。加断言把「随机位置的 page fault」变成「确定性的一行信息」，比多跑 50 次 QEMU 便宜。
+
+- [2026-08-02] **原版每一处 `cli()`/`sti()` 都要照搬，包括它罩住的范围**。`add_request` 的 cli 一直罩到 `request_fn()` 调用完；漏掉之后 end_request（中断上下文）与它交错，请求的 bh 指针错位，读块 1 会拿到别的块的内容并置上 b_uptodate。移植时看到 cli/sti 先问「它防的是谁」，再决定边界放哪。详见 buglog bug-021。
+- [2026-08-02] **`PanicInfo::message().as_str()` 对带格式参数的 assert 返回 None**。`assert!(c, "idx={}", i)` 的消息拿不到，日志里只剩 file:line，精心写的诊断值全丢。直接 Display `info.message()`。详见 buglog bug-022。
+- [2026-08-02] 缓冲/块设备层的随机损坏，先加**不变量护栏**再查根因：`bh()`/`inode()` 的下标断言、`data()` 的空指针检查、链表下标的范围断言、数据页必须 >= 1MB、mkfs 写后读校验、「一块一缓冲」检查。这些把「随机位置的 page fault」变成「一行带数值的断言」，是后续每一步定位的前提。
+- [2026-08-02] 看到内存里出现 `0xf000ff53`（或 `f000:e2c3` 之类）要立刻想到**BIOS ROM**（0xF0000 段的 IRET stub），说明某个指针落到了低端保留内存，而不是数据本身出错。

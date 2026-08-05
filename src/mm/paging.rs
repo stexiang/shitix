@@ -59,7 +59,10 @@ pub fn invalidate() {
     unsafe {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+        // 写 cr3 换页表 = 改变之后所有内存访问的含义。不能声明
+        // `nostack`（栈也是内存，映射可能变），也不能让编译器把跨过这条
+        // 指令的访问重排。只留 preserves_flags。
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(preserves_flags));
     }
 }
 
@@ -67,7 +70,8 @@ pub fn invalidate() {
 pub fn invalidate_page(vaddr: usize) {
     // SAFETY: invlpg 在 CPL=0 合法，只影响 TLB 缓存，不改映射。
     unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+        // 同写 cr3：invlpg 改变该页后续访问的解析结果，不能声明 nostack。
+        core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(preserves_flags));
     }
 }
 

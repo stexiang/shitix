@@ -35,7 +35,10 @@ use crate::irq;
 use crate::klib::errno::{EAGAIN, KResult};
 use crate::klib::printk::Level;
 use crate::mm;
-use task::{HZ, NR_TASKS, STACK_MAGIC, Task, TaskState, flags};
+use task::{HZ, STACK_MAGIC, flags};
+
+// fs/ 与 drivers/ 需要这几个名字；原版它们都在 sched.h 里公开。
+pub use task::{NR_TASKS, Task, TaskState};
 
 /// 任务表。对应原版 `struct task_struct * task[NR_TASKS] = {&init_task, }`。
 /// 原版是指针数组（槽位空 = NULL），我们是值数组（槽位空 = `TaskState::Unused`）。
@@ -89,9 +92,31 @@ pub unsafe fn current() -> &'static mut Task {
 ///
 /// # Safety
 /// 同 [`current`]，且 `nr < NR_TASKS`。
+#[track_caller]
 pub unsafe fn task(nr: usize) -> &'static mut Task {
-    // SAFETY: 契约保证下标有界。
+    assert!(nr < NR_TASKS, "task(): index {} out of range (NR_TASKS={})", nr, NR_TASKS);
+    // SAFETY: 上面已校验下标在界内。
     unsafe { &mut (*core::ptr::addr_of_mut!(TASKS))[nr] }
+}
+
+/// 任务的裸指针。
+///
+/// 调度环的链接字段（`next`/`prev`）必须用这个写，不能用 [`task`]。
+/// [`task`] 返回 `&'static mut Task`；`task(nr).next = old_next` 与
+/// `task(old_next).prev = nr` 在 `nr == old_next`（环上只剩一个任务）或
+/// `cur == old_next` 时是对同一对象的两条可变引用。`&mut` 带 `noalias`，
+/// LLVM 可以把后一次写丢掉，留下一个只连了一半的环节点。
+/// `fs::buffer` 里的同一个错误造成了约 15% 概率的随机文件系统损坏
+/// （见 `fs::buffer::buf_ptr` 的说明）。
+///
+/// # Safety
+/// `nr < NR_TASKS`（内部断言）；调用者负责关中断或独占。
+#[inline]
+#[track_caller]
+unsafe fn task_ptr(nr: usize) -> *mut Task {
+    assert!(nr < NR_TASKS, "task_ptr(): index {} out of range", nr);
+    // SAFETY: 下标已校验；TASKS 是地址恒定的静态数组。
+    unsafe { (*core::ptr::addr_of_mut!(TASKS)).as_mut_ptr().add(nr) }
 }
 
 /// 当前 jiffies。对应原版直接读全局 `jiffies`。
@@ -280,8 +305,10 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
             core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                              options(nomem, nostack, preserves_flags));
             if cur_cr3 != next_cr3 {
+                // 见 mm::paging::flush_tlb：换页表影响之后所有内存访问，
+                // 不能声明 nostack。
                 core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                                 options(nostack, preserves_flags));
+                                 options(preserves_flags));
             }
         }
     }
@@ -320,6 +347,18 @@ pub unsafe extern "C" fn schedule_tail() {
 fn do_timer(_irq: usize, regs: &mut crate::traps::PtRegs) {
     // SAFETY: 中断上下文，单核，jiffies 的自增不会与自身并发。
     unsafe { *core::ptr::addr_of_mut!(JIFFIES) += 1 }
+
+    // 临时看门狗：每个滴答查一次超级块表有没有被写坏，坏了就把被打断的
+    // RIP 打出来——那是「谁在写」的直接证据。只在 debug 构建里跑。
+    if cfg!(debug_assertions) {
+        // SAFETY: 只读一个 u16。
+        if let Some(d) = unsafe { crate::fs::super_block::watchdog_bad_dev() } {
+            crate::pr!(Level::Err,
+                "WATCHDOG: SUPER_BLOCKS[0].s_dev={:#06x} interrupted rip={:#x} rsp={:#x} cs={:#x}",
+                d, regs.rip, regs.rsp, regs.cs);
+            panic!("SUPER_BLOCKS corrupted, interrupted rip={:#x}", regs.rip);
+        }
+    }
 
     // SAFETY: current 在中断里读是安全的（调度只发生在中断返回路径上）。
     let cur = unsafe { current() };
@@ -398,6 +437,56 @@ impl WaitQueue {
     pub unsafe fn sleep_on_timeout(&mut self, ticks: u64) {
         // SAFETY: 契约转交。
         unsafe { self.sleep_on_state(TaskState::Interruptible, jiffies() + ticks) }
+    }
+
+    /// 「先挂队列、再在关中断下复查条件」的睡眠。对应原版
+    /// `__wait_on_buffer` 的结构：
+    /// ```c
+    /// bh->b_count++;
+    /// add_wait_queue(&bh->b_wait, &wait);
+    /// repeat:
+    ///     current->state = TASK_UNINTERRUPTIBLE;
+    ///     if (bh->b_lock) { schedule(); goto repeat; }
+    ///     remove_wait_queue(...); bh->b_count--;
+    /// ```
+    /// 关键在于**先置 state 再判条件**：反过来（先判条件、条件成立才去
+    /// 睡）的话，判完到真正挂上队列之间有一个窗口，中断里的 `wake_up`
+    /// 正好落在这个窗口就没人收到，任务永久睡死。在缓冲上表现为某个
+    /// `b_count` 再也回不到 1，`minix_truncate` 于是一直 retry 到放弃、
+    /// 漏掉那个块。
+    ///
+    /// `cond` 在关中断状态下被反复求值，必须短且不睡。
+    ///
+    /// # Safety
+    /// 同 [`sleep_on`](Self::sleep_on)。`cond` 不得再次进入调度器。
+    pub unsafe fn sleep_on_while(&mut self, mut cond: impl FnMut() -> bool) {
+        let nr = current_nr();
+        if nr == 0 {
+            panic!("task[0] trying to sleep");
+        }
+        // SAFETY: 全程关中断，只在 schedule() 内部放开。
+        let flags = unsafe { irq::local_irq_save() };
+        // 先挂上队列（原版 add_wait_queue 在 repeat 之前）
+        // SAFETY: 已关中断，独占等待链。
+        unsafe {
+            (*core::ptr::addr_of_mut!(WAIT_NEXT))[nr] = self.head;
+        }
+        self.head = nr;
+        while cond() {
+            // SAFETY: 已关中断，独占任务表。
+            unsafe {
+                let t = task(nr);
+                t.state = TaskState::Uninterruptible;
+                t.timeout = 0;
+            }
+            // SAFETY: 不在中断上下文（契约保证）；schedule 内部会开中断。
+            unsafe { schedule() };
+        }
+        // SAFETY: 已关中断。
+        unsafe { task(nr).state = TaskState::Running };
+        self.remove(nr);
+        // SAFETY: 与上面的 save 配对。
+        unsafe { irq::restore_flags(flags) };
     }
 
     /// # Safety
@@ -575,6 +664,89 @@ unsafe fn find_empty_process() -> KResult<usize> {
 ///   栈顶 - 80  : rbp           /
 ///                             ← tss.rsp 指这里
 /// ```
+/// 每个内核线程的栈页数。见 [`kernel_thread`] 里关于「一页不够」的说明。
+pub const KSTACK_PAGES: usize = 4;
+/// 池里放几份栈。**不能按 NR_TASKS 开满**：这个池在 BSS 里，而 BSS
+/// 一旦长过 0x90000 就会盖掉 setup.S 留在那里的机器参数与 E820 表
+/// （0x90000 参数区、0x9E000 E820 数组），表现为 mm 初始化前就 panic。
+/// 3 份正好够当前用量（fsinit + 两个 worker）；再加一份就会越界，
+/// 链接脚本里的 `ASSERT(_kernel_end <= 0x90000)` 会拦住。
+const KSTACK_SLOTS: usize = 3;
+// 池大小 = KSTACK_PAGES * KSTACK_SLOTS 页。加 SCRATCH 之后 BSS 已到 0x90000
+// 边界，KSTACK_PAGES 从 4 降到 3（12KB/线程，实测高水位 9.7KB 偏紧，
+// 所以同时把 mkfs 的 1KB 块搬去了静态 SCRATCH，见 fs::minix::mkfs）。
+/// 内核栈字节数。
+pub const KSTACK_SIZE: usize = KSTACK_PAGES * mm::PAGE_SIZE;
+
+/// 内核栈静态池。task[0] 不占一份（它用 head.S 里的静态栈）。
+///
+/// 对齐到页边界，这样每份栈的底地址都是页对齐的，和原版
+/// `kernel_stack_page` 的性质一致（`current` 曾经靠屏蔽低位从 rsp 反推
+/// task，我们不用那个技巧，但保持对齐没有坏处）。
+#[repr(align(4096))]
+struct KStackPool(#[allow(dead_code)] [u8; KSTACK_SIZE * KSTACK_SLOTS]);
+static mut KSTACKS: KStackPool = KStackPool([0; KSTACK_SIZE * KSTACK_SLOTS]);
+/// 哪一份已被占用。
+static mut KSTACK_USED: [bool; KSTACK_SLOTS] = [false; KSTACK_SLOTS];
+
+/// 上一个退出的内核线程留下的栈，等下一次分配时回收。见
+/// [`do_kthread_exit`] 里的说明。0 表示没有待回收的。
+static mut KSTACK_PENDING: usize = 0;
+
+/// 回收上一个退出的线程留下的栈。
+///
+/// # Safety
+/// 同 [`alloc_kstack`]。
+unsafe fn reap_kstack() {
+    // SAFETY: 契约转交。
+    unsafe {
+        let p = *core::ptr::addr_of!(KSTACK_PENDING);
+        if p != 0 {
+            *core::ptr::addr_of_mut!(KSTACK_PENDING) = 0;
+            free_kstack(p);
+        }
+    }
+}
+
+/// 取一份内核栈，返回栈底地址，0 表示池已满。
+///
+/// # Safety
+/// 只能在关中断的情况下调用（[`kernel_thread`] 已经关了）。
+unsafe fn alloc_kstack() -> usize {
+    // SAFETY: 契约保证已关中断、单核独占这两个静态量。
+    unsafe {
+        reap_kstack();
+        let used = &mut *core::ptr::addr_of_mut!(KSTACK_USED);
+        for (i, u) in used.iter_mut().enumerate() {
+            if !*u {
+                *u = true;
+                let base = core::ptr::addr_of_mut!(KSTACKS) as usize;
+                return base + i * KSTACK_SIZE;
+            }
+        }
+        0
+    }
+}
+
+/// 归还一份内核栈。
+///
+/// # Safety
+/// 同 [`alloc_kstack`]；`addr` 必须是它返回过的地址。
+unsafe fn free_kstack(addr: usize) {
+    // SAFETY: 契约转交。
+    unsafe {
+        let base = core::ptr::addr_of_mut!(KSTACKS) as usize;
+        if addr < base {
+            return;
+        }
+        let i = (addr - base) / KSTACK_SIZE;
+        let used = &mut *core::ptr::addr_of_mut!(KSTACK_USED);
+        if i < used.len() {
+            used[i] = false;
+        }
+    }
+}
+
 pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KResult<usize> {
     // SAFETY: 全程关中断，独占任务表。
     let flags = unsafe { irq::local_irq_save() };
@@ -582,13 +754,19 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
         // SAFETY: 已关中断。
         let nr = unsafe { find_empty_process()? };
 
-        // 内核栈：两页。原版 `sys_fork` 用 `get_free_page()` 取一页做
-        // `kernel_stack_page`，我们要两页所以取两次相邻的做不到——
-        // 改用 kmalloc（原版的 kmalloc 上限是 4096-ish，我们的支持到一页；
-        // 8192 超了，所以分两页并要求它们相邻）。
-        // 简化：直接取两个独立页，只用高的那个当栈，低的那个放魔数区。
-        // 实际上一页 4KB 对内核线程够用，跟原版一致，所以只取一页。
-        let stack = mm::get_free_page();
+        // 内核栈：从静态池里取 [`KSTACK_PAGES`] 页连续空间。
+        //
+        // 原版 `sys_fork` 用 `get_free_page()` 取**一**页（4KB）当
+        // `kernel_stack_page`，我们最初也照搬了，但实测不够：原版的 i386
+        // 栈帧比 x86_64 小（寄存器少一半、指针 4 字节 vs 8 字节），而
+        // fs 的调用链很深（`sys_open` → `namei` → `dir_namei` →
+        // `minix_lookup` → `find_entry` → `minix_bread` → `getblk` →
+        // `ll_rw_block` → `do_rd_request`）。一页会溢出，症状是栈底魔数
+        // 被踩掉 + 一个 CR2 是小负数的 page fault（见 buglog）。
+        //
+        // 页分配器只能给单页且不保证相邻，所以这里用静态池而不是
+        // `get_free_page`：连续、对齐、无需回收，代价是固定占用。
+        let stack = unsafe { alloc_kstack() };
         if stack == 0 {
             return Err(EAGAIN);
         }
@@ -598,7 +776,7 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
         unsafe { core::ptr::write_volatile(stack as *mut u64, STACK_MAGIC) };
 
         let stack = stack as u64;
-        let stack_top = stack + mm::PAGE_SIZE as u64;
+        let stack_top = stack + KSTACK_SIZE as u64;
 
         // 布置初始栈。SAFETY: stack_top 往下 80 字节都在我们刚分配的页内
         // （页是 4096 字节，远大于 80），且该页无人共享。
@@ -644,12 +822,13 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
 
             // 挂进调度环。原版 `SET_LINKS(p)` 操作 next_task/prev_task 指针，
             // 我们操作下标，语义相同。
+            // 裸指针写：nr/cur/old_next 可能两两相等，见 [`task_ptr`]。
             let cur = current_nr();
-            let old_next = task(cur).next;
-            task(nr).next = old_next;
-            task(nr).prev = cur;
-            task(cur).next = nr;
-            task(old_next).prev = nr;
+            let old_next = (*task_ptr(cur)).next;
+            (*task_ptr(nr)).next = old_next;
+            (*task_ptr(nr)).prev = cur;
+            (*task_ptr(cur)).next = nr;
+            (*task_ptr(old_next)).prev = nr;
         }
         Ok(nr)
     })();
@@ -675,18 +854,22 @@ pub unsafe extern "C" fn do_kthread_exit(code: u64) {
         // 直接释放槽位和栈。
         let stack = t.kernel_stack;
         // 摘出调度环
+        // 裸指针写：p/n/自己可能相等，见 [`task_ptr`]。
         let (p, n) = (t.prev, t.next);
-        task(p).next = n;
-        task(n).prev = p;
+        (*task_ptr(p)).next = n;
+        (*task_ptr(n)).prev = p;
         t.state = TaskState::Unused;
         t.kernel_stack = 0;
         irq::restore_flags(flags);
 
-        // 注意：此刻我们还在这个栈上跑，不能立刻释放它。
-        // 让 schedule 切走后由下一个任务代为释放——简化处理：
-        // 内核线程退出属于自检路径，这里泄漏一页可接受，记在 TODO。
-        // 真正的做法是原版那样进 ZOMBIE 由 release() 回收。
-        let _ = stack;
+        // 此刻我们还在这个栈上跑，不能立刻归还——归还后它可能被
+        // 下一个 kernel_thread 拿去初始化，而我们还要在上面跑到
+        // schedule() 切走为止。所以只记下来，由下一次 alloc_kstack
+        // 之前的 reap_kstack 回收。
+        //
+        // 原版的做法是转 TASK_ZOMBIE、由父进程 waitpid 时 release()
+        // 回收；等 exit.c 移植完再换成那个。
+        *core::ptr::addr_of_mut!(KSTACK_PENDING) = stack as usize;
 
         set_need_resched();
         schedule();
@@ -773,6 +956,99 @@ pub fn print_current() {
                if t.stack_ok() { "" } else { ", CORRUPTED STACK" });
 }
 
+// ---- task[0] 的静态栈护栏（原版没有）----
+
+unsafe extern "C" {
+    /// `head.S` 里栈底之下那一页哨兵。
+    #[link_name = "stack_guard"]
+    static STACK_GUARD: u8;
+    /// `head.S` 的内核栈低端。
+    #[link_name = "stack_bottom"]
+    static STACK_BOTTOM: u8;
+    /// 内核栈高端（初始 rsp）。
+    #[link_name = "stack_top"]
+    static STACK_TOP: u8;
+}
+
+/// 哨兵页的填充值。选一个不会被误撞出来的模式。
+const GUARD_PAT: u64 = 0x5A5A_C0DE_5A5A_C0DE;
+
+/// 哨兵区大小，必须与 `head.S` 里 `stack_guard` 的 `.space` 一致。
+const GUARD_BYTES: usize = 512;
+
+/// 给 task[0] 的静态栈铺哨兵。必须在 `start_kernel` 早期、任何深调用
+/// 之前调用一次。
+///
+/// # Safety
+/// 启动早期调用一次，此时哨兵页无人使用（它只是 `.bss` 里的填充）。
+pub unsafe fn init_stack_guard() {
+    // SAFETY: stack_guard 是链接器给出的 .bss 内 4096 字节区域。
+    unsafe {
+        let p = core::ptr::addr_of!(STACK_GUARD) as *mut u64;
+        for i in 0..(GUARD_BYTES / 8) {
+            core::ptr::write_volatile(p.add(i), GUARD_PAT);
+        }
+    }
+}
+
+/// 哨兵是否完好。false 表示 task[0] 的栈已经溢出，踩到了 `.bss` 里
+/// 排在它之前的东西（`fs::buffer::BUFFERS` 就在那一片）。
+pub fn stack_guard_ok() -> bool {
+    // SAFETY: 只读哨兵页。
+    unsafe {
+        let p = core::ptr::addr_of!(STACK_GUARD) as *const u64;
+        for i in 0..(GUARD_BYTES / 8) {
+            if core::ptr::read_volatile(p.add(i)) != GUARD_PAT {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// task[0] 静态栈的用量高水位（字节）。靠「从栈底往上找第一个非零字」
+/// 估算——`head.S` 已经把整个 `.bss` 清过零，所以还没被碰过的部分是 0。
+pub fn stack_high_water() -> usize {
+    // SAFETY: 只读自己的静态栈区间。
+    unsafe {
+        let lo = core::ptr::addr_of!(STACK_BOTTOM) as usize;
+        let hi = core::ptr::addr_of!(STACK_TOP) as usize;
+        let mut p = lo;
+        while p < hi {
+            if core::ptr::read_volatile(p as *const u64) != 0 {
+                break;
+            }
+            p += 8;
+        }
+        hi - p
+    }
+}
+
+/// 当前内核线程栈的用量高水位（字节）。栈来自静态池，`head.S` 已把整个
+/// `.bss` 清零过，所以「从栈底往上第一个非零字」就是历史最深处。
+///
+/// 0 表示当前任务用的是 `head.S` 的静态栈（task[0]），见
+/// [`stack_high_water`]。
+pub fn kstack_high_water() -> usize {
+    // SAFETY: 只读自己的内核栈区间。
+    unsafe {
+        let lo = current().kernel_stack as usize;
+        if lo == 0 {
+            return 0;
+        }
+        let hi = lo + KSTACK_SIZE;
+        // 栈底头 8 字节是 STACK_MAGIC，从它之后开始找
+        let mut p = lo + 8;
+        while p < hi {
+            if core::ptr::read_volatile(p as *const u64) != 0 {
+                break;
+            }
+            p += 8;
+        }
+        hi - p
+    }
+}
+
 /// 打印全部任务。对应原版 `sched.c:show_state()`。
 pub fn show_state() {
     crate::pr!(Level::Info, "sched: jiffies={} switches={} current={}",
@@ -784,4 +1060,30 @@ pub fn show_state() {
             t.show(nr);
         }
     }
+}
+
+/// 当前时间（Unix 纪元秒）。对应原版 `include/linux/sched.h` 的
+/// `CURRENT_TIME` 宏（`xtime.tv_sec`），由 `kernel/time.c` 在启动时
+/// 从 CMOS RTC 读出 `startup_time` 再加上 `jiffies/HZ`。
+///
+/// `kernel/time.c` 的 CMOS 读取还没移植，所以 `STARTUP_TIME` 目前是 0，
+/// 时间戳等于开机以来的秒数。文件系统只把它当单调递增的戳用
+/// （比较新旧、写进 inode），0 起点不影响正确性；接上 RTC 之后
+/// 只需给 `STARTUP_TIME` 赋值。
+pub fn current_time() -> u32 {
+    // SAFETY: 只读一个 u32，启动期设定后不再变。
+    let base = unsafe { *core::ptr::addr_of!(STARTUP_TIME) };
+    base + (jiffies() / HZ) as u32
+}
+
+/// 开机时刻的 Unix 时间。对应原版 `kernel/time.c` 的 `startup_time`。
+static mut STARTUP_TIME: u32 = 0;
+
+/// 设置开机时刻。对应原版 `time_init()` 里 `startup_time = mktime(...)`。
+///
+/// # Safety
+/// 启动期调用一次。
+pub unsafe fn set_startup_time(t: u32) {
+    // SAFETY: 契约保证独占。
+    unsafe { *core::ptr::addr_of_mut!(STARTUP_TIME) = t }
 }

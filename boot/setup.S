@@ -17,9 +17,18 @@
 
     .set INITSEG,  0x9000       /* 机器参数区（与原版一致）*/
     .set SYSSEG,   0x1000       /* system 所在段, 物理 0x10000 */
-    .set PML4_ADDR, 0x70000     /* 页表放在 0x70000 起的 3 个页 */
-    .set PDPT_ADDR, 0x71000
-    .set PD_ADDR,   0x72000
+/* 页表放在 0x4000 起的 3 个页。
+ *
+ * 原来在 0x70000，但内核镜像从 0x10000 装载，BSS 增长到 0x76680 之后
+ * head.S 的清 BSS 会把页表清零 → 切 long mode 时立刻三重错误。
+ * 0x4000-0x6FFF 这一段在 long mode 之后没人用：bootsect 自搬到 0x9000、
+ * setup 在 0x90200、机器参数区 0x90000、E820 表 0x9E000，
+ * 而 bootsect 的实模式栈在 0x9000:0x4000（即物理 0x94000）不在这里。
+ * page_alloc 把整个低 1MB 都列为保留（见 MIN_USABLE_PHYS），
+ * 所以这三页不会被当成空闲页派出去。 */
+    .set PML4_ADDR, 0x4000
+    .set PDPT_ADDR, 0x5000
+    .set PD_ADDR,   0x6000
 
 _setup_start:
     movw    %cs, %ax
