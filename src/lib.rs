@@ -14,6 +14,7 @@ pub mod fs;
 pub mod irq;
 pub mod klib;
 pub mod mm;
+pub mod net;
 pub mod sched;
 pub mod serial;
 pub mod syscall;
