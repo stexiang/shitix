@@ -377,3 +377,173 @@ macro_rules! ksprintf {
         core::str::from_utf8(&$buf[..n]).unwrap_or("<non-utf8>")
     }};
 }
+
+// =============================================================================
+// SAFE WRAPPERS
+// =============================================================================
+
+use crate::klib::string::CStr;
+
+/// 解析无符号整数的安全包装器
+/// 
+/// # Arguments
+/// * `s` - 以 NUL 结尾的字节切片
+/// * `base` - 进制（0 表示自动检测）
+/// 
+/// # Returns
+/// * `(值, 消耗的字节数)`
+pub fn parse_u64(s: &[u8], base: u32) -> Option<(u64, usize)> {
+    if s.is_empty() || s[s.len() - 1] != 0 {
+        return None; // 不是 NUL 终止
+    }
+    let s = &s[..s.len() - 1]; // 去掉 NUL
+    if s.is_empty() {
+        return Some((0, 1));
+    }
+    
+    let mut base = base;
+    let mut i = 0usize;
+    
+    if base == 0 {
+        base = 10;
+        if s[i] == b'0' {
+            base = 8;
+            i += 1;
+            if i < s.len() && (s[i] == b'x' || s[i] == b'X') {
+                if i + 1 < s.len() && isxdigit(s[i + 1]) {
+                    i += 1;
+                    base = 16;
+                } else {
+                    return None; // 0x 后没有数字
+                }
+            }
+        }
+    }
+    
+    let mut result: u64 = 0;
+    while i < s.len() && isxdigit(s[i]) {
+        let c = s[i];
+        let value = if isdigit(c) {
+            (c - b'0') as u64
+        } else {
+            (tolower(c) - b'a') as u64 + 10
+        };
+        if value >= base as u64 {
+            break;
+        }
+        result = result.wrapping_mul(base as u64).wrapping_add(value);
+        i += 1;
+    }
+    
+    if i == 0 {
+        None
+    } else {
+        Some((result, i + 1)) // +1 for NUL terminator
+    }
+}
+
+/// 解析有符号整数的安全包装器
+pub fn parse_i64(s: &[u8], base: u32) -> Option<(i64, usize)> {
+    if s.is_empty() || s[s.len() - 1] != 0 {
+        return None;
+    }
+    let s = &s[..s.len() - 1];
+    if s.is_empty() {
+        return Some((0, 1));
+    }
+    
+    let negative = s[0] == b'-';
+    let (start, consumed) = if negative {
+        (&s[1..], s.len() - 1)
+    } else {
+        (s, s.len())
+    };
+    
+    if consumed == 0 {
+        return None;
+    }
+    
+    match parse_u64(start, base) {
+        Some((v, n)) => {
+            let result = if negative { -(v as i64) } else { v as i64 };
+            Some((result, n + if negative { 1 } else { 0 } + 1)) // +1 for NUL
+        }
+        None => None,
+    }
+}
+
+/// 解析 CStr 的无符号整数
+pub fn parse_cstr_u64(cstr: &CStr, base: u32) -> Option<(u64, usize)> {
+    parse_u64(cstr.as_bytes(), base)
+}
+
+/// 解析 CStr 的有符号整数
+pub fn parse_cstr_i64(cstr: &CStr, base: u32) -> Option<(i64, usize)> {
+    parse_i64(cstr.as_bytes(), base)
+}
+
+/// FormatBuf - 安全的格式化缓冲区
+pub struct FormatBuf {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl FormatBuf {
+    /// 创建新的格式化缓冲区
+    pub fn new() -> Self {
+        let mut s = Self {
+            buf: [0; 256],
+            len: 0,
+        };
+        s.buf[0] = 0;
+        s
+    }
+
+    /// 格式化字符串
+    pub fn format(&mut self, args: core::fmt::Arguments) {
+        use core::fmt::Write;
+        // 保留一个字节给 NUL
+        let available = &mut self.buf[..255];
+        let _ = Cursor::new(available).write_fmt(args);
+        self.len = available.len().min(255);
+        self.buf[self.len] = 0;
+    }
+
+    /// 获取为 CStr
+    pub fn as_cstr(&self) -> CStr {
+        // SAFETY: 缓冲区总是 NUL 终止
+        unsafe { CStr::from_ptr(self.buf.as_ptr()) }
+    }
+
+    /// 获取为 str（如果 UTF-8 有效）
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(&self.buf[..self.len]).ok()
+    }
+
+    /// 获取长度
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// 获取字节切片
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl Default for FormatBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Write for FormatBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if self.len + s.len() < 256 {
+            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+            self.buf[self.len] = 0;
+        }
+        Ok(())
+    }
+}
