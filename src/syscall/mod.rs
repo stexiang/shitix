@@ -25,30 +25,215 @@ use crate::klib::errno::ENOSYS;
 use crate::klib::printk::Level;
 use crate::traps::PtRegs;
 
-/// 系统调用号。取值与原版 `include/linux/unistd.h` 的 `__NR_*` 完全一致
-/// （即 i386 的调用号），这样将来跑原版编译出的用户程序也能对上。
+/// 系统调用号。x86_64 Linux 系统调用号
 pub mod nr {
-    pub const SETUP: usize = 0;
-    pub const EXIT: usize = 1;
-    pub const FORK: usize = 2;
-    pub const READ: usize = 3;
-    pub const WRITE: usize = 4;
-    pub const OPEN: usize = 5;
-    pub const CLOSE: usize = 6;
+    // 进程管理
+    pub const EXIT: usize = 60;
+    pub const EXIT_GROUP: usize = 231;
+    pub const FORK: usize = 57;
+    pub const VFORK: usize = 58;
+    pub const EXECVE: usize = 59;
+    pub const WAIT4: usize = 61;
     pub const WAITPID: usize = 7;
-    pub const GETPID: usize = 20;
-    pub const PAUSE: usize = 29;
-    pub const KILL: usize = 37;
-    pub const DUP: usize = 41;
-    pub const TIMES: usize = 43;
-    pub const GETPPID: usize = 64;
-    pub const GETPGRP: usize = 65;
+    pub const KILL: usize = 62;
+    pub const UNAME: usize = 160;
+    pub const GETPID: usize = 61;
+    pub const GETPPID: usize = 62;
+    pub const GETPGRP: usize = 76;
+    pub const GETPGID: usize = 121;
+    pub const SETPGID: usize = 123;
     pub const SETSID: usize = 66;
-    pub const UNAME: usize = 122;
+    
+    // 文件操作
+    pub const READ: usize = 0;
+    pub const WRITE: usize = 1;
+    pub const OPEN: usize = 2;
+    pub const CLOSE: usize = 3;
+    pub const STAT: usize = 4;
+    pub const FSTAT: usize = 5;
+    pub const LSTAT: usize = 6;
+    pub const PIVOT_ROOT: usize = 155;
+    pub const GETCWD: usize = 17;
+    pub const CHDIR: usize = 80;
+    pub const FCHDIR: usize = 81;
+    pub const RENAME: usize = 82;
+    pub const MKDIR: usize = 83;
+    pub const RMDIR: usize = 84;
+    pub const CREAT: usize = 85;
+    pub const LINK: usize = 86;
+    pub const UNLINK: usize = 87;
+    pub const SYMLINK: usize = 88;
+    pub const READLINK: usize = 89;
+    pub const CHMOD: usize = 90;
+    pub const FCHMOD: usize = 91;
+    pub const CHOWN: usize = 92;
+    pub const FCHOWN: usize = 93;
+    pub const LCHOWN: usize = 94;
+    pub const UMASK: usize = 95;
+    pub const GETTIMEOFDAY: usize = 96;
+    pub const GETRLIMIT: usize = 97;
+    pub const GETRUSAGE: usize = 98;
+    pub const SYSINFO: usize = 99;
+    pub const TIMES: usize = 100;
+    pub const GETUID: usize = 102;
+    pub const SYSLOG: usize = 103;
+    pub const GETGID: usize = 104;
+    pub const SETUID: usize = 105;
+    pub const SETGID: usize = 106;
+    pub const GETEUID: usize = 107;
+    pub const GETEGID: usize = 108;
+    
+    // 内存管理
+    pub const BRK: usize = 12;
+    pub const MMAP: usize = 9;
+    pub const MUNMAP: usize = 11;
+    pub const MPROTECT: usize = 10;
+    pub const MLOCK: usize = 224;
+    pub const MUNLOCK: usize = 225;
+    pub const MLOCKALL: usize = 226;
+    pub const MUNLOCKALL: usize = 227;
+    pub const MREMAP: usize = 25;
+    pub const MSYNC: usize = 26;
+    pub const MINCORE: usize = 27;
+    pub const MADVISE: usize = 28;
+    pub const MMAP2: usize = 9;
+    
+    // 文件描述符
+    pub const DUP: usize = 32;
+    pub const DUP2: usize = 33;
+    pub const PAUSE: usize = 34;
+    pub const SELECT: usize = 23;
+    pub const POLL: usize = 7;
+    pub const EPOLL_CREATE: usize = 13;
+    pub const EPOLL_CTL: usize = 14;
+    pub const EPOLL_WAIT: usize = 15;
+    pub const PIPE: usize = 22;
+    pub const PIPE2: usize = 293;
+    pub const SETITIMER: usize = 38;
+    pub const GETITIMER: usize = 39;
+    pub const SETHOSTNAME: usize = 147;
+    pub const SETDOMAINNAME: usize = 146;
+    pub const IOPERM: usize = 173;
+    pub const IOPL: usize = 172;
+    pub const INIT_MODULE: usize = 175;
+    pub const DELETE_MODULE: usize = 176;
+    pub const FCNTL: usize = 72;
+    pub const FLOCK: usize = 73;
+    pub const FSYNC: usize = 74;
+    pub const FDATASYNC: usize = 75;
+    
+    // 信号
+    pub const ALARM: usize = 37;
+    pub const SIGNAL: usize = 48;
+    pub const RT_SIGACTION: usize = 13;
+    pub const RT_SIGPROCMASK: usize = 14;
+    pub const RT_SIGRETURN: usize = 15;
+    pub const RT_SIGSUSPEND: usize = 24;
+    
+    // 时间
+    pub const CLOCK_GETRES: usize = 229;
+    pub const CLOCK_GETTIME: usize = 228;
+    pub const CLOCK_SETTIME: usize = 227;
+    pub const CLOCK_NANOSLEEP: usize = 230;
+    pub const TIMER_CREATE: usize = 222;
+    pub const TIMER_SETTIME: usize = 223;
+    pub const TIMER_GETTIME: usize = 224;
+    pub const TIMER_GETOVERRUN: usize = 225;
+    pub const TIMER_DELETE: usize = 226;
+    
+    // 挂载
+    pub const MOUNT: usize = 165;
+    pub const UMOUNT: usize = 166;
+    pub const UMOUNT2: usize = 166;
+    
+    // 其他系统调用
+    pub const READV: usize = 19;
+    pub const WRITEV: usize = 20;
+    pub const ACCESS: usize = 21;
+    pub const PREAD64: usize = 17;
+    pub const PWRITE64: usize = 18;
+    pub const TRUNCATE: usize = 76;
+    pub const FTRUNCATE: usize = 77;
+    pub const GETDENTS: usize = 78;
+    pub const GETDENTS64: usize = 61;
+    pub const FUTIMESAT: usize = 261;
+    pub const FUTIMENSAT: usize = 262;
+    pub const READLINKAT: usize = 267;
+    pub const SYMLINKAT: usize = 266;
+    pub const LINKAT: usize = 265;
+    pub const UNLINKAT: usize = 263;
+    pub const MKDIRAT: usize = 258;
+    pub const MKNODAT: usize = 259;
+    pub const RENAMEAT: usize = 264;
+    pub const MKNOD: usize = 133;
+    pub const ACCT: usize = 163;
+    pub const SWAPON: usize = 167;
+    pub const SWAPOFF: usize = 168;
+    pub const REBOOT: usize = 169;
+    pub const SETRESUID: usize = 147;
+    pub const GETRESUID: usize = 148;
+    pub const SETRESGID: usize = 149;
+    pub const GETRESGID: usize = 150;
+    pub const SETFSUID: usize = 151;
+    pub const SETFSGID: usize = 152;
+    pub const SETREUID: usize = 117;
+    pub const SETREGID: usize = 119;
+    pub const GETGROUPS: usize = 115;
+    pub const SETGROUPS: usize = 116;
+    pub const SETPRIORITY: usize = 141;
+    pub const GETPRIORITY: usize = 142;
+    
+    // 内存策略
+    pub const MBIND: usize = 237;
+    pub const GETMEMPOLICY: usize = 238;
+    pub const SETMEMPOLICY: usize = 239;
+    
+    // IPC
+    pub const MSGSND: usize = 69;
+    pub const MSGRCV: usize = 70;
+    pub const MSGGET: usize = 68;
+    pub const MSGCTL: usize = 71;
+    pub const SEMGET: usize = 64;
+    pub const SEMOP: usize = 65;
+    pub const SEMCTL: usize = 66;
+    pub const SHMGET: usize = 73;
+    pub const SHMCTL: usize = 74;
+    pub const SHMAT: usize = 72;
+    pub const SHMDT: usize = 75;
+    
+    // 网络
+    pub const SOCKET: usize = 41;
+    pub const SOCKETPAIR: usize = 53;
+    pub const BIND: usize = 49;
+    pub const LISTEN: usize = 50;
+    pub const ACCEPT: usize = 43;
+    pub const CONNECT: usize = 42;
+    pub const GETSOCKNAME: usize = 51;
+    pub const GETPEERNAME: usize = 52;
+    pub const SENDTO: usize = 44;
+    pub const RECVFROM: usize = 45;
+    pub const SHUTDOWN: usize = 48;
+    pub const SETSOCKOPT: usize = 54;
+    pub const GETSOCKOPT: usize = 55;
+    pub const SENDMSG: usize = 46;
+    pub const RECVMSG: usize = 47;
+    
+    // 扩展
+    pub const PRLIMIT: usize = 134;
+    pub const RECVMMSG: usize = 299;
+    pub const SENDMMSG: usize = 307;
+    pub const SETNS: usize = 308;
+    pub const GETCPU: usize = 309;
+    pub const SEMTIMEDOP: usize = 67;
+    pub const CAPGET: usize = 90;
+    pub const CAPSET: usize = 91;
+    pub const PTRACE: usize = 101;
+    
+    // IDLE
     pub const IDLE: usize = 112;
-    pub const GETPGID: usize = 132;
-    /// 表的容量。原版 `NR_syscalls = sizeof(sys_call_table)/sizeof(fn_ptr)` = 137。
-    pub const NR_SYSCALLS: usize = 137;
+    
+    /// 表的容量
+    pub const NR_SYSCALLS: usize = 512;
 }
 
 /// 系统调用处理函数签名。
@@ -98,6 +283,31 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::WRITE] = sys::write;
     t[nr::UNAME] = sys::uname;
     t[nr::IDLE] = sys::idle;
+    // LFS Critical Syscalls
+    t[nr::READ] = sys::read;
+    t[nr::OPEN] = sys::open;
+    t[nr::CLOSE] = sys::close;
+    t[nr::BRK] = sys::brk;
+    t[nr::MMAP] = sys::mmap;
+    t[nr::MUNMAP] = sys::munmap;
+    t[nr::MPROTECT] = sys::mprotect;
+    t[nr::CREAT] = sys::creat;
+    t[nr::STAT] = sys::stat;
+    t[nr::FSTAT] = sys::fstat;
+    t[nr::LSTAT] = sys::lstat;
+    t[nr::CHDIR] = sys::chdir;
+    t[nr::MKDIR] = sys::mkdir;
+    t[nr::RMDIR] = sys::rmdir;
+    t[nr::UNLINK] = sys::unlink;
+    t[nr::SYMLINK] = sys::symlink;
+    t[nr::READLINK] = sys::readlink;
+    t[nr::CHMOD] = sys::chmod;
+    t[nr::CHOWN] = sys::chown;
+    t[nr::DUP] = sys::dup;
+    t[nr::DUP2] = sys::dup2;
+    t[nr::GETCWD] = sys::getcwd;
+    t[nr::RENAME] = sys::rename;
+    t[nr::MKNOD] = sys::mknod;
     t
 };
 

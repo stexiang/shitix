@@ -147,6 +147,8 @@ pub struct Task {
     pub kernel_stack: u64,
     /// 原版 `struct tss_struct tss`
     pub tss: Tss,
+    /// 数据段结束地址（原版 `unsigned long brk`）。用于 brk() 系统调用。
+    pub brk: usize,
 
     /// 退出码。原版 `int exit_code`
     pub exit_code: i32,
@@ -176,6 +178,7 @@ impl Task {
             timeout: 0,
             kernel_stack: 0,
             tss: Tss::new(),
+            brk: 0,
             exit_code: 0,
         }
     }
