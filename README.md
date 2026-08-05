@@ -98,6 +98,7 @@ shitix/
 | `sched/` | 任务调度器 | `kernel/sched.c` |
 | `mm/` | 内存管理 | `mm/*.c` |
 | `fs/` | 文件系统 | `fs/*.c` |
+| `fs/ext2/` | ext2/ext3/ext4 文件系统 | `fs/ext2/*.c` |
 | `klib/string.rs` | 字符串操作 | `lib/string.c` |
 | `klib/vsprintf.rs` | 格式化输出 | `kernel/vsprintf.c` |
 | `signal.rs` | 信号处理 | `kernel/signal.c` |
@@ -153,6 +154,17 @@ fn release_region(base: u32, count: u32) -> Result<(), IoError>;
 fn check_port(base: u32, count: u32) -> bool;
 fn get_refcount(port: u32) -> Result<u8, IoError>;
 ```
+
+### ext2 文件系统
+
+`fs/ext2/` 实现了 Linux 标准 ext2/ext3/ext4 文件系统结构：
+
+| 结构 | 说明 |
+|------|------|
+| `Ext2SuperBlock` | 超级块（1024 字节，与磁盘格式完全对应） |
+| `Ext2GroupDesc` | 块组描述符 |
+| `Ext2Inode` | inode 结构（支持直接块和间接块） |
+| `Ext2DirEntry` | 目录项结构 |
 
 ## 构建产物
 
