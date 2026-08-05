@@ -10,13 +10,17 @@ pub mod console;
 pub mod desc;
 pub mod drivers;
 pub mod e820;
+pub mod exit;
 pub mod fs;
+pub mod info;
+pub mod ioport;
 pub mod irq;
 pub mod klib;
 pub mod mm;
 pub mod net;
 pub mod sched;
 pub mod serial;
+pub mod signal;
 pub mod syscall;
 pub mod traps;
 
