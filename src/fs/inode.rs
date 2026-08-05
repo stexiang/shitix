@@ -35,6 +35,8 @@ pub enum FsType {
     None,
     /// minix 文件系统。原版 `minix_inode_operations`
     Minix,
+    /// ext2/ext3/ext4 文件系统。原版 `ext2_inode_operations`
+    Ext2,
     /// 字符设备文件。原版 `chrdev_inode_operations`
     Chr,
     /// 块设备文件。原版 `blkdev_inode_operations`

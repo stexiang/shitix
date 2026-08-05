@@ -16,7 +16,7 @@ use crate::fs::file_table::filp;
 use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::open::fd_to_filp;
 use crate::fs::{Dirent, SEEK_CUR, SEEK_END, SEEK_SET, mode, oflags};
-use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOTDIR, ESPIPE};
+use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENOTDIR, ESPIPE};
 
 /// 读。对应原版 `sys_read()`。
 ///
@@ -55,6 +55,7 @@ pub unsafe fn read(fd: usize, buf: &mut [u8]) -> i64 {
                 }
                 super::minix::file::read(n, pos, buf)
             }
+            FsType::Ext2 => -(ENOSYS as i64), // TODO: ext2 file read
             FsType::None => -(EINVAL as i64),
         };
         if r > 0 {
@@ -109,6 +110,7 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
                 }
                 super::minix::file::write(n, pos, buf)
             }
+            FsType::Ext2 => -(ENOSYS as i64), // TODO: ext2 file write
             FsType::None => -(EINVAL as i64),
         };
         if r > 0 {

@@ -4,7 +4,7 @@
 //! 
 //! ## 状态
 //! 
-//! 核心数据结构已定义，但需要与缓冲区缓存和 VFS 层集成。
+//! 核心数据结构已定义，需要与缓冲区缓存和 VFS 层集成。
 //! 
 //! ## 待完成
 //! 
@@ -23,6 +23,7 @@ pub mod namei;
 pub mod file;
 pub mod truncate;
 pub mod io;
+pub mod ops;
 
 // Re-exports for convenience
 pub use super_block::{Ext2SuperBlock, Ext2GroupDesc, EXT2_SUPER_MAGIC};

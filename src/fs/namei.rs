@@ -27,7 +27,7 @@ use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::super_block;
 use crate::fs::{MAY_EXEC, MAY_READ, MAY_WRITE, MS_RDONLY, mode, oflags};
 use crate::klib::errno::{
-    EACCES, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM, EROFS,
+    EACCES, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, ENOTDIR, EPERM, EROFS,
 };
 
 /// 路径分量的最大长度。对应原版 `include/linux/limits.h` 的 `NAME_MAX 255`，
@@ -186,6 +186,7 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
         // 原版是 dir->i_op->lookup(dir, name, len, &result)
         match inode::inode(dir).i_op {
             FsType::Minix => super::minix::namei::lookup(dir, name),
+            FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::lookup
             _ => Err(ENOTDIR),
         }
     }
@@ -272,6 +273,7 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
                 }
                 let r = match inode::inode(dir).i_op {
                     FsType::Minix => super::minix::namei::create(dir, last, m),
+                    FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::create
                     _ => Err(ENOTDIR),
                 };
                 inode::iput(dir);
@@ -330,6 +332,7 @@ pub unsafe fn do_mknod(path: &[u8], m: u16, rdev: u16) -> i64 {
         }
         let r = match inode::inode(dir).i_op {
             FsType::Minix => super::minix::namei::mknod(dir, last, m, rdev),
+            FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::mknod
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -364,6 +367,7 @@ pub unsafe fn do_mkdir(path: &[u8], m: u16) -> i64 {
         }
         let r = match inode::inode(dir).i_op {
             FsType::Minix => super::minix::namei::mkdir(dir, last, m),
+            FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::mkdir
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -398,6 +402,7 @@ pub unsafe fn do_rmdir(path: &[u8]) -> i64 {
         }
         let r = match inode::inode(dir).i_op {
             FsType::Minix => super::minix::namei::rmdir(dir, last),
+            FsType::Ext2 => ENOSYS, // TODO: ext2::namei::rmdir
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -426,6 +431,7 @@ pub unsafe fn do_unlink(path: &[u8]) -> i64 {
         }
         let r = match inode::inode(dir).i_op {
             FsType::Minix => super::minix::namei::unlink(dir, last),
+            FsType::Ext2 => ENOSYS, // TODO: ext2::namei::unlink
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -475,6 +481,7 @@ pub unsafe fn do_link(oldpath: &[u8], newpath: &[u8]) -> i64 {
         }
         let r = match inode::inode(dir).i_op {
             FsType::Minix => super::minix::namei::link(target, dir, last),
+            FsType::Ext2 => ENOSYS, // TODO: ext2::namei::link
             _ => ENOTDIR,
         };
         inode::iput(target);
