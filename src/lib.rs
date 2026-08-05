@@ -26,6 +26,8 @@ pub mod signal;
 pub mod smp;
 pub mod syscall;
 pub mod traps;
+pub mod usb;
+pub mod umm;
 
 /// `sys_uname` 报告的系统信息。对应原版 `include/linux/utsname.h` 里
 /// `init_uts_ns` 的字段和 `version.c` 的 `UTS_RELEASE`。
