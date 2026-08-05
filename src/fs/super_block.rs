@@ -119,25 +119,34 @@ impl SuperBlock {
     }
 }
 
-/// 护栏图案。见 [`GUARD_LO`]。
+/// 护栏图案。见 `SUPER_AREA`。
 const SB_GUARD: u64 = 0x1234_ABCD_1234_ABCD;
 
-/// 表前后的护栏。用来区分「越界写打到了这张表上」和「表里的字段被
-/// 逻辑错误写坏了」：护栏破了就是前者（有人从相邻地址溢出过来），
-/// 护栏完好而字段是垃圾就是后者。
+/// 用 `#[repr(C)]` 保证内存布局：LO guard → 表 → HI guard。
+/// 原先用三个独立 static，链接器把 GUARD_HI 放在了 SUPER_BLOCKS 前面、
+/// GUARD_LO 放在了后面，完全失去保护作用（0x68bc0: HI, 0x68be0: LO,
+/// 0x68c08: SUPER_BLOCKS）。越界写直接打到紧邻的 ROOT_INODE，根本碰不到
+/// 任何护栏。
 ///
-/// 加它的起因：观察到整个 `SuperBlock` 被填成低端内存 BIOS ROM 的字节
-/// （`s_dev=0xff53`、`s_ninodes=61440`、`s_imap[]` 里是 `0xf000ff53`），
+/// 起因：观察到整个 `SuperBlock` 被填成 BIOS ROM 的字节
+/// （`s_dev=0xff53`、`s_imap[]` 里是 `0xf000ff53`），
 /// 这种「一整片都坏」的形态只有内存被覆盖能解释。
-#[used]
-static mut GUARD_LO: [u64; 4] = [SB_GUARD; 4];
+#[repr(C)]
+struct GuardedSuperBlocks {
+    /// 低侧护栏，4 个 u64。
+    lo: [u64; 4],
+    /// 超级块表。
+    table: [SuperBlock; NR_SUPER],
+    /// 高侧护栏，4 个 u64。
+    hi: [u64; 4],
+}
 
-/// 超级块表。对应原版 `struct super_block super_blocks[NR_SUPER]`。
-static mut SUPER_BLOCKS: [SuperBlock; NR_SUPER] = [const { SuperBlock::new() }; NR_SUPER];
-
-/// 见 [`GUARD_LO`]。
-#[used]
-static mut GUARD_HI: [u64; 4] = [SB_GUARD; 4];
+/// 超级块表，含前后护栏。对应原版 `struct super_block super_blocks[NR_SUPER]`。
+static mut SUPER_AREA: GuardedSuperBlocks = GuardedSuperBlocks {
+    lo: [SB_GUARD; 4],
+    table: [const { SuperBlock::new() }; NR_SUPER],
+    hi: [SB_GUARD; 4],
+};
 
 /// 已挂载超级块的字段自检。`s_dirsize`/`s_namelen` 只能是 minix v1/v2 的
 /// 那两组值；它们直接参与目录项偏移计算（`2 * dirsize`、`off + dirsize`），
@@ -155,7 +164,7 @@ pub unsafe fn check_mounted(n: usize) {
     unsafe { check_guards("check_mounted") };
     // SAFETY: 只读标量。
     unsafe {
-        // 全部走裸指针 + volatile：`&(*addr_of!(SUPER_BLOCKS))[n]` 建的是
+        // 全部走裸指针 + volatile：`SUPER_AREA.table[n]` 建的是
         // 共享引用，一旦调用者手里还有同一槽的 `&mut`（mount_root 里就是
         // 这样），这次读就不可信。踩过两次：报出来的值是 IVT 字节
         // （0xf000ff53...）或超出槽数范围的下标，而看门狗每个滴答都在查
@@ -173,7 +182,7 @@ pub unsafe fn check_mounted(n: usize) {
     }
 }
 
-/// 看门狗：`SUPER_BLOCKS[0].s_dev` 的合法值只有 0（空闲）和 ROOT_DEV。
+/// 看门狗：`SUPER_AREA.table[0].s_dev` 的合法值只有 0（空闲）和 ROOT_DEV。
 /// 由时钟中断每个滴答调一次，这样能把「被写坏」的时刻缩到一个滴答内，
 /// 并且能在中断返回路径上拿到当时的 RIP（`do_timer` 收到 `PtRegs`）。
 ///
@@ -182,7 +191,7 @@ pub unsafe fn check_mounted(n: usize) {
 pub unsafe fn watchdog_bad_dev() -> Option<u16> {
     // SAFETY: 只读。
     unsafe {
-        let sp = &(*core::ptr::addr_of!(SUPER_BLOCKS))[0];
+        let sp = &(*core::ptr::addr_of!(SUPER_AREA)).table[0];
         let d = core::ptr::read_volatile(core::ptr::addr_of!(sp.s_dev));
         if d != 0 && d != *core::ptr::addr_of!(ROOT_DEV) {
             return Some(d);
@@ -212,20 +221,18 @@ pub unsafe fn watchdog_bad_dev() -> Option<u16> {
 /// 检查两侧护栏。破了就报出哪一侧、第几个字，并 panic。
 ///
 /// # Safety
-/// 只读两个静态数组，可在任何上下文调用。
+/// 只读，可在任何上下文调用。
 pub unsafe fn check_guards(tag: &str) {
     // SAFETY: 只读。
     unsafe {
-        for (name, p) in [
-            ("lo", core::ptr::addr_of!(GUARD_LO) as *const u64),
-            ("hi", core::ptr::addr_of!(GUARD_HI) as *const u64),
-        ] {
+        let area = &*core::ptr::addr_of!(SUPER_AREA);
+        for (name, guard) in [("lo", &area.lo), ("hi", &area.hi)] {
             for i in 0..4 {
-                let v = core::ptr::read_volatile(p.add(i));
+                let v = core::ptr::read_volatile(&guard[i]);
                 if v != SB_GUARD {
                     pr_warn!("super: guard {} word {} smashed: {:#018x} (at {})",
                              name, i, v, tag);
-                    panic!("SUPER_BLOCKS guard {} smashed at {}", name, tag);
+                    panic!("SUPER_AREA guard {} smashed at {}", name, tag);
                 }
             }
         }
@@ -247,7 +254,7 @@ static mut ROOT_MOUNTFLAGS: u64 = 0;
 #[track_caller]
 pub unsafe fn sb(n: usize) -> &'static mut SuperBlock {
     // 越界立刻报出下标。最常见的错因是把 NIL（usize::MAX）或一个未初始化的
-    // `i_sb` 当下标传进来。没有这道检查的话越界写会落到 `SUPER_BLOCKS`
+    // `i_sb` 当下标传进来。没有这道检查的话越界写会落到 `SUPER_AREA`
     // 之后的静态变量上（BSS 里紧邻的就是别的表），症状是完全无关的地方
     // 读到垃圾——比如 `s_imap[]` 里出现低端内存 IVT 的 `0xf000ff53`。
     assert!(n < NR_SUPER, "sb(): index {} out of range (NR_SUPER={})", n, NR_SUPER);
@@ -255,7 +262,7 @@ pub unsafe fn sb(n: usize) -> &'static mut SuperBlock {
     // 才炸，是为了把「谁写坏了 s_imap/s_zmap」和「谁误用了它」分开：
     // 看到过 `0xf000ff53f000ff53`（低端内存 IVT 里那条 `F000:FF53` 的
     // 重复模式）出现在这两个数组里，说明有人把低端内存的内容拷进了
-    // `SUPER_BLOCKS`，而不是缓冲层算错了下标。
+    // `SUPER_AREA`，而不是缓冲层算错了下标。
     // 护栏先查：如果是「越界写砸了整片」，护栏会先破，这样报出来的是
     // 「谁写坏了表」而不是「谁用了坏字段」。
     // 这里**不要**调 `check_guards()`。护栏检查本身要读静态数组，而
@@ -265,14 +272,14 @@ pub unsafe fn sb(n: usize) -> &'static mut SuperBlock {
     // 正确的 `SB_GUARD` —— 内存完好，是比较本身被编译器重排/复用了。
     // 护栏要查就在 mount/umount 这种不持有 `&mut` 的边界上查。
     // 这里曾经有一段「校验 s_imap/s_zmap 下标」的 debug 检查。**不要加
-    // 回来**：它通过 `&(*addr_of!(SUPER_BLOCKS))[n]` 建了一条共享引用，
+    // 回来**：它通过 `SUPER_AREA.table[n]` 建了一条共享引用，
     // 而调用者手里往往还握着上一次 `sb(n)` 返回的 `&mut`——共享引用与
     // `&mut` 重叠就是 UB，检查自己读到的值因此是垃圾。实测症状：报
     // "map slot 112 corrupt"，而 112 根本超出 8+8 个槽的范围，随后
     // dump 出来的内存又完好无损。字段级不变量要查就在具体的使用点
     // （见 `check_mounted`），不要放进访问器里。
     // SAFETY: 上面已校验下标在界内；单核内核。
-    unsafe { &mut (*core::ptr::addr_of_mut!(SUPER_BLOCKS))[n] }
+    unsafe { &mut (*core::ptr::addr_of_mut!(SUPER_AREA)).table[n] }
 }
 
 /// 超级块的裸指针。
@@ -294,8 +301,8 @@ pub unsafe fn sb(n: usize) -> &'static mut SuperBlock {
 #[track_caller]
 pub unsafe fn sb_ptr(n: usize) -> *mut SuperBlock {
     assert!(n < NR_SUPER, "sb_ptr(): index {} out of range", n);
-    // SAFETY: 下标已校验；SUPER_BLOCKS 地址恒定。
-    unsafe { (*core::ptr::addr_of_mut!(SUPER_BLOCKS)).as_mut_ptr().add(n) }
+    // SAFETY: 下标已校验；SUPER_AREA 地址恒定。
+    unsafe { (*core::ptr::addr_of_mut!(SUPER_AREA)).table.as_mut_ptr().add(n) }
 }
 
 /// 根设备号。
@@ -424,7 +431,7 @@ pub unsafe fn read_super(dev: u16, flags: u64, silent: bool) -> usize {
             if back != dev {
                 pr_warn!("DBG read_super: wrote s_dev={:#06x} but read back {:#06x} (slot {})",
                          dev, back, n);
-                panic!("SUPER_BLOCKS write lost");
+                panic!("SUPER_AREA write lost");
             }
         }
 
