@@ -430,6 +430,157 @@ pub unsafe fn c_str<'a>(s: *const u8) -> Option<&'a str> {
 }
 
 // =============================================================================
+// SAFE SLICE-BASED API (推荐使用)
+// =============================================================================
+
+/// 字符串长度（安全切片版）。
+#[inline]
+pub fn strlen_slice(s: &[u8]) -> usize {
+    s.iter().position(|&c| c == 0).unwrap_or(s.len())
+}
+
+/// 字符串比较（安全切片版）。返回 Ordering。
+pub fn strcmp_slice(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let len_a = strlen_slice(a);
+    let len_b = strlen_slice(b);
+    let min_len = len_a.min(len_b);
+    
+    match a[..min_len].cmp(&b[..min_len]) {
+        core::cmp::Ordering::Equal if len_a != len_b => len_a.cmp(&len_b),
+        other => other,
+    }
+}
+
+/// 字符串比较（安全切片版，限长度）。
+pub fn strncmp_slice(a: &[u8], b: &[u8], count: usize) -> core::cmp::Ordering {
+    let min_len = count.min(a.len()).min(b.len());
+    match a[..min_len].cmp(&b[..min_len]) {
+        core::cmp::Ordering::Equal if min_len < count => a.len().cmp(&b.len()),
+        other => other,
+    }
+}
+
+/// 查找字符（安全切片版）。
+pub fn strchr_slice(s: &[u8], c: u8) -> Option<usize> {
+    s.iter().position(|&x| x == c)
+}
+
+/// 查找最后字符（安全切片版）。
+pub fn strrchr_slice(s: &[u8], c: u8) -> Option<usize> {
+    s.iter().rposition(|x| *x == c)
+}
+
+/// 查找子串（安全切片版）。
+pub fn strstr_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let needle_len = strlen_slice(needle);
+    if needle_len > haystack.len() {
+        return None;
+    }
+    haystack[..haystack.len() - needle_len + 1]
+        .windows(needle_len)
+        .position(|w| w == &needle[..needle_len])
+}
+
+/// 查找分隔符（安全切片版）。
+pub fn strpbrk_slice(cs: &[u8], ct: &[u8]) -> Option<usize> {
+    let null_pos = cs.iter().position(|&c| c == 0).unwrap_or(cs.len());
+    cs[..null_pos].iter().position(|c| ct.contains(c))
+}
+
+/// 连续匹配字符数（安全切片版）。
+pub fn strspn_slice(cs: &[u8], ct: &[u8]) -> usize {
+    let null_pos = cs.iter().position(|&c| c == 0).unwrap_or(cs.len());
+    cs[..null_pos].iter().take_while(|c| ct.contains(c)).count()
+}
+
+/// 连续不匹配字符数（安全切片版）。
+pub fn strcspn_slice(cs: &[u8], ct: &[u8]) -> usize {
+    let null_pos = cs.iter().position(|&c| c == 0).unwrap_or(cs.len());
+    cs[..null_pos].iter().take_while(|c| !ct.contains(c)).count()
+}
+
+/// 内存拷贝（安全切片版）。
+#[inline]
+pub fn memcpy_slice<'a>(dest: &'a mut [u8], src: &[u8]) -> &'a mut [u8] {
+    let n = src.len().min(dest.len());
+    dest[..n].copy_from_slice(&src[..n]);
+    dest
+}
+
+/// 内存移动（安全切片版）。
+#[inline]
+pub fn memmove_slice<'a>(dest: &'a mut [u8], src: &[u8]) -> &'a mut [u8] {
+    let n = src.len().min(dest.len());
+    dest[..n].copy_from_slice(&src[..n]);
+    dest
+}
+
+/// 内存填充（安全切片版）。
+#[inline]
+pub fn memset_slice(s: &mut [u8], c: u8) -> &mut [u8] {
+    s.fill(c);
+    s
+}
+
+/// 内存比较（安全切片版）。
+#[inline]
+pub fn memcmp_slice(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    a.cmp(b)
+}
+
+/// 内存查找（安全切片版）。
+pub fn memchr_slice(haystack: &[u8], c: u8) -> Option<usize> {
+    haystack.iter().position(|&x| x == c)
+}
+
+/// 字符串拷贝（安全切片版）。
+pub fn strcpy_slice<'a>(dest: &'a mut [u8], src: &[u8]) -> &'a mut [u8] {
+    let src_len = strlen_slice(src).min(dest.len().saturating_sub(1));
+    dest[..src_len].copy_from_slice(&src[..src_len]);
+    if src_len < dest.len() {
+        dest[src_len] = 0;
+    }
+    dest
+}
+
+/// 字符串拷贝限长（安全切片版）。
+pub fn strncpy_slice<'a>(dest: &'a mut [u8], src: &[u8], count: usize) -> &'a mut [u8] {
+    let count = count.min(dest.len());
+    let src_len = strlen_slice(src).min(count);
+    dest[..src_len].copy_from_slice(&src[..src_len]);
+    dest[src_len..count].fill(0);
+    dest
+}
+
+/// 字符串连接（安全切片版）。
+pub fn strcat_slice<'a>(dest: &'a mut [u8], src: &[u8]) -> &'a mut [u8] {
+    let dest_len = strlen_slice(dest);
+    let src_len = src.iter().position(|&c| c == 0).unwrap_or(src.len());
+    let total = dest_len + src_len;
+    if total < dest.len() {
+        dest[dest_len..total].copy_from_slice(&src[..src_len]);
+        dest[total] = 0;
+    }
+    dest
+}
+
+/// 字符串连接限长（安全切片版）。
+pub fn strncat_slice<'a>(dest: &'a mut [u8], src: &[u8], count: usize) -> &'a mut [u8] {
+    let dest_len = strlen_slice(dest);
+    let count = count.min(dest.len().saturating_sub(dest_len + 1));
+    let src_len = src[..count].iter().position(|&c| c == 0).unwrap_or(count);
+    let total = dest_len + src_len;
+    if total < dest.len() {
+        dest[dest_len..total].copy_from_slice(&src[..src_len]);
+        dest[total] = 0;
+    }
+    dest
+}
+
+// =============================================================================
 // SAFE WRAPPERS (推荐使用)
 // =============================================================================
 
