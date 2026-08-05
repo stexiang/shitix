@@ -121,6 +121,13 @@ pub mod nr {
     pub const FLOCK: usize = 73;
     pub const FSYNC: usize = 74;
     pub const FDATASYNC: usize = 75;
+    pub const SYNC: usize = 162;
+    pub const IOCTL: usize = 16;
+    pub const TRUNCATE: usize = 76;
+    pub const FTRUNCATE: usize = 77;
+    pub const GETDENTS: usize = 78;
+    pub const GETDENTS64: usize = 61;
+    pub const REBOOT: usize = 169;
     
     // 信号
     pub const ALARM: usize = 37;
@@ -152,10 +159,6 @@ pub mod nr {
     pub const ACCESS: usize = 21;
     pub const PREAD64: usize = 17;
     pub const PWRITE64: usize = 18;
-    pub const TRUNCATE: usize = 76;
-    pub const FTRUNCATE: usize = 77;
-    pub const GETDENTS: usize = 78;
-    pub const GETDENTS64: usize = 61;
     pub const FUTIMESAT: usize = 261;
     pub const FUTIMENSAT: usize = 262;
     pub const READLINKAT: usize = 267;
@@ -169,7 +172,6 @@ pub mod nr {
     pub const ACCT: usize = 163;
     pub const SWAPON: usize = 167;
     pub const SWAPOFF: usize = 168;
-    pub const REBOOT: usize = 169;
     pub const SETRESUID: usize = 147;
     pub const GETRESUID: usize = 148;
     pub const SETRESGID: usize = 149;
@@ -309,6 +311,35 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::RENAME] = sys::rename;
     t[nr::MKNOD] = sys::mknod;
     t[nr::EXECVE] = sys::execve;
+    // Additional syscalls
+    t[nr::KILL] = sys::kill;
+    t[nr::ALARM] = sys::alarm;
+    t[nr::GETTIMEOFDAY] = sys::gettimeofday;
+    t[nr::GETUID] = sys::getuid;
+    t[nr::GETGID] = sys::getgid;
+    t[nr::GETEUID] = sys::geteuid;
+    t[nr::GETEGID] = sys::getegid;
+    t[nr::SETUID] = sys::setuid;
+    t[nr::SETGID] = sys::setgid;
+    t[nr::SETPGID] = sys::setpgid;
+    t[nr::SETSID] = sys::setsid;
+    t[nr::SYNC] = sys::sync;
+    t[nr::FSYNC] = sys::fsync;
+    t[nr::TRUNCATE] = sys::truncate;
+    t[nr::FTRUNCATE] = sys::ftruncate;
+    t[nr::GETDENTS] = sys::getdents;
+    t[nr::GETDENTS64] = sys::getdents64;
+    t[nr::IOCTL] = sys::ioctl;
+    t[nr::FCHDIR] = sys::fchdir;
+    t[nr::UMASK] = sys::umask;
+    t[nr::SYSINFO] = sys::sysinfo;
+    t[nr::POLL] = sys::poll;
+    t[nr::SELECT] = sys::select;
+    t[nr::MOUNT] = sys::mount;
+    t[nr::UMOUNT] = sys::umount;
+    t[nr::REBOOT] = sys::reboot;
+    t[nr::GETRUSAGE] = sys::getrusage;
+    t[nr::GETRLIMIT] = sys::getrlimit;
     t
 };
 

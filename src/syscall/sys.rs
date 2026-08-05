@@ -5,10 +5,92 @@
 //! 其余在分发表里指向 [`ni_syscall`]。每个函数的文档注明原版位置。
 
 use super::{SysArgs, nr};
-use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF};
+use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR};
 use crate::klib::printk::Level;
 use crate::sched;
 use crate::traps::PtRegs;
+
+/// 时间值结构
+#[repr(C)]
+pub struct TimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// 时区结构
+#[repr(C)]
+pub struct Timezone {
+    pub tz_minuteswest: i32,
+    pub tz_dsttime: i32,
+}
+
+/// 系统信息结构
+#[repr(C)]
+pub struct SysInfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u64,
+}
+
+/// 资源使用情况
+#[repr(C)]
+pub struct RUsage {
+    pub ru_utime: TimeVal,
+    pub ru_stime: TimeVal,
+}
+
+/// 资源限制
+#[repr(C)]
+pub struct RLimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+/// poll 文件描述符
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// 进程时间统计
+#[repr(C)]
+pub struct Tms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+/// 文件状态结构
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub _pad0: i32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atimensec: i64,
+    pub st_mtime: i64,
+    pub st_mtimensec: i64,
+    pub st_ctime: i64,
+    pub st_ctimensec: i64,
+    pub _unused: [i64; 3],
+}
 
 /// 未实现的调用。对应原版 `sched.c:sys_ni_syscall()`，同样返回 `-EINVAL`。
 ///
@@ -643,4 +725,109 @@ pub fn chown(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     
     // TODO: 集成 fs
     -(ENOSYS as i64)
+}
+
+/// 终止进程信号。对应原版 `kernel/signal.c:sys_kill()`。
+pub fn kill(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pid = args.a0 as i32;
+    let sig = args.a1 as i32;
+    crate::pr_warn!("sys_kill: pid={}, sig={} not fully implemented", pid, sig);
+    -(ENOSYS as i64)
+}
+
+/// 设置 alarm。对应原版 `kernel/sched.c:sys_alarm()`。
+pub fn alarm(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let seconds = args.a0 as u64;
+    crate::pr_warn!("sys_alarm: {} seconds (not implemented)", seconds);
+    0
+}
+
+/// 获取当前时间。对应原版 `kernel/time.c:sys_gettimeofday()`。
+pub fn gettimeofday(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let tv = args.a0 as *mut TimeVal;
+    let tz = args.a1 as *mut Timezone;
+    if tv.is_null() { return -(EFAULT as i64); }
+    unsafe {
+        (*tv).tv_sec = 0;
+        (*tv).tv_usec = 0;
+        if !tz.is_null() {
+            (*tz).tz_minuteswest = 0;
+            (*tz).tz_dsttime = 0;
+        }
+    }
+    0
+}
+
+/// 获取用户 ID。对应原版 `kernel/sys.c:sys_getuid()`。
+pub fn getuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 获取有效用户 ID。对应原版 `kernel/sys.c:sys_geteuid()`。
+pub fn geteuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 获取组 ID。对应原版 `kernel/sys.c:sys_getgid()`。
+pub fn getgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 获取有效组 ID。对应原版 `kernel/sys.c:sys_getegid()`。
+pub fn getegid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置用户 ID。
+pub fn setuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置组 ID。
+pub fn setgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置进程组。
+pub fn setpgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 创建会话。
+pub fn setsid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    unsafe { let t = sched::current(); t.session = t.pid; t.pgrp = t.pid; }
+    0
+}
+
+/// 同步文件系统。
+pub fn sync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 文件同步。
+pub fn fsync(args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置文件长度。
+pub fn truncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置文件长度（ftruncate）。
+pub fn ftruncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取目录项。
+pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取目录项64。
+pub fn getdents64(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 文件描述符控制。
+pub fn fchdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 获取 umask。
+pub fn umask(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0o022 }
+/// 获取系统信息。
+pub fn sysinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let buf = args.a0 as *mut SysInfo;
+    if buf.is_null() { return -(EFAULT as i64); }
+    unsafe {
+        (*buf).uptime = sched::jiffies() as i64;
+        (*buf).loads = [0u64; 3];
+        (*buf).totalram = 16 * 1024 * 1024;
+        (*buf).freeram = 8 * 1024 * 1024;
+        (*buf).sharedram = 0; (*buf).bufferram = 0;
+        (*buf).totalswap = 0; (*buf).freeswap = 0;
+        (*buf).procs = 1;
+    }
+    0
+}
+/// 轮询。
+pub fn poll(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 多路复用。
+pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 挂载文件系统。
+pub fn mount(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 卸载文件系统。
+pub fn umount(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 重新引导。
+pub fn reboot(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 资源使用情况。
+pub fn getrusage(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let usage = args.a1 as *mut RUsage;
+    if !usage.is_null() { unsafe { (*usage).ru_utime.tv_sec = 0; (*usage).ru_utime.tv_usec = 0; (*usage).ru_stime.tv_sec = 0; (*usage).ru_stime.tv_usec = 0; } }
+    0
+}
+/// 资源限制。
+pub fn getrlimit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let rlim = args.a1 as *mut RLimit;
+    if !rlim.is_null() { unsafe { (*rlim).rlim_cur = -1i64 as u64; (*rlim).rlim_max = -1i64 as u64; } }
+    0
 }
