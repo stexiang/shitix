@@ -231,6 +231,116 @@ pub mod nr {
     pub const CAPSET: usize = 91;
     pub const PTRACE: usize = 101;
     
+    // Process control
+    pub const PRCTL: usize = 157;
+    pub const SET_TID_ADDRESS: usize = 218;
+    pub const GETRANDOM: usize = 318;
+    
+    // Memory management
+    pub const MIGRATE_PAGES: usize = 256;
+    pub const MOVE_PAGES: usize = 256;
+    pub const MLOCK2: usize = 325;
+    
+    // IO
+    pub const IO_SETUP: usize = 0;
+    pub const IO_DESTROY: usize = 0;
+    pub const IO_SUBMIT: usize = 0;
+    pub const IO_GETEVENTS: usize = 0;
+    pub const IO_CANCEL: usize = 0;
+    pub const IO_PGETEVENTS: usize = 0;
+    
+    // Keyctl
+    pub const ADD_KEY: usize = 248;
+    pub const REQUEST_KEY: usize = 249;
+    pub const KEYCTL: usize = 250;
+    
+    // Inotify
+    pub const INOTIFY_INIT: usize = 253;
+    pub const INOTIFY_INIT1: usize = 254;
+    pub const INOTIFY_ADD_WATCH: usize = 254;
+    pub const INOTIFY_RM_WATCH: usize = 255;
+    
+    // Epoll
+    pub const EPOLL_CREATE1: usize = 291;
+    
+    // Timerfd
+    pub const TIMERFD_CREATE: usize = 283;
+    pub const TIMERFD_SETTIME: usize = 286;
+    pub const TIMERFD_GETTIME: usize = 287;
+    
+    // Eventfd
+    pub const EVENTFD: usize = 284;
+    pub const EVENTFD2: usize = 290;
+    
+    // File ops
+    pub const SPLICE: usize = 275;
+    pub const TEE: usize = 276;
+    pub const VMSPLICE: usize = 277;
+    pub const SYNC_FILE_RANGE: usize = 277;
+    pub const VHANGUP: usize = 229;
+    pub const DUP3: usize = 292;
+    pub const FACCESSAT: usize = 269;
+    pub const FCHMODAT: usize = 268;
+    pub const FCHOWNAT: usize = 269;
+    pub const STATFS: usize = 43;
+    pub const FSTATFS: usize = 44;
+    pub const TRUNCATE64: usize = 193;
+    pub const FTRUNCATE64: usize = 194;
+    pub const FALLOCATE: usize = 285;
+    pub const FANOTIFY_INIT: usize = 300;
+    pub const FANOTIFY_MARK: usize = 301;
+    pub const COPY_FILE_RANGE: usize = 326;
+    pub const PREADV2: usize = 327;
+    pub const PWRITEV2: usize = 328;
+    pub const STATX: usize = 332;
+    pub const LOOKUP_DCOOKIE: usize = 212;
+    pub const SYNCFS: usize = 306;
+    
+    // *At syscalls
+    pub const OPENAT: usize = 257;
+    pub const RENAMEAT2: usize = 316;
+    
+    // Advanced
+    pub const PERF_EVENT_OPEN: usize = 298;
+    pub const ACCEPT4: usize = 288;
+    pub const PROCESS_VM_READV: usize = 310;
+    pub const PROCESS_VM_WRITEV: usize = 311;
+    
+    // Memory protection keys
+    pub const PKEY_MPROTECT: usize = 329;
+    pub const PKEY_ALLOC: usize = 330;
+    pub const PKEY_FREE: usize = 331;
+    
+    // Extended attributes
+    pub const SETXATTR: usize = 188;
+    pub const LSETXATTR: usize = 189;
+    pub const FSETXATTR: usize = 190;
+    pub const GETXATTR: usize = 191;
+    pub const LGETXATTR: usize = 192;
+    pub const FGETXATTR: usize = 193;
+    pub const LISTXATTR: usize = 194;
+    pub const LLISTXATTR: usize = 195;
+    pub const FLISTXATTR: usize = 196;
+    pub const REMOVEXATTR: usize = 197;
+    pub const LREMOVEXATTR: usize = 198;
+    pub const FREMOVEXATTR: usize = 199;
+    
+    // io_uring
+    pub const IO_URING_SETUP: usize = 425;
+    pub const IO_URING_ENTER: usize = 426;
+    pub const IO_URING_REGISTER: usize = 427;
+    
+    // Other
+    pub const KEXEC_LOAD: usize = 246;
+    pub const SCHED_SETATTR: usize = 314;
+    pub const SCHED_GETATTR: usize = 315;
+    pub const SECCOMP: usize = 317;
+    pub const MEMFD_CREATE: usize = 319;
+    pub const USERFAULTFD: usize = 323;
+    pub const MEMBARRIER: usize = 324;
+    pub const CLOCK_ADJTIME: usize = 305;
+    pub const RSEQ: usize = 334;
+    
     // IDLE
     pub const IDLE: usize = 112;
     
@@ -303,7 +413,7 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::UNLINK] = sys::unlink;
     t[nr::SYMLINK] = sys::symlink;
     t[nr::READLINK] = sys::readlink;
-    t[nr::CHMOD] = sys::chmod;
+
     t[nr::CHOWN] = sys::chown;
     t[nr::DUP] = sys::dup;
     t[nr::DUP2] = sys::dup2;
@@ -395,6 +505,120 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::CLOCK_NANOSLEEP] = sys::clock_nanosleep;
     // Other
     t[nr::PRLIMIT] = sys::prlimit;
+    t[nr::PRCTL] = sys::prctl;
+    t[nr::SET_TID_ADDRESS] = sys::set_tid_address;
+    t[nr::GETRANDOM] = sys::getrandom;
+    // Memory syscalls
+    t[nr::MBIND] = sys::mbind;
+    t[nr::SETMEMPOLICY] = sys::set_mempolicy;
+    t[nr::GETMEMPOLICY] = sys::get_mempolicy;
+    t[nr::MIGRATE_PAGES] = sys::migrate_pages;
+    t[nr::MOVE_PAGES] = sys::move_pages;
+    t[nr::MLOCK2] = sys::mlock2;
+    // IO syscalls
+    t[nr::IO_SETUP] = sys::io_setup;
+    t[nr::IO_DESTROY] = sys::io_destroy;
+    t[nr::IO_SUBMIT] = sys::io_submit;
+    t[nr::IO_GETEVENTS] = sys::io_getevents;
+    t[nr::IO_CANCEL] = sys::io_cancel;
+    t[nr::IO_PGETEVENTS] = sys::io_pgetevents;
+    // Keyctl syscalls
+    t[nr::ADD_KEY] = sys::add_key;
+    t[nr::REQUEST_KEY] = sys::request_key;
+    t[nr::KEYCTL] = sys::keyctl;
+    // Inotify syscalls
+    t[nr::INOTIFY_INIT] = sys::inotify_init;
+    t[nr::INOTIFY_INIT1] = sys::inotify_init1;
+    t[nr::INOTIFY_ADD_WATCH] = sys::inotify_add_watch;
+    t[nr::INOTIFY_RM_WATCH] = sys::inotify_rm_watch;
+    // Epoll syscalls
+    t[nr::EPOLL_CREATE] = sys::epoll_create;
+    t[nr::EPOLL_CREATE1] = sys::epoll_create1;
+    t[nr::EPOLL_CTL] = sys::epoll_ctl;
+    t[nr::EPOLL_WAIT] = sys::epoll_wait;
+    // Timerfd syscalls
+    t[nr::TIMERFD_CREATE] = sys::timerfd_create;
+    t[nr::TIMERFD_SETTIME] = sys::timerfd_settime;
+    t[nr::TIMERFD_GETTIME] = sys::timerfd_gettime;
+    // Eventfd syscalls
+    t[nr::EVENTFD] = sys::eventfd;
+    t[nr::EVENTFD2] = sys::eventfd2;
+    // File ops syscalls
+    t[nr::SPLICE] = sys::splice;
+    t[nr::TEE] = sys::tee;
+    t[nr::VMSPLICE] = sys::vmsplice;
+    t[nr::SYNC_FILE_RANGE] = sys::sync_file_range;
+    t[nr::VHANGUP] = sys::vhangup;
+    t[nr::PIPE2] = sys::pipe2;
+    t[nr::DUP3] = sys::dup3;
+    t[nr::FACCESSAT] = sys::faccessat;
+    t[nr::FCHMODAT] = sys::fchmodat;
+    t[nr::FCHOWNAT] = sys::fchownat;
+    t[nr::STATFS] = sys::statfs;
+    t[nr::FSTATFS] = sys::fstatfs;
+    t[nr::TRUNCATE64] = sys::truncate64;
+    t[nr::FTRUNCATE64] = sys::ftruncate64;
+    t[nr::FALLOCATE] = sys::fallocate;
+    t[nr::FANOTIFY_INIT] = sys::fanotify_init;
+    t[nr::FANOTIFY_MARK] = sys::fanotify_mark;
+    t[nr::COPY_FILE_RANGE] = sys::copy_file_range;
+    t[nr::PREADV2] = sys::preadv2;
+    t[nr::PWRITEV2] = sys::pwritev2;
+    t[nr::STATX] = sys::statx;
+    t[nr::LOOKUP_DCOOKIE] = sys::lookup_dcookie;
+    t[nr::SYNCFS] = sys::syncfs;
+    // *At syscalls
+    t[nr::OPENAT] = sys::openat;
+    t[nr::MKDIRAT] = sys::mkdirat;
+    t[nr::MKNODAT] = sys::mknodat;
+    t[nr::UNLINKAT] = sys::unlinkat;
+    t[nr::RENAMEAT] = sys::renameat;
+    t[nr::RENAMEAT2] = sys::renameat2;
+    t[nr::LINKAT] = sys::linkat;
+    t[nr::SYMLINKAT] = sys::symlinkat;
+    t[nr::READLINKAT] = sys::readlinkat;
+    // Other FD syscalls
+    t[nr::FCHOWN] = sys::fchown;
+
+    // Advanced syscalls
+    t[nr::PERF_EVENT_OPEN] = sys::perf_event_open;
+    t[nr::ACCEPT4] = sys::accept4;
+    t[nr::PROCESS_VM_READV] = sys::process_vm_readv;
+    t[nr::PROCESS_VM_WRITEV] = sys::process_vm_writev;
+    // Memory protection keys
+    t[nr::PKEY_MPROTECT] = sys::pkey_mprotect;
+    t[nr::PKEY_ALLOC] = sys::pkey_alloc;
+    t[nr::PKEY_FREE] = sys::pkey_free;
+    // Extended attributes
+    t[nr::SETXATTR] = sys::setxattr;
+    t[nr::LSETXATTR] = sys::lsetxattr;
+    t[nr::FSETXATTR] = sys::fsetxattr;
+    t[nr::GETXATTR] = sys::getxattr;
+    t[nr::LGETXATTR] = sys::lgetxattr;
+    t[nr::FGETXATTR] = sys::fgetxattr;
+    t[nr::LISTXATTR] = sys::listxattr;
+    t[nr::LLISTXATTR] = sys::llistxattr;
+    t[nr::FLISTXATTR] = sys::flistxattr;
+    t[nr::REMOVEXATTR] = sys::removexattr;
+    t[nr::LREMOVEXATTR] = sys::lremovexattr;
+    t[nr::FREMOVEXATTR] = sys::fremovexattr;
+    // io_uring syscalls
+    t[nr::IO_URING_SETUP] = sys::io_uring_setup;
+    t[nr::IO_URING_ENTER] = sys::io_uring_enter;
+    t[nr::IO_URING_REGISTER] = sys::io_uring_register;
+    // Other advanced syscalls
+    t[nr::KEXEC_LOAD] = sys::kexec_load;
+    t[nr::INIT_MODULE] = sys::init_module;
+    t[nr::DELETE_MODULE] = sys::delete_module;
+    t[nr::SCHED_SETATTR] = sys::sched_setattr;
+    t[nr::SCHED_GETATTR] = sys::sched_getattr;
+    t[nr::SECCOMP] = sys::seccomp;
+    t[nr::MEMFD_CREATE] = sys::memfd_create;
+    t[nr::USERFAULTFD] = sys::userfaultfd;
+    t[nr::MEMBARRIER] = sys::membarrier;
+    t[nr::CLOCK_ADJTIME] = sys::clock_adjtime;
+    t[nr::SETNS] = sys::setns;
+    t[nr::RSEQ] = sys::rseq;
     t
 };
 
