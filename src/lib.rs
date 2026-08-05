@@ -10,6 +10,7 @@ pub mod console;
 pub mod desc;
 pub mod drivers;
 pub mod e820;
+pub mod elf;
 pub mod exit;
 pub mod fs;
 pub mod info;
