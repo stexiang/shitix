@@ -66,7 +66,9 @@
 pub mod inet;
 pub mod unix;
 
-// Re-export commonly used types
+// 测试模块（始终可用，在内核启动时自检）
+pub mod tests;
+
 pub use inet::sock::Socket;
 pub use inet::skbuff::SkBuff;
 
