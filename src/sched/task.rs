@@ -94,6 +94,7 @@ impl Tss {
 }
 
 /// 进程控制块。对应原版 `struct task_struct`（见模块文档说明取舍）。
+#[derive(Clone)]
 #[repr(C)]
 pub struct Task {
     // ---- 原版注释说 "these are hardcoded - don't touch" 的那几个 ----

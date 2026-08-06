@@ -1093,3 +1093,47 @@ pub unsafe fn set_startup_time(t: u32) {
     // SAFETY: 契约保证独占。
     unsafe { *core::ptr::addr_of_mut!(STARTUP_TIME) = t }
 }
+
+/// 分配一个新的 PID
+/// 
+/// 对应原版 `fork.c` 中的 `last_pid` 分配逻辑。
+/// 返回一个新分配的 PID，确保在同一时刻不会有两个任务使用相同的 PID。
+pub fn allocate_pid() -> i32 {
+    // SAFETY: LAST_PID 是原子性操作的全局变量
+    // 在单核环境下，调度器在修改 LAST_PID 时会关闭中断
+    unsafe {
+        let mut pid = *core::ptr::addr_of!(LAST_PID);
+        
+        // 循环查找未使用的 PID
+        // 跳过已使用的 PID
+        let max_pid = (1 << 16) as i32; // 限制 PID 范围
+        let mut attempts = 0;
+        
+        loop {
+            pid += 1;
+            if pid >= max_pid {
+                pid = 1; // 从 1 开始，0 保留给特殊用途
+            }
+            
+            // 检查是否有任务使用这个 PID
+            let mut in_use = false;
+            for i in 0..NR_TASKS {
+                if i != current_nr() && (*core::ptr::addr_of_mut!(TASKS))[i].pid == pid {
+                    in_use = true;
+                    break;
+                }
+            }
+            
+            if !in_use {
+                *core::ptr::addr_of_mut!(LAST_PID) = pid;
+                return pid;
+            }
+            
+            attempts += 1;
+            if attempts > max_pid {
+                // 应该不会发生
+                return -1;
+            }
+        }
+    }
+}

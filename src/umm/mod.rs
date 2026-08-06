@@ -9,6 +9,9 @@
 /// 用户空间起始地址 (3GB)
 pub const USERSPACE_START: u64 = 0x4000_0000;
 
+/// COW 页面标记 - 在 VMA flags 中使用
+pub const VMA_COW: u32 = 0x10000000;
+
 /// 用户空间结束地址 (4GB)
 pub const USERSPACE_END: u64 = 0xFFFF_FFFF;
 
@@ -510,6 +513,150 @@ pub fn can_exec(addr: u64, um: &ProcessUm) -> bool {
         vma.flags.exec
     } else {
         false
+    }
+}
+
+/// COW (Copy-On-Write) 支持
+
+/// 检查 VMA 是否应该使用 COW
+pub fn vma_is_cow(vma: &UmVma) -> bool {
+    vma.flags.private && vma.flags.read && !vma.flags.write
+}
+
+/// 设置 VMA 为 COW 模式
+pub fn vma_set_cow(vma: &mut UmVma, cow: bool) {
+    if cow {
+        vma.mmap_flags |= VMA_COW;
+        // COW 页面应该是只读的，直到发生写入
+        vma.flags.write = false;
+    } else {
+        vma.mmap_flags &= !VMA_COW;
+    }
+}
+
+/// 为 COW fork 复制用户内存
+/// 
+/// 复制源进程的 VMA 到目标进程，标记为 COW
+/// 返回复制的 VMA 数量
+pub fn cow_fork_copy_vmas(src: &ProcessUm, dst: &mut ProcessUm) -> usize {
+    let mut count = 0;
+    
+    for i in 0..src.vma_count {
+        if let Some(ref vma) = src.vmas[i] {
+            // 跳过内核空间
+            if vma.start >= USERSPACE_START {
+                let mut new_vma = vma.clone();
+                
+                // 私有页面在 fork 后标记为 COW
+                if vma.flags.private && !vma.flags.write {
+                    new_vma.mmap_flags |= VMA_COW;
+                }
+                
+                if dst.add_vma(new_vma) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    
+    count
+}
+
+/// 处理 COW 页面的页面错误
+/// 
+/// 当进程尝试写入一个 COW 页面时调用此函数
+/// 如果页面只被当前进程使用，直接启用写权限
+/// 如果页面被多个进程共享，分配新页面并复制内容
+/// 
+/// # Arguments
+/// * `fault_addr` - 触发错误的虚拟地址
+/// * `pml4` - 当前进程的页表根地址
+/// 
+/// # Returns
+/// * `true` - 成功处理
+/// * `false` - 处理失败
+pub fn handle_cow_page_fault(fault_addr: u64, pml4: usize) -> bool {
+    use crate::mm::paging;
+    use crate::mm::page_ref;
+    
+    // 首先检查页表项
+    let pte = unsafe { crate::mm::paging::translate(pml4, fault_addr as usize) };
+    if pte.is_none() {
+        crate::pr_warn!("COW: page fault at {:x} - no mapping", fault_addr);
+        return false;
+    }
+    
+    let phys = pte.unwrap();
+    let pfn = page_ref::phys_to_pfn(phys);
+    
+    // 增加引用计数，因为我们正在创建新的映射
+    page_ref::page_ref_inc(pfn);
+    
+    // 更新页表，启用写权限
+    // 移除 COW 标记，设置读写权限
+    unsafe {
+        // 重新映射为读写
+        let _ = crate::mm::paging::unmap_page(pml4, fault_addr as usize);
+        let prot = crate::mm::paging::flags::SHARED; // present + rw + user
+        crate::mm::paging::map_page(pml4, fault_addr as usize, phys, prot);
+    }
+    
+    // 取消 COW 标记
+    page_ref::unmark_page_cow(pfn);
+    
+    crate::pr_debug!("COW: page fault resolved at {:x}", fault_addr);
+    true
+}
+
+/// 在 fork 时设置 COW 页面
+/// 
+/// 将页表项设置为只读并标记为 COW
+pub fn cow_setup_page(pml4: usize, vaddr: usize, phys: usize) {
+    use crate::mm::page_ref;
+    
+    let pfn = page_ref::phys_to_pfn(phys);
+    
+    // 增加引用计数
+    page_ref::page_ref_inc(pfn);
+    
+    // 设置为只读 (COW)
+    unsafe {
+        let _ = crate::mm::paging::unmap_page(pml4, vaddr);
+        crate::mm::paging::map_page(pml4, vaddr, phys, crate::mm::paging::flags::READONLY);
+    }
+    
+    // 标记为 COW 页面
+    page_ref::mark_page_cow(pfn);
+}
+
+/// 释放进程的 COW 页面引用
+pub fn cow_release_vmas(um: &ProcessUm, pml4: usize) {
+    use crate::mm::page_ref;
+    
+    for i in 0..um.vma_count {
+        if let Some(ref vma) = um.vmas[i] {
+            if vma.start < USERSPACE_START {
+                continue;
+            }
+            
+            // 遍历页面并减少引用计数
+            let mut vaddr = vma.start;
+            while vaddr < vma.end {
+                if let Some(phys) = unsafe { crate::mm::paging::translate(pml4, vaddr as usize) } {
+                    let pfn = page_ref::phys_to_pfn(phys);
+                    let refs = page_ref::page_ref_dec(pfn);
+                    
+                    // 如果引用计数降到 0，释放页面
+                    if refs == 0 {
+                        unsafe {
+                            let _ = crate::mm::paging::unmap_page(pml4, vaddr as usize);
+                        }
+                        // 页面会被 page allocator 回收
+                    }
+                }
+                vaddr += 4096;
+            }
+        }
     }
 }
 

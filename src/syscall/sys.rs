@@ -839,8 +839,78 @@ pub fn sendmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn recvmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 
 // Process syscalls
-pub fn fork(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn vfork(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+/// Fork syscall - 进程复制
+///
+/// 对应原版 `kernel/fork.c:sys_fork()`。
+/// 实现 fork() 系统调用。
+pub fn fork(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::EAGAIN;
+    
+    // SAFETY: 系统调用上下文
+    unsafe {
+        // 查找空闲的 task slot
+        let free_slot = {
+            let mut slot = None;
+            for i in 1..sched::NR_TASKS {
+                if sched::task(i).state == sched::task::TaskState::Unused {
+                    slot = Some(i);
+                    break;
+                }
+            }
+            slot
+        };
+        
+        let Some(child_nr) = free_slot else {
+            crate::pr_warn!("sys_fork: no free task slots");
+            return -(EAGAIN as i64);
+        };
+        
+        let parent = sched::current();
+        let parent_nr = sched::current_nr();
+        
+        // 复制父进程
+        let child = sched::task(child_nr);
+        *child = (*parent).clone();
+        
+        // 设置子进程特有的字段
+        child.state = sched::task::TaskState::Running;
+        child.pid = sched::allocate_pid();
+        child.pgrp = parent.pgrp;
+        child.parent = parent_nr;
+        
+        // 复制寄存器上下文
+        child.tss.rsp = parent.tss.rsp;
+        child.tss.cr3 = parent.tss.cr3;
+        
+        // 分配新的内核栈
+        let stack_page = crate::mm::get_free_page();
+        if stack_page == 0 {
+            crate::pr_warn!("sys_fork: out of memory for stack");
+            child.state = sched::task::TaskState::Unused;
+            return -(EAGAIN as i64);
+        }
+        child.kernel_stack = stack_page as u64;
+        
+        // 复制 brk 值
+        child.brk = parent.brk;
+        
+        // 设置调度参数
+        child.counter = sched::task::HZ as i64;
+        child.priority = 15;
+        
+        crate::pr_info!("sys_fork: parent={}, child_pid={}, child_slot={}", 
+                        parent.pid, child.pid, child_nr);
+        
+        child.pid as i64
+    }
+}
+
+/// vfork syscall - 轻量级进程复制
+pub fn vfork(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    fork(_args, _regs)
+}
+
 pub fn wait4(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn setitimer(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn getitimer(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -868,10 +938,61 @@ pub fn msgrcv(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn msgctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 
 // Time syscalls
+
+/// 时间规格结构
+#[repr(C)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+/// nanosleep - 高精度睡眠
+///
+/// 对应原版 `kernel/sched.c:sys_nanosleep()`。
+pub fn nanosleep(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let req = args.a0 as *const Timespec;
+    let rem = args.a1 as *mut Timespec;
+    
+    if req.is_null() {
+        return -(EINVAL as i64);
+    }
+    
+    // SAFETY: req 已校验非空
+    let secs = unsafe { (*req).tv_sec };
+    let nsecs = unsafe { (*req).tv_nsec };
+    
+    if nsecs < 0 || nsecs >= 1_000_000_000 {
+        return -(EINVAL as i64);
+    }
+    
+    // 计算睡眠时间（简化为 jiffies）
+    let sleep_jiffies = (secs * sched::task::HZ as i64) as u64;
+    
+    if sleep_jiffies > 0 {
+        // SAFETY: 系统调用上下文，可以睡眠
+        unsafe {
+            sched::current().state = crate::sched::task::TaskState::Interruptible;
+            sched::current().timeout = sched::jiffies() + sleep_jiffies;
+            sched::schedule();
+        }
+    }
+    
+    // 如果有剩余时间结构指针，写入剩余时间（简化：假设睡眠完成）
+    if !rem.is_null() {
+        // SAFETY: rem 已校验非空
+        unsafe {
+            (*rem).tv_sec = 0;
+            (*rem).tv_nsec = 0;
+        }
+    }
+    
+    0
+}
+
 pub fn clock_gettime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn clock_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn clock_getres(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn clock_nanosleep(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn clock_nanosleep(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { nanosleep(_args, _regs) }
 
 // Priority syscalls
 pub fn getpriority(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }

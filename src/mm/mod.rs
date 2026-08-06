@@ -8,15 +8,15 @@
 //! | [`page_alloc`] | `mm/memory.c` 的 `mem_init()` + `mm/swap.c` 的 `__get_free_page`/`free_page` |
 //! | [`kmalloc`] | `mm/kmalloc.c` 全部 |
 //! | [`paging`] | `mm/memory.c` 的 `put_page`/`remap_page_range`/`invalidate` |
+//! | [`page_ref`] | COW 页面引用计数管理 |
 //!
-//! 尚未移植的部分：`mm/swap.c` 的换页（缺块设备）、`mm/mmap.c` 的
-//! `vm_area_struct` 管理（缺进程）、`mm/vmalloc.c`（依赖前两者）。
-//! 这几个要等进程和块设备到位后再做。
+//! 尚未移植的部分：`mm/swap.c` 的换页（缺块设备）、`mm/vmalloc.c`（依赖前两者）。
 
 pub mod kmalloc;
 pub mod page;
 pub mod page_alloc;
 pub mod paging;
+pub mod page_ref;
 
 pub use kmalloc::{kfree, kmalloc, kzalloc};
 pub use page::{PAGE_SIZE, page_align};
