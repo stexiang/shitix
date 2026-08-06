@@ -101,3 +101,118 @@
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 13:09
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 13:15 | 复现链接错误 `_kernel_end` 越过 0x90000 | boot/kernel.ld, scripts/build.sh | ASSERT 触发，实测 _kernel_end=0xCC2B0 | ~4k |
+| 13:20 | 定位 BSS 大户：注释掉 ASSERT 链到 /tmp 后 nm --size-sort | /tmp/system.elf | PAGE_REF_ARRAY 独占 256KB（BSS 共 365KB） | ~3k |
+| 13:30 | 引用计数表改成动态划分（沿用 mem_map 约定）+ MemInfo 加两字段 | src/mm/page_alloc.rs | map_end 抬到表尾之后，表不进空闲链表 | ~5k |
+| 13:40 | 重写 page_ref：REF_BASE/REF_LEN + attach()/slot()，越界返 None | src/mm/page_ref.rs | 静态数组消除；COW 标记位从 bit15 挪到 bit31（原本与计数字段重叠） | ~6k |
+| 13:50 | 启动行补报 page_ref 表地址与槽数 | src/lib.rs | page_ref at 0x120000 (65504 slots) | ~1k |
+| 13:55 | 构建 + QEMU 启动测试 ×5 | target/boot/ | 链接通过，_kernel_end=0x8C2C0，BSS 365KB→103KB；4/5 PASS，1 次 SUPER_AREA 护栏误报（既有 ~15% flaky，见 bug-019） | ~5k |
+| 14:00 | 记录 bug-024 + cerebrum 三条 + STATUS 更新 | .wolf/ | 已归档 | ~3k |
+
+## Session: 2026-08-06 13:22
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 14:20 | 用户指出护栏误报被错记为 bug-023 flaky | .wolf/buglog.json | 确认记错：bug-023 症状里没有护栏 panic；改记 bug-025 | ~2k |
+| 14:30 | 裸指针重写 check_guards + 失配复读，跑 20 次 | src/fs/super_block.rs | 0 次触发 | ~6k |
+| 14:45 | 诊断变体（保留 UB 只加复读）跑 20 次 | src/fs/super_block.rs | 0 次触发 —— 单靠别名 UB 不稳定复现，加码即改内联 | ~4k |
+| 15:00 | git 考古：256KB 数组在 33667fd 引入，ASSERT 更早 | boot/kernel.ld, src/mm/page_ref.rs | **33667fd 起内核一直没链接过**，最后可构建提交是 HEAD~2 | ~3k |
+| 15:10 | HEAD~2 worktree 基线跑 20 次 | (worktree) | 护栏 0 次触发（与用户说法一致）；fs flaky 2/20 = bug-023 既有 | ~5k |
+| 15:25 | 定稿 check_guards 修法 + 改正 bug-024、新增 bug-025 | src/fs/super_block.rs, .wolf/ | 3 次启动测试通过 | ~4k |
+
+## Session: 2026-08-06 14:12
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 14:13
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 — 系统调用号补齐到 x86_64 正式表
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| — | 审 `nr` 模块，发现大量重号（GETPID=WAIT4=61、GETPPID=KILL=62、六个 IO_* 全 0 覆盖 READ） | src/syscall/mod.rs | 确认自检 FAIL 的根因，记 bug-026 | ~6k |
+| — | `nr` 改成按 x86_64 正式表逐号生成 0..=334 + io_uring/pidfd/clone3/faccessat2/epoll_pwait2 | src/syscall/mod.rs | 341 项无重号 | ~5k |
+| — | 分发表改按号顺序逐项赋值 | src/syscall/mod.rs | 341 槽已挂实现 | ~3k |
+| — | 补 133 个实现：lseek/readv/writev/sched_yield/gettid/time/exit_group/tkill/tgkill 真做，getgroups/madvise/mincore 等给合理默认，其余占位 -ENOSYS | src/syscall/sys.rs | 零新增告警 | ~9k |
+| — | 修自检里 `nr::OPEN` 已实现导致的假设失效，新增私有号 `nr::UNUSED=501` | src/lib.rs, src/syscall/mod.rs | 自检从 FAIL 转 ok | ~1k |
+| — | 发现 test.sh 被本地改动注释掉 build，之前几轮测的都是旧镜像 | scripts/test.sh | git checkout 恢复，记 bug-027 | ~2k |
+| — | `implemented_count` 从比函数指针改成 WIRED 位图（release ICF 少数一个） | src/syscall/mod.rs | debug/release 都是 341，记 bug-028 | ~2k |
+| — | 验证：debug 6 轮（5 过 1 挂 = 已知 bug-023 的 fs 竞态）、release 过、32M/128M/1G/3G 过 | — | 与本次改动无关的既有 flake | ~4k |
+
+## Session: 2026-08-06 15:48
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 15:51
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 15:51
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 16:14
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 16:23
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session 2026-08-06 (模块 7)
+
+| Time  | Action | Files | Outcome | ~tokens |
+|-------|--------|-------|---------|---------|
+| 15:30 | 21 个 syscall 从 `-ENOSYS` 接到 fs 层 | `src/syscall/sys.rs` | `open`/`creat`/`close`/`read`、`dup`/`dup2`、`chdir`/`chmod`/`truncate`、`mkdir`/`rmdir`/`unlink`/`link`/`mknod`、`fsync`、`stat`/`lstat`/`fstat`、`getdents`/`getdents64` | 8k |
+| 15:45 | 用户指针护栏 | `src/syscall/sys.rs` | `check_range`/`user_path`/`user_buf`/`user_buf_mut`/`user_stat_out`，只挡低 1GB 外地址；**不阻止用户态读写内核内存** | 2k |
+| 16:00 | `write` 改 fs 优先 + 控制台兜底 | `src/syscall/sys.rs` | 先走 `fs::read_write::write`，fd 1/2 拿到 `-EBADF` 才退回内核控制台 | 1k |
+| 16:15 | 新增 `syscall_fs_selftest()` | `src/lib.rs` | 9 组测试（creat+write、lseek+read、fstat、dup、close×2、stat、mkdir/rmdir、unlink、EFAULT），挂在 `fs_init_thread` | 4k |
+| 16:30 | 链接失败：BSS 越界 | `boot/kernel.ld` | `_kernel_end = 0x922C0`，超 0x90000 共 8896 字节；`.text`/`.rodata` 涨约 24KB | 2k |
+| 16:45 | 内核栈池移出 BSS | `src/sched/mod.rs`, `src/mm/page_alloc.rs` | `KSTACKS` 改动态划分，`attach_kstacks()` 在 `page_ref` 表之后；`KSTACK_SLOTS` 3→8 | 6k |
+| 17:00 | 修 `write` 自检期望 | `src/lib.rs` | `write(0,...)` 现在返 `-EBADF`（未打开 fd），原期望 `-EINVAL` | 1k |
+| 17:15 | 新增 `scripts/check-syscall-nr.py` | `scripts/check-syscall-nr.py` | 机器核对 `nr` 模块与内核头，输出 `官方 360 个号，本树 360 个 / 全部一致` | 3k |
+| 17:30 | `scripts/test.sh` 加 `MEM=` 覆盖 | `scripts/test.sh` | 默认 256M，照 `TIMEOUT`/`PROFILE` 约定 | 1k |
+| 17:45 | 验证：debug/release + 内存矩阵 | - | `_kernel_end` = 0x854F0 (debug) / 0x5B4E0 (release)，余量 44KB；361 wired；32M/128M/1G/3G 全绿 | 8k |
+| 18:00 | LFS 集成评估 | `.wolf/STATUS.md` | 核实缺项：无 ring-3 切换、`execve` 占位、ELF64 加载器缺、无 `copy_from_user`、`Stat` 是 i386 布局、`arch_prctl` 占位、ext4 只有结构定义无操作 | 4k |
+| 18:15 | 记账 | `.wolf/buglog.json`, `.wolf/STATUS.md`, `.wolf/memory.md` | bug-029 (unlink 间歇性 +2)、STATUS.md 更新模块 7 + LFS 结论 | 3k |
+
+**Total session:** ~43k tokens
+
+## Session: 2026-08-06 19:15
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:01
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:03
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:04
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:04
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|

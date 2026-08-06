@@ -295,9 +295,21 @@ ret_check_resched:
 restore_and_iret:
     RESTORE_ALL
 
-/* 原版 reschedule: 把 ret_from_sys_call 压栈后 jmp _schedule */
+/*
+ * 原版 reschedule: 把 ret_from_sys_call 压栈后 jmp _schedule。
+ *
+ * 这里必须先对齐栈再 call：pt_regs 是 0xa8 字节（8 mod 16），所以进到
+ * ret_from_sys_call 时 rsp 是 8 mod 16，直接 call 会让 schedule 拿到一个
+ * 不满足 SysV ABI 的栈。opt-level=1 下 LLVM 会用 movaps 存取栈上的槽位，
+ * 栈错位时那些访问要么 #GP 要么读到错的位置——表现出来就是「某个基址
+ * 寄存器莫名变成 0」（bug-029）。其余几处 call 都已经这么做了，
+ * 唯独这里漏了。
+ */
 reschedule:
+    movq    %rsp, %rbp
+    andq    $-16, %rsp
     call    schedule
+    movq    %rbp, %rsp
     jmp     ret_check_resched
 
 /* 原版 handle_bottom_half：开中断跑软中断，期间 intr_count 加一 */
@@ -367,7 +379,11 @@ ret_from_fork:
  */
     .global kernel_thread_entry
 kernel_thread_entry:
+    /* 同 reschedule：call 之前 rsp 必须 16 对齐（见那里的注释）。 */
+    movq    %rsp, %rbp
+    andq    $-16, %rsp
     call    schedule_tail
+    movq    %rbp, %rsp
     popq    %rax                    /* fn */
     popq    %rdi                    /* arg */
     andq    $-16, %rsp

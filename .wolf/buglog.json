@@ -424,6 +424,128 @@
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-024",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "ld: kernel image (incl. BSS) overlaps setup parameter area at 0x90000",
+      "file": "src/mm/page_ref.rs",
+      "root_cause": "page_ref.rs 把 COW 引用计数表写成定长静态数组 static mut PAGE_REF_ARRAY: [AtomicU32; 65536]，占 256KB BSS，把 _kernel_end 顶到 0xCC2B0，越过 0x90000 的机器参数区/0x9E000 E820 表。kernel.ld 的 ASSERT 在链接期拦下。附带：page_ref::init() 从来没被任何地方调用，这 256KB 纯粹是白付的零页 BSS。同时 COW 标记位用 0x8000，而计数字段是 & 0xFFFF，两者重叠，引用计数一旦 >= 32768 就被误读成 COW 页。",
+      "fix": "表体改成按实际物理内存动态划分，沿用 mem_map 的既有约定：page_alloc::init 在 mem_map 之后划出 nr_pages*4 字节、清零、调 page_ref::attach()，并把 map_end 抬到表尾之后（保证不进空闲链表）；MemInfo 加 page_ref_addr/nr_pages。page_ref.rs 用 REF_BASE/REF_LEN + slot() 取槽，越界返回 None 而不 panic（COW 路径会传来受管内存之外的 pfn，如 MMIO）。COW 标记位挪到 bit 31 避开计数字段。结果：BSS 365KB->103KB，_kernel_end=0x8C2C0（距上限约 15KB）。 注意：修此 bug 时观察到的 SUPER_AREA 护栏 panic 另立 bug-025，最初误记为 bug-023 的既有 flaky，是错的——bug-023 的症状里没有护栏 panic。",
+      "tags": [
+        "bss",
+        "linker",
+        "0x90000",
+        "kernel.ld",
+        "assert",
+        "page_ref",
+        "cow",
+        "mm",
+        "static-array"
+      ],
+      "related_bugs": [
+        "bug-001"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-025",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "KERNEL PANIC: SUPER_AREA guard lo smashed at check_mounted（pr_warn 报出的值 0x1234abcd1234abcd 恰好就是正确的 SB_GUARD）",
+      "file": "src/fs/super_block.rs",
+      "root_cause": "两层。(1) 直接原因是护栏检查自身不可信：`check_guards` 用 `&*addr_of!(SUPER_AREA)` 建了一条覆盖整个结构（含 table）的共享引用，与 fs 路径上可能存活的 `&mut SuperBlock` 重叠 = UB，带 readonly/dereferenceable 的假设让比较本身被折叠/复用。证据：单次 read_volatile 的结果同时喂给比较和打印，打印出来的值等于 SB_GUARD，而比较判定不等——内存是好的，是比较错了。super_block.rs:268-272 早就把这个症状写在注释里（针对 sb() 里调 check_guards 的场合），只是 check_mounted 这条路径没被算进去。(2) 为什么现在才出现：`33667fd`（COW）引入 256KB 的 PAGE_REF_ARRAY 后内核就再也没链接成功过（bug-024），所以 33667fd 和 5a3c04e 两个提交的代码从未运行过；最后一个可构建的提交是 HEAD~2。实测 HEAD~2 跑 20 次护栏 0 次误报，与用户「上次测护栏 100% 正常」一致。链接修好后新代码首次执行，内联上下文变了，这个一直潜伏的误报才显形。",
+      "fix": "`check_guards` 改成全程裸指针（`addr_of_mut!` + `read_volatile`），不再建任何覆盖 SUPER_AREA 的引用；失配时先复读同一地址，复读正确就只 pr_warn 说明本次比较不可信并继续，复读仍错才 panic。这样真损坏仍然 fail-stop，误报不再杀内核。修完 20 次 0 次触发。",
+      "tags": [
+        "ub",
+        "aliasing",
+        "noalias",
+        "miscompile",
+        "guard",
+        "false-positive",
+        "super_block",
+        "check_guards",
+        "layout-sensitive"
+      ],
+      "related_bugs": [
+        "bug-019",
+        "bug-024"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z",
+      "notes": "未能在修复后复现（裸指针版 20 次、保留 UB 只加复读的诊断版 20 次，均 0 次触发），所以机制是从「打印值等于正确护栏」这一矛盾推断的，不是直接测到的。bug-023 的 fs flaky（mkfs.minix failed / unable to mount root）在 HEAD~2 基线上同样是 2/20，与护栏无关，仍然未解决。"
+    },
+    {
+      "id": "bug-026",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "syscall selftest: getpid=-38 getppid=-38 ... -> FAIL；且 getppid 触发 [WARN] sys_kill: pid=0, sig=0",
+      "file": "src/syscall/mod.rs",
+      "root_cause": "nr 模块按功能分组手写调用号，出现大量重号：GETPID=WAIT4=61、GETPPID=KILL=62、SETSID=GETPGRP=76(与 TRUNCATE 同号)、POLL=WAITPID=7、MMAP=MMAP2=9、SHUTDOWN=SIGNAL=48 等。建表时 t[nr::X]=... 后写的项静默覆盖先写的，于是 GETPID 槽最终指向 wait4、GETPPID 槽指向 kill。IO_SETUP..IO_PGETEVENTS 六个全是 0，把 t[READ] 也覆盖了。",
+      "fix": "nr 模块改成从 x86_64 正式表 arch/x86/entry/syscalls/syscall_64.tbl 逐号生成 0..=334 连续常量，杜绝重号；分发表同样按号顺序逐项赋值。自检里原本假设 nr::OPEN 是空槽（已实现），改用新增的私有号 nr::UNUSED=501。",
+      "tags": [
+        "syscall",
+        "duplicate-number",
+        "dispatch-table",
+        "silent-overwrite"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-027",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "scripts/test.sh 明明打印「构建」却不重新编译，改完代码测的还是旧镜像（debug 显示 table=512 entries 的旧文案）",
+      "file": "scripts/test.sh",
+      "root_cause": "工作区里有一处未提交的本地改动把 `bash scripts/build.sh` 注释掉了（同时把 MODE 写死成 test），所以 test.sh 只跑 QEMU 不编译。旧的 serial.log 还在，看起来像是新结果。",
+      "fix": "git checkout scripts/test.sh 恢复。以后改完代码若自检结果与预期不符，先确认 serial.log 里有本次改动引入的新字样，再怀疑代码。",
+      "tags": [
+        "build",
+        "test-harness",
+        "stale-artifact",
+        "local-uncommitted-change"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-028",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "implemented_count() 在 debug 下数出 341、release 下数出 340",
+      "file": "src/syscall/mod.rs",
+      "root_cause": "用「函数指针 != ni_syscall」来数已实现槽位。release 下 LLVM 的 identical code folding 把函数体相同的 sys_* 合并成同一地址，返回 -EINVAL 的占位实现（sched_setscheduler）与同样返回 -EINVAL 的 ni_syscall 撞成一个地址，被误判成未实现。Rust 本身也不保证 fn 指针相等的语义。",
+      "fix": "另建 static WIRED: [bool; NR_SYSCALLS] 位图，与分发表在同一 const 块里逐项赋 true，数位图而不是比指针。debug/release 现在都是 341。",
+      "tags": [
+        "release-only",
+        "identical-code-folding",
+        "fn-pointer-identity",
+        "diagnostic"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    }
+    ,{
+      "id": "bug-029",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "syscall_fs_selftest: unlink 间歇性返回 +2 (ENOENT 未取负)；同次失败中 stat st_size=32 (读缓冲长度) 而非 20 (实际写入长度)",
+      "file": "src/fs/namei.rs, src/fs/stat.rs 或 src/fs/read_write.rs",
+      "root_cause": "未定位。已排除：do_unlink/minix::namei::unlink 的 errno 符号错误(每条返回路径都正确取负/返正)、Task::errno 被多处写(全树只有 do_syscall 里一句 =0)、syscall 号重号(check-syscall-nr.py 验证过)。探针实测 unlink=-2 errno 0->0，说明 do_syscall 的 errno 覆盖分支未触发，-2 是 sys::unlink 的直接返回值。同次失败中 stat 取到缓冲长度(32)而非文件大小(20)，指向 inode/缓冲被串写。",
+      "fix": "未修复。下一步从 fs::stat 填 st_size 的路径与 read 的缓冲归还顺序查起。症状出现率约 1/12 (256M)、3/5 (32M)，在 HEAD~2 基线上同频率出现，与最近的 COW/syscall 工作无关。",
+      "tags": [
+        "fs",
+        "intermittent",
+        "buffer-cache",
+        "inode",
+        "minix",
+        "stat",
+        "unlink"
+      ],
+      "related_bugs": ["bug-023"],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z",
+      "notes": "此前被归给 bug-023 (mkfs.minix failed / unable to mount root)，但 bug-023 已记录为已修 (fs_init_thread 不在 task[0] 里跑)，且其成因「在 task[0] 里睡」已不存在。两者症状重叠但可能是不同根因。大概率不是 minix 独有：do_unlink/dir_namei/buffer cache 都在 VFS 层，换 ext4 会一起带过去。"
     }
   ]
 }

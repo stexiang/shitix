@@ -380,6 +380,11 @@ unsafe fn make_request(m: usize, rw_in: i32, n: usize) {
         q.bh = n;
         q.bhtail = n;
         q.next = NIL;
+        // 写方向：调用方刚通过 `data_mut()` 的 `&mut [u8]` 改完数据区，
+        // 驱动马上要用裸指针把它 memcpy 出去。屏障保证那些写在驱动读之前
+        // 已经落到内存，而不是被 LLVM 留在寄存器里或排到 memcpy 之后
+        // ——读方向的同一个坑就是 bug-029（见 ramdisk::do_rd_request 的注释）。
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         bh(n).b_reqnext = NIL;
 
         let flags = irq::local_irq_save();

@@ -5,34 +5,57 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// 页面引用计数数组 - 每个物理页框一个计数
-/// 假设最大 256MB 物理内存，页大小 4KB，则最多 65536 页
-const MAX_PFN: usize = 64 * 1024;
+/// 引用计数表的表体与长度，由 [`attach`] 在 `page_alloc::init` 里填好。
+///
+/// 表体不是静态数组：按最大可管理内存静态开表需要 256KB BSS，`_kernel_end`
+/// 会顶过 0x90000 盖掉 setup.S 的机器参数区（`kernel.ld` 的 ASSERT 会拦住）。
+/// 所以和 `mem_map` 一样按实际物理内存量在启动期划出来。
+static mut REF_BASE: *mut AtomicU32 = core::ptr::null_mut();
+static mut REF_LEN: usize = 0;
 
-/// 页面引用计数表
-/// 使用静态数组存储，每个物理页框对应一个引用计数
-static mut PAGE_REF_ARRAY: [AtomicU32; 65536] = [const { AtomicU32::new(0) }; 65536];
-
-/// 初始化页面引用计数
-pub fn init() {
+/// 把引用计数表挂到 `base`，长度 `len` 个条目。
+///
+/// # Safety
+/// 只能在启动早期由 `page_alloc::init` 调用一次。`base` 必须指向一块已恒等
+/// 映射、长度不小于 `len * 4` 字节、已清零且随后被标记为保留页的内存。
+pub unsafe fn attach(base: usize, len: usize) {
     unsafe {
-        let ptr = core::ptr::addr_of_mut!(PAGE_REF_ARRAY);
-        let len = (*ptr).len();
-        for i in 0..len {
-            (*ptr)[i].store(0, Ordering::Relaxed);
-        }
-        crate::pr_info!("page_ref: initialized {} slots", len);
+        REF_BASE = base as *mut AtomicU32;
+        REF_LEN = len;
     }
+}
+
+/// 取 `pfn` 对应的计数槽；表未挂上或下标越界时返回 `None`。
+///
+/// 越界不 panic：调用方大多在 COW 路径上传入来自页表的 pfn，超出受管内存
+/// 范围（如 MMIO）的页本来就不参与引用计数，按“无槽位”处理即可。
+#[inline]
+fn slot(pfn: usize) -> Option<&'static AtomicU32> {
+    // SAFETY: 只读两个静态标量；attach 之后 REF_BASE 在 REF_LEN 范围内始终有效。
+    unsafe {
+        let (base, len) = (
+            core::ptr::read_volatile(core::ptr::addr_of!(REF_BASE)),
+            core::ptr::read_volatile(core::ptr::addr_of!(REF_LEN)),
+        );
+        if base.is_null() || pfn >= len {
+            return None;
+        }
+        Some(&*base.add(pfn))
+    }
+}
+
+/// 报告表的规模，供启动期打印核对布局。
+pub fn table_len() -> usize {
+    // SAFETY: 只读一个静态标量。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(REF_LEN)) }
 }
 
 /// 获取页框的引用计数
 #[inline]
 pub fn page_ref_count(pfn: usize) -> u32 {
-    if pfn >= 65536 {
-        return 0;
-    }
-    unsafe {
-        PAGE_REF_ARRAY[pfn].load(Ordering::Relaxed) & 0xFFFF
+    match slot(pfn) {
+        Some(s) => s.load(Ordering::Relaxed) & 0xFFFF,
+        None => 0,
     }
 }
 
@@ -40,12 +63,9 @@ pub fn page_ref_count(pfn: usize) -> u32 {
 /// 返回新的引用计数
 #[inline]
 pub fn page_ref_inc(pfn: usize) -> u32 {
-    if pfn >= 65536 {
-        return 0;
-    }
-    unsafe {
-        let old = PAGE_REF_ARRAY[pfn].fetch_add(1, Ordering::Relaxed);
-        (old + 1) & 0xFFFF
+    match slot(pfn) {
+        Some(s) => (s.fetch_add(1, Ordering::Relaxed) + 1) & 0xFFFF,
+        None => 0,
     }
 }
 
@@ -53,52 +73,46 @@ pub fn page_ref_inc(pfn: usize) -> u32 {
 /// 返回新的引用计数
 #[inline]
 pub fn page_ref_dec(pfn: usize) -> u32 {
-    if pfn >= 65536 {
-        return 0;
-    }
-    unsafe {
-        let old = PAGE_REF_ARRAY[pfn].fetch_sub(1, Ordering::Relaxed);
-        (old - 1) & 0xFFFF
+    match slot(pfn) {
+        Some(s) => (s.fetch_sub(1, Ordering::Relaxed).wrapping_sub(1)) & 0xFFFF,
+        None => 0,
     }
 }
 
 /// 设置页框引用计数
 #[inline]
 pub fn page_ref_set(pfn: usize, count: u32) {
-    if pfn >= 65536 {
-        return;
-    }
-    unsafe {
-        PAGE_REF_ARRAY[pfn].store(count & 0xFFFF, Ordering::Relaxed);
+    if let Some(s) = slot(pfn) {
+        // 只改低 16 位的计数，保留高位的 COW 标记
+        let cow = s.load(Ordering::Relaxed) & 0x8000_0000;
+        s.store((count & 0xFFFF) | cow, Ordering::Relaxed);
     }
 }
 
 /// 获取页框的 COW 标记
 #[inline]
 pub fn page_is_cow(pfn: usize) -> bool {
-    if pfn >= 65536 {
-        return false;
-    }
-    unsafe {
-        (PAGE_REF_ARRAY[pfn].load(Ordering::Relaxed) & 0x8000) != 0
+    match slot(pfn) {
+        Some(s) => (s.load(Ordering::Relaxed) & COW_FLAG) != 0,
+        None => false,
     }
 }
 
 /// 设置页框的 COW 标记
 #[inline]
 pub fn page_set_cow(pfn: usize, cow: bool) {
-    if pfn >= 65536 {
-        return;
-    }
-    unsafe {
-        let val = PAGE_REF_ARRAY[pfn].load(Ordering::Relaxed);
+    if let Some(s) = slot(pfn) {
         if cow {
-            PAGE_REF_ARRAY[pfn].store(val | 0x8000, Ordering::Relaxed);
+            s.fetch_or(COW_FLAG, Ordering::Relaxed);
         } else {
-            PAGE_REF_ARRAY[pfn].store(val & !0x8000, Ordering::Relaxed);
+            s.fetch_and(!COW_FLAG, Ordering::Relaxed);
         }
     }
 }
+
+/// COW 标记位。放在 bit 31 而不是 bit 15：计数字段是低 16 位（`& 0xFFFF`），
+/// bit 15 会和计数重叠，引用计数一旦到 32768 就会被误读成 COW 页。
+const COW_FLAG: u32 = 0x8000_0000;
 
 /// 页框号转换为物理地址
 #[inline]
@@ -119,24 +133,18 @@ pub fn page_ref_init(pfn: usize) {
 
 /// 获取页面并增加引用
 pub fn get_page(pfn: usize) -> bool {
-    if pfn >= 65536 {
-        return false;
-    }
-    unsafe {
-        let old = PAGE_REF_ARRAY[pfn].fetch_add(1, Ordering::Relaxed);
-        (old & 0xFFFF) != 0
+    match slot(pfn) {
+        Some(s) => (s.fetch_add(1, Ordering::Relaxed) & 0xFFFF) != 0,
+        None => false,
     }
 }
 
 /// 释放页面并减少引用
 /// 返回 true 如果页面应该被释放（引用计数降到 0）
 pub fn put_page(pfn: usize) -> bool {
-    if pfn >= 65536 {
-        return false;
-    }
-    unsafe {
-        let old = PAGE_REF_ARRAY[pfn].fetch_sub(1, Ordering::Relaxed);
-        (old & 0xFFFF) <= 1
+    match slot(pfn) {
+        Some(s) => (s.fetch_sub(1, Ordering::Relaxed) & 0xFFFF) <= 1,
+        None => false,
     }
 }
 

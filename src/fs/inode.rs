@@ -142,11 +142,97 @@ impl Inode {
     }
 }
 
-/// inode 表。原版是动态链表（见模块文档第 1 点）。
-static mut INODES: [Inode; NR_INODE] = [const { Inode::new() }; NR_INODE];
+/// inode 表两侧的护栏，用来区分 bug-029 的两种可能：整块 memcpy 打偏
+/// （护栏一起被冲掉）还是通过坏下标/坏指针的单字段写（护栏完好）。
+/// 与 `super_block::SUPER_AREA` 的护栏同一套手法。
+const INODE_GUARD: u64 = 0x5A5A_1234_ABCD_5A5A;
+
+/// inode 表 + 两侧护栏。原版是动态链表（见模块文档第 1 点）。
+///
+/// 包在一个结构里而不是三个独立 static，是为了让护栏和表在内存里真的相邻
+/// ——独立的 static 之间链接器可以任意插空、重排，护栏就守不住任何东西。
+#[repr(C)]
+struct InodeArea {
+    guard_lo: [u64; 4],
+    table: [Inode; NR_INODE],
+    guard_hi: [u64; 4],
+}
+
+static mut INODE_AREA: InodeArea = InodeArea {
+    guard_lo: [INODE_GUARD; 4],
+    table: [const { Inode::new() }; NR_INODE],
+    guard_hi: [INODE_GUARD; 4],
+};
+
+/// 检查两侧护栏。破了就报出哪一侧、第几个字。
+///
+/// # Safety
+/// 只读；可在中断上下文调用。
+pub unsafe fn watchdog_guards_ok() -> Option<(&'static str, usize, u64)> {
+    // SAFETY: 只做 volatile 读，不建 `&mut`（中断里不能与进程上下文的
+    // `&mut` 共存）。
+    unsafe {
+        let area = core::ptr::addr_of!(INODE_AREA);
+        for k in 0..4 {
+            let v = core::ptr::addr_of!((*area).guard_lo[k]).read_volatile();
+            if v != INODE_GUARD {
+                return Some(("lo", k, v));
+            }
+            let v = core::ptr::addr_of!((*area).guard_hi[k]).read_volatile();
+            if v != INODE_GUARD {
+                return Some(("hi", k, v));
+            }
+        }
+        None
+    }
+}
 
 /// 等空闲 inode 的任务。对应原版 `static struct wait_queue * inode_wait`。
 static mut INODE_WAIT: WaitQueue = WaitQueue::new();
+
+/// 临时看门狗：扫 inode 表找被 IVT/BIOS 字节灌过的槽。
+///
+/// 与 [`super_block::watchdog_bad_dev`] 同一套手法，用来定位 bug-029：
+/// 失败日志里出现过 `i_mode=0o177523`（0xFF53）、`i_nlink=255`、
+/// `st_size=0xF000F84D`——都是低端内存那串 `0xf000ff53` IRET stub 的碎片，
+/// 说明有人把 IVT/BIOS ROM 的内容写进了 inode 表。由 `do_timer` 每滴答调一次，
+/// 抓到就把被打断的 RIP 打出来。只在 debug 构建里跑。
+///
+/// 返回 `(槽号, 坏掉的 i_mode)`。
+///
+/// # Safety
+/// 只读 inode 表；可以在中断上下文调用。
+pub unsafe fn watchdog_bad_inode() -> Option<(usize, u16)> {
+    // SAFETY: 只做 volatile 读，不建 `&mut`（中断里不能与进程上下文的
+    // `&mut` 共存，见 buffer::init 里关于 noalias 的注释）。
+    unsafe {
+        let base = core::ptr::addr_of!((*core::ptr::addr_of!(INODE_AREA)).table).cast::<Inode>();
+        for n in 0..NR_INODE {
+            let p = base.add(n);
+            let count = core::ptr::addr_of!((*p).i_count).read_volatile();
+            if count == 0 {
+                // 空闲槽的内容不作数（i_mode 可能是上一个使用者的残留）。
+                continue;
+            }
+            let m = core::ptr::addr_of!((*p).i_mode).read_volatile();
+            // `i_mode == 0` 不算坏：`iget` 先占住槽（i_count=1）再由
+            // `read_inode` 去读盘填字段，中间有一个 i_mode 还是 0 的窗口，
+            // 而这个看门狗是从时钟中断里扫的，正好会撞上。只查确实是垃圾
+            // 的形态：高 4 位全 1（0xF000/0xFF53 那串 IVT 字节的特征）。
+            if m != 0 && m & 0xF000 == 0xF000 {
+                return Some((n, m));
+            }
+            // nlink 同理：只有 i_mode 已填好（说明 read_inode 跑完了）才查。
+            if m != 0 {
+                let nlink = core::ptr::addr_of!((*p).i_nlink).read_volatile();
+                if nlink == 0xFF || nlink == 0xFFFF {
+                    return Some((n, m));
+                }
+            }
+        }
+        None
+    }
+}
 
 /// 取 inode。
 ///
@@ -160,7 +246,7 @@ pub unsafe fn inode(n: usize) -> &'static mut Inode {
     // 定位成本高得多。
     assert!(n < NR_INODE, "inode(): index {} out of range (NR_INODE={})", n, NR_INODE);
     // SAFETY: 上面已校验下标在界内；单核内核。
-    unsafe { &mut (*core::ptr::addr_of_mut!(INODES))[n] }
+    unsafe { &mut (*core::ptr::addr_of_mut!(INODE_AREA)).table[n] }
 }
 
 /// inode 的裸指针。
@@ -184,7 +270,7 @@ pub unsafe fn inode(n: usize) -> &'static mut Inode {
 pub unsafe fn inode_ptr(n: usize) -> *mut Inode {
     assert!(n < NR_INODE, "inode_ptr(): index {} out of range", n);
     // SAFETY: 下标已校验；INODES 地址恒定。
-    unsafe { (*core::ptr::addr_of_mut!(INODES)).as_mut_ptr().add(n) }
+    unsafe { (*core::ptr::addr_of_mut!(INODE_AREA)).table.as_mut_ptr().add(n) }
 }
 
 /// 等 `i_lock` 放开。对应原版 `wait_on_inode()`。

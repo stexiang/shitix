@@ -2,19 +2,19 @@
   "version": 1,
   "created_at": "2026-08-01T19:00:19.430Z",
   "lifetime": {
-    "total_tokens_estimated": 1021,
-    "total_reads": 15,
+    "total_tokens_estimated": 33769,
+    "total_reads": 21,
     "total_writes": 0,
-    "total_sessions": 17,
-    "anatomy_hits": 3,
+    "total_sessions": 36,
+    "anatomy_hits": 9,
     "anatomy_misses": 12,
-    "repeated_reads_blocked": 0,
-    "estimated_savings_vs_bare_cli": 600,
-    "real_input_tokens": 3120,
-    "real_output_tokens": 154806,
-    "real_cache_read_tokens": 23309249,
-    "real_cache_creation_tokens": 6849761,
-    "real_api_calls": 391
+    "repeated_reads_blocked": 2,
+    "estimated_savings_vs_bare_cli": 13896,
+    "real_input_tokens": 534038,
+    "real_output_tokens": 251091,
+    "real_cache_read_tokens": 50147596,
+    "real_cache_creation_tokens": 11792561,
+    "real_api_calls": 695
   },
   "sessions": [
     {
@@ -225,6 +225,114 @@
         "cache_read_input_tokens": 547545,
         "cache_creation_input_tokens": 172899,
         "api_calls": 19
+      }
+    },
+    {
+      "id": "session-2026-08-06-1322",
+      "agent": "claude",
+      "started": "2026-08-06T05:22:37.781Z",
+      "ended": "2026-08-06T06:10:32.348Z",
+      "reads": [
+        {
+          "file": "/root/shitix/src/fs/super_block.rs",
+          "tokens_estimated": 6048,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/umm/mod.rs",
+          "tokens_estimated": 6022,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [],
+      "totals": {
+        "input_tokens_estimated": 12070,
+        "output_tokens_estimated": 0,
+        "reads_count": 2,
+        "writes_count": 0,
+        "repeated_reads_blocked": 2,
+        "anatomy_lookups": 2
+      },
+      "real_usage": {
+        "input_tokens": 101,
+        "output_tokens": 37517,
+        "cache_read_input_tokens": 8349855,
+        "cache_creation_input_tokens": 1958672,
+        "api_calls": 101
+      }
+    },
+    {
+      "id": "session-2026-08-06-1413",
+      "agent": "claude",
+      "started": "2026-08-06T06:13:26.795Z",
+      "ended": "2026-08-06T06:49:46.460Z",
+      "reads": [
+        {
+          "file": "/root/shitix/src/syscall/mod.rs",
+          "tokens_estimated": 6887,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [],
+      "totals": {
+        "input_tokens_estimated": 6887,
+        "output_tokens_estimated": 0,
+        "reads_count": 1,
+        "writes_count": 0,
+        "repeated_reads_blocked": 0,
+        "anatomy_lookups": 1
+      },
+      "real_usage": {
+        "input_tokens": 75,
+        "output_tokens": 21000,
+        "cache_read_input_tokens": 6473757,
+        "cache_creation_input_tokens": 1518582,
+        "api_calls": 75
+      }
+    },
+    {
+      "id": "session-2026-08-06-1623",
+      "agent": "claude",
+      "started": "2026-08-06T08:23:46.823Z",
+      "ended": "2026-08-06T08:53:27.098Z",
+      "reads": [
+        {
+          "file": "/root/shitix/src/fs/mod.rs",
+          "tokens_estimated": 1493,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4/mod.rs",
+          "tokens_estimated": 1236,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/lib.rs",
+          "tokens_estimated": 11062,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [],
+      "totals": {
+        "input_tokens_estimated": 13791,
+        "output_tokens_estimated": 0,
+        "reads_count": 3,
+        "writes_count": 0,
+        "repeated_reads_blocked": 0,
+        "anatomy_lookups": 3
+      },
+      "real_usage": {
+        "input_tokens": 530742,
+        "output_tokens": 37768,
+        "cache_read_input_tokens": 12014735,
+        "cache_creation_input_tokens": 1465546,
+        "api_calls": 128
       }
     }
   ],

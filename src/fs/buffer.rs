@@ -140,6 +140,23 @@ impl BufferHead {
                    index_of(self), self.b_data as usize, self.b_size,
                    self.b_dev, self.b_blocknr, self.b_count, self.b_lock);
         }
+        // 数据区是驱动用裸指针 memcpy 填的，这里却把它当成 `&[u8]` 交出去。
+        // 共享引用带 noalias + readonly，LLVM 由此认为「这段内存在切片存活
+        // 期间没人写」，于是可以跨调用缓存住上一个使用者留下的值。
+        //
+        // bug-029 就是这么来的：`minix::read_inode` 里 `parse_inode` 从
+        // 0xffdbc00 读出 `i_mode=0o177523`（一整块 0xFF 的形态），而紧挨着
+        // 用 `read_volatile` 从同一个地址抓的快照是正确的 `ed 41`。
+        // 内存从头到尾都是对的，错的是编译器沿用了这个缓冲上一轮装位图块
+        // 时的载入结果。
+        //
+        // `compiler_fence` 在这里不够：它只约束原子操作之间的顺序，挡不住
+        // 基于 `readonly` 的 CSE。空的 `asm!` 默认带 memory clobber，会让
+        // LLVM 认为内存已被外部改写，从而作废所有缓存的载入——这正是需要的。
+        // 单核不需要 CPU 级屏障（没有别的核，ramdisk 也不是真 DMA），
+        // 所以不用 `mfence`，一条空 asm 就够。
+        // SAFETY: 空指令序列，只借它的 memory clobber 语义。
+        unsafe { core::arch::asm!("", options(nostack, preserves_flags)) };
         // SAFETY: b_data 由 init 从页分配器取得，长度恰为 b_size；
         // 契约保证没有并发 I/O 在改它。
         unsafe { core::slice::from_raw_parts(self.b_data, self.b_size) }
@@ -157,6 +174,10 @@ impl BufferHead {
                    index_of(self), self.b_data as usize, self.b_size,
                    self.b_dev, self.b_blocknr, self.b_count, self.b_lock);
         }
+        // 同 data() 里那段长注释：空 asm 的 memory clobber 作废掉编译器
+        // 缓存的载入。`&mut` 上还多一层 noalias，重排的余地比只读切片更大。
+        // SAFETY: 空指令序列，只借它的 memory clobber 语义。
+        unsafe { core::arch::asm!("", options(nostack, preserves_flags)) };
         // SAFETY: 同 data；&mut self 保证 Rust 侧独占。
         unsafe { core::slice::from_raw_parts_mut(self.b_data, self.b_size) }
     }
@@ -797,6 +818,20 @@ pub unsafe fn bread(dev: u16, block: u32, size: usize) -> Option<usize> {
         ll_rw_block(READ, &mut [n]);
         wait_on_buffer(n);
         if bh(n).b_uptodate {
+            // bug-029 定位：见 ramdisk 里同样的检查。驱动那一侧不报、这里报，
+            // 就说明数据是在 memcpy 之后、交回调用方之前被改的。
+            let p = bh(n).b_data;
+            if core::ptr::read_volatile(p) == 0x53
+                && core::ptr::read_volatile(p.add(1)) == 0xff
+                && core::ptr::read_volatile(p.add(2)) == 0x00
+                && core::ptr::read_volatile(p.add(3)) == 0xf0
+            {
+                panic!(
+                    "bread: IVT pattern in buf {} dev={:#06x} blk={} b_data={:#x} \
+                     (asked dev={:#06x} blk={})",
+                    n, bh(n).b_dev, bh(n).b_blocknr, p as usize, dev, block
+                );
+            }
             return Some(n);
         }
         brelse(n);

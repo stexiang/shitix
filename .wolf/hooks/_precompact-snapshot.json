@@ -1,86 +1,36 @@
 {
-  "at": "2026-08-02T17:33:30.953Z",
+  "at": "2026-08-06T12:06:15.844Z",
   "trigger": "auto",
   "session": {
-    "session_id": "session-2026-08-02-1950",
-    "started": "2026-08-02T11:50:14.573Z",
+    "session_id": "session-2026-08-06-1915",
+    "started": "2026-08-06T11:15:18.426Z",
     "files_read": {
-      "/root/shitix/src/lib.rs": {
-        "count": 6,
-        "tokens": 10561,
-        "first_read": "2026-08-02T11:59:27.343Z"
-      },
-      "/root/shitix/src/drivers/block/ramdisk.rs": {
+      "/root/shitix/src/fs/minix/bitmap.rs": {
         "count": 2,
-        "tokens": 1929,
-        "first_read": "2026-08-02T11:59:49.851Z"
+        "tokens": 3290,
+        "first_read": "2026-08-06T11:21:25.170Z"
       },
-      "/root/shitix/src/mm/page_alloc.rs": {
-        "count": 1,
-        "tokens": 2475,
-        "first_read": "2026-08-02T12:00:28.598Z"
+      "/root/shitix/src/fs/buffer.rs": {
+        "count": 2,
+        "tokens": 10437,
+        "first_read": "2026-08-06T11:32:17.675Z"
       },
-      "/root/shitix/src/mm/kmalloc.rs": {
+      "/root/shitix/src/drivers/block/ll_rw.rs": {
         "count": 1,
-        "tokens": 2177,
-        "first_read": "2026-08-02T12:01:03.655Z"
-      },
-      "/root/shitix/boot/entry.S": {
-        "count": 1,
-        "tokens": 2628,
-        "first_read": "2026-08-02T12:01:29.733Z"
-      },
-      "/root/shitix/src/irq.rs": {
-        "count": 1,
-        "tokens": 4322,
-        "first_read": "2026-08-02T12:01:41.930Z"
+        "tokens": 5167,
+        "first_read": "2026-08-06T11:33:14.336Z"
       },
       "/root/shitix/src/fs/minix/inode_ops.rs": {
         "count": 1,
-        "tokens": 6727,
-        "first_read": "2026-08-02T12:02:13.021Z"
-      },
-      "/root/shitix/src/e820.rs": {
-        "count": 1,
-        "tokens": 497,
-        "first_read": "2026-08-02T12:02:46.839Z"
-      },
-      "/root/shitix/src/drivers/char_dev/mem.rs": {
-        "count": 1,
-        "tokens": 1710,
-        "first_read": "2026-08-02T12:04:28.097Z"
-      },
-      "/root/shitix/src/fs/buffer.rs": {
-        "count": 4,
-        "tokens": 7601,
-        "first_read": "2026-08-02T12:07:12.079Z"
-      },
-      "/root/shitix/src/drivers/block/ll_rw.rs": {
-        "count": 4,
-        "tokens": 4730,
-        "first_read": "2026-08-02T12:07:48.622Z"
-      },
-      "/root/shitix/boot/head.S": {
-        "count": 1,
-        "tokens": 856,
-        "first_read": "2026-08-02T13:04:32.635Z"
-      },
-      "/root/shitix/boot/kernel.ld": {
-        "count": 1,
-        "tokens": 283,
-        "first_read": "2026-08-02T13:10:20.184Z"
-      },
-      "/root/shitix/src/sched/mod.rs": {
-        "count": 2,
-        "tokens": 8574,
-        "first_read": "2026-08-02T13:39:15.971Z"
+        "tokens": 6858,
+        "first_read": "2026-08-06T12:05:52.990Z"
       }
     },
     "files_written": [],
     "edit_counts": {},
-    "anatomy_hits": 14,
+    "anatomy_hits": 4,
     "anatomy_misses": 0,
-    "repeated_reads_warned": 13,
+    "repeated_reads_warned": 2,
     "cerebrum_warnings": 0,
     "stop_count": 0
   }

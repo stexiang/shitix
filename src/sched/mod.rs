@@ -364,6 +364,24 @@ fn do_timer(_irq: usize, regs: &mut crate::traps::PtRegs) {
                 d, regs.rip, regs.rsp, regs.cs);
             panic!("SUPER_BLOCKS corrupted, interrupted rip={:#x}", regs.rip);
         }
+        // inode 表两侧的护栏。破了说明是整块 memcpy 打偏（写穿了表的边界），
+        // 完好而字段又是垃圾说明是坏下标/坏指针的定点写——两种成因的修法
+        // 完全不同，所以先分开。
+        // SAFETY: 只读。
+        if let Some((side, k, v)) = unsafe { crate::fs::inode::watchdog_guards_ok() } {
+            crate::pr!(Level::Err,
+                "WATCHDOG: INODE_AREA guard_{}[{}]={:#x} interrupted rip={:#x} rsp={:#x} cs={:#x}",
+                side, k, v, regs.rip, regs.rsp, regs.cs);
+            panic!("INODE_AREA guard smashed, interrupted rip={:#x}", regs.rip);
+        }
+        // 同一套手法查 inode 表（bug-029）。见 watchdog_bad_inode 的文档。
+        // SAFETY: 只读 inode 表。
+        if let Some((n, m)) = unsafe { crate::fs::inode::watchdog_bad_inode() } {
+            crate::pr!(Level::Err,
+                "WATCHDOG: INODES[{}].i_mode={:#o} interrupted rip={:#x} rsp={:#x} cs={:#x}",
+                n, m, regs.rip, regs.rsp, regs.cs);
+            panic!("INODES corrupted at slot {}, interrupted rip={:#x}", n, regs.rip);
+        }
     }
 
     // SAFETY: current 在中断里读是安全的（调度只发生在中断返回路径上）。
@@ -672,28 +690,40 @@ unsafe fn find_empty_process() -> KResult<usize> {
 /// ```
 /// 每个内核线程的栈页数。见 [`kernel_thread`] 里关于「一页不够」的说明。
 pub const KSTACK_PAGES: usize = 4;
-/// 池里放几份栈。**不能按 NR_TASKS 开满**：这个池在 BSS 里，而 BSS
-/// 一旦长过 0x90000 就会盖掉 setup.S 留在那里的机器参数与 E820 表
-/// （0x90000 参数区、0x9E000 E820 数组），表现为 mm 初始化前就 panic。
-/// 3 份正好够当前用量（fsinit + 两个 worker）；再加一份就会越界，
-/// 链接脚本里的 `ASSERT(_kernel_end <= 0x90000)` 会拦住。
-const KSTACK_SLOTS: usize = 3;
-// 池大小 = KSTACK_PAGES * KSTACK_SLOTS 页。加 SCRATCH 之后 BSS 已到 0x90000
-// 边界，KSTACK_PAGES 从 4 降到 3（12KB/线程，实测高水位 9.7KB 偏紧，
-// 所以同时把 mkfs 的 1KB 块搬去了静态 SCRATCH，见 fs::minix::mkfs）。
+/// 池里放几份栈。task[0] 不占一份（它用 head.S 里的静态栈）。
+///
+/// 曾经是 3，因为那时池子放在 BSS 里，而 BSS 一旦长过 0x90000 就会盖掉
+/// setup.S 留在那里的机器参数与 E820 表（0x90000 参数区、0x9E000 E820
+/// 数组），表现为 mm 初始化前就 panic；链接脚本的
+/// `ASSERT(_kernel_end <= 0x90000)` 拦住过这类事故四次。现在池子由
+/// `page_alloc::init` 从物理内存里划出（见 [`attach_kstacks`]），BSS 不再
+/// 随槽位数增长，所以可以放宽到 8 份。
+pub const KSTACK_SLOTS: usize = 8;
 /// 内核栈字节数。
 pub const KSTACK_SIZE: usize = KSTACK_PAGES * mm::PAGE_SIZE;
+/// 整个池的字节数。`page_alloc::init` 按这个数划地。
+pub const KSTACK_POOL_BYTES: usize = KSTACK_SIZE * KSTACK_SLOTS;
 
-/// 内核栈静态池。task[0] 不占一份（它用 head.S 里的静态栈）。
+/// 内核栈池的底地址，由 [`attach_kstacks`] 在 `page_alloc::init` 里填好。
+/// 0 表示还没挂上（此时 [`alloc_kstack`] 一律失败）。
 ///
-/// 对齐到页边界，这样每份栈的底地址都是页对齐的，和原版
+/// 池首地址页对齐，所以每份栈的底地址也都是页对齐的，和原版
 /// `kernel_stack_page` 的性质一致（`current` 曾经靠屏蔽低位从 rsp 反推
 /// task，我们不用那个技巧，但保持对齐没有坏处）。
-#[repr(align(4096))]
-struct KStackPool(#[allow(dead_code)] [u8; KSTACK_SIZE * KSTACK_SLOTS]);
-static mut KSTACKS: KStackPool = KStackPool([0; KSTACK_SIZE * KSTACK_SLOTS]);
-/// 哪一份已被占用。
+static mut KSTACK_BASE: usize = 0;
+/// 哪一份已被占用。这个是定长 bool 数组，留在 BSS 里无所谓（8 字节）。
 static mut KSTACK_USED: [bool; KSTACK_SLOTS] = [false; KSTACK_SLOTS];
+
+/// 把 `page_alloc::init` 划出的那块地登记为内核栈池。
+///
+/// # Safety
+/// 只能由 `page_alloc::init` 调用一次，且必须在任何 [`kernel_thread`]
+/// 之前。`base` 必须页对齐，且 `base..base + KSTACK_POOL_BYTES` 是恒等
+/// 映射、已清零、不会再被派发给别人的物理内存。
+pub unsafe fn attach_kstacks(base: usize) {
+    // SAFETY: 契约保证此时是启动早期的独占阶段，无并发访问。
+    unsafe { *core::ptr::addr_of_mut!(KSTACK_BASE) = base };
+}
 
 /// 上一个退出的内核线程留下的栈，等下一次分配时回收。见
 /// [`do_kthread_exit`] 里的说明。0 表示没有待回收的。
@@ -722,11 +752,15 @@ unsafe fn alloc_kstack() -> usize {
     // SAFETY: 契约保证已关中断、单核独占这两个静态量。
     unsafe {
         reap_kstack();
+        let base = *core::ptr::addr_of!(KSTACK_BASE);
+        // 池还没挂上（mm 未初始化）——不可能发生，但宁可返回失败也别派 0 页。
+        if base == 0 {
+            return 0;
+        }
         let used = &mut *core::ptr::addr_of_mut!(KSTACK_USED);
         for (i, u) in used.iter_mut().enumerate() {
             if !*u {
                 *u = true;
-                let base = core::ptr::addr_of_mut!(KSTACKS) as usize;
                 return base + i * KSTACK_SIZE;
             }
         }
@@ -741,8 +775,8 @@ unsafe fn alloc_kstack() -> usize {
 unsafe fn free_kstack(addr: usize) {
     // SAFETY: 契约转交。
     unsafe {
-        let base = core::ptr::addr_of_mut!(KSTACKS) as usize;
-        if addr < base {
+        let base = *core::ptr::addr_of!(KSTACK_BASE);
+        if base == 0 || addr < base {
             return;
         }
         let i = (addr - base) / KSTACK_SIZE;
@@ -760,7 +794,7 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
         // SAFETY: 已关中断。
         let nr = unsafe { find_empty_process()? };
 
-        // 内核栈：从静态池里取 [`KSTACK_PAGES`] 页连续空间。
+        // 内核栈：从内核栈池里取 [`KSTACK_PAGES`] 页连续空间。
         //
         // 原版 `sys_fork` 用 `get_free_page()` 取**一**页（4KB）当
         // `kernel_stack_page`，我们最初也照搬了，但实测不够：原版的 i386
@@ -770,8 +804,9 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
         // `ll_rw_block` → `do_rd_request`）。一页会溢出，症状是栈底魔数
         // 被踩掉 + 一个 CR2 是小负数的 page fault（见 buglog）。
         //
-        // 页分配器只能给单页且不保证相邻，所以这里用静态池而不是
-        // `get_free_page`：连续、对齐、无需回收，代价是固定占用。
+        // 页分配器只能给单页且不保证相邻，所以这里用预划的池而不是
+        // `get_free_page`：连续、对齐、无需回收，代价是固定占用。池本身由
+        // `page_alloc::init` 从物理内存里划出（见 [`attach_kstacks`]），不占 BSS。
         let stack = unsafe { alloc_kstack() };
         if stack == 0 {
             return Err(EAGAIN);

@@ -1,9 +1,9 @@
-<!-- Last updated: 2026-08-02 -->
+<!-- Last updated: 2026-08-06 (模块 7：21 个 syscall 接 fs 层、内核栈池移出 BSS、LFS 集成结论) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
 > Update this file at the end of every work phase so the next `/clear` resumes in 1 read.
-> Last updated (was): 2026-08-02 (模块 4 完成)
+> Last updated (was): 2026-08-06 (模块 7 完成；syscall 表 361 wired，fs 层通畅，BSS 44KB 余量)
 
 ---
 
@@ -77,11 +77,79 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
   这是上阶段 STATUS 里记的已知缺口，本阶段补上
 - panic 信息只上 VGA 不上串口；`as_str()` 丢掉带格式的 assert 消息
 
+**模块 6：系统调用号补齐到 x86_64 正式表**（2026-08-06）
+- `nr` 模块原本按功能分组手写号，重号一大把：`GETPID`=`WAIT4`=61、`GETPPID`=`KILL`=62、六个 `IO_*` 全是 0（把 `t[READ]` 也覆盖了）。建表是顺序赋值，重号**静默覆盖**，编译器零警告。表现是 syscall 自检一直 `FAIL`（getppid 实际跑的是 sys_kill），此前被当成噪声
+- 改成从 `arch/x86/entry/syscalls/syscall_64.tbl` 逐号生成 `0..=334` 连续常量，之后补 io_uring(425-427)/pidfd_open(434)/clone3(435)/faccessat2(439)/epoll_pwait2(441)；自检私有号在 500 段（`IDLE=500`、`UNUSED=501`）。保留 `UMOUNT`/`PRLIMIT`/`SETMEMPOLICY` 等旧名作别名
+- 分发表改按号顺序逐项赋值，**341 个槽挂了实现**（原先看似 200 多项，实际有效的远少于此）
+- `src/syscall/sys.rs` 新增 133 个实现：
+  - 真做：`lseek`(转 fs 层)、`readv`/`writev`(拆成逐 iovec 调 read/write，短读即停)、`sched_yield`、`gettid`、`time`、`exit_group`、`tkill`/`tgkill`、`getpgid`/`getsid`、`getresuid`/`getresgid`、`sched_getaffinity`
+  - 合理默认：`madvise`/`mincore`/`readahead`/`fadvise64` 忽略即合法、`fdatasync`→`fsync`、`flock` 单进程无竞争、`getgroups` 返回 0、`utime` 系列忽略（无 RTC）、`sched_get*` 汇报 SCHED_OTHER
+  - 占位 `-ENOSYS` 89 个，每个文档注明**缺哪个子系统**（rt_sig* 缺信号栈帧、timer_* 缺 POSIX 定时器池、futex 缺 per-address 等待队列、mq_* 只有 SysV 队列、clone 缺 flags 语义…）
+- `implemented_count()` 用 `static WIRED: [bool; 512]` 位图而非比函数指针：release 下 LLVM 的 identical code folding 把返回 `-EINVAL` 的占位实现和 `ni_syscall` 折叠成同一地址，比指针会漏数（debug 341 / release 340）
+- 验证：syscall 自检**从 FAIL 转 ok**（`getpid=0 getppid=0 bad=-38 ni=-22`）；debug 6 轮 5 过、release 过、`-m 32M/128M/1G/3G` 过；`sys.rs` 新增段零编译告警
+- 踩坑三个，记入 buglog **bug-026..028**；另有一条 Do-Not-Repeat：不要用 `git stash` 做基线对比（这个树的改动都未提交）
+
+**COW 引用计数表改成动态划分**（2026-08-06，修 `ld: ... overlaps setup parameter area at 0x90000`）
+- `page_ref.rs` 原本按最大内存开 `[AtomicU32; 65536]` = 256KB BSS，`_kernel_end` 冲到 0xCC2B0，被 `kernel.ld` 的 ASSERT 拦下（该 ASSERT 第一次真正挡住事故）。另外 `page_ref::init()` 从来没被调用过，这 256KB 是白付的
+- 改成沿用 `mem_map` 的约定：`page_alloc::init` 在 `mem_map` 之后按实际内存划出 `nr_pages * 4` 字节、清零、调 `page_ref::attach()`，并把 `map_end` 抬到表尾之后确保不进空闲链表；`MemInfo` 加 `page_ref_addr` / `nr_pages`
+- `page_ref.rs` 用 `REF_BASE`/`REF_LEN` + `slot()` 取槽，越界返 `None` 不 panic（COW 路径会传来受管内存之外的 pfn）
+- 顺手修：COW 标记位从 bit15 挪到 bit31 —— 原本与 `& 0xFFFF` 的计数字段重叠，引用计数到 32768 会被误读成 COW 页
+- 验证：BSS 365KB→103KB，`_kernel_end`=0x8C2C0。详见 buglog **bug-024**
+- ⚠️ **`33667fd`（COW）之后内核一直没链接成功过**，所以 `33667fd` 和 `5a3c04e` 两个提交的代码在此之前从未运行。最后一个可构建的提交是 `HEAD~2`。链接修好后这两个提交的代码是第一次真正执行，冒出来的问题要按「新代码」看待，别默认归给既有 bug
+
+**修 `SUPER_AREA` 护栏误报**（2026-08-06，buglog **bug-025**）
+- 症状：`KERNEL PANIC: SUPER_AREA guard lo smashed at check_mounted`，而 `pr_warn` 打印的值 `0x1234abcd1234abcd` 恰好就是正确的 `SB_GUARD`
+- 判据：一次 `read_volatile` 的结果同时喂比较和打印；打印值正确而比较说不等 ⟹ 比较错了，内存是好的
+- 根因：`check_guards` 用 `&*addr_of!(SUPER_AREA)` 建了覆盖整个结构（含 `table`）的共享引用，与 fs 路径上存活的 `&mut SuperBlock` 重叠 = UB。`super_block.rs:268` 早写了这个症状，但只针对 `sb()` 那条路径，漏了 `check_mounted`
+- 为什么现在才冒出来：见上，新代码首次执行改变了内联上下文，让一直潜伏的误报显形。**HEAD~2 基线跑 20 次护栏 0 次触发**，与「上次测护栏 100% 正常」一致
+- 修法：`check_guards` 全程裸指针，不建任何覆盖 `SUPER_AREA` 的引用；失配先复读，复读正确就 warn + continue，复读仍错才 panic（真损坏保持 fail-stop）。修完 20 次 0 次触发
+- ⚠️ 未能在修复后复现（裸指针版 20 次 + 保留 UB 只加复读的诊断版 20 次，均 0 次），机制是推断而非直接测到
+- ⚠️ **BSS 只剩约 15KB 余量**，下一个加静态缓冲的模块会再撞 ASSERT。放血点：`desc.rs` 三个 8KB IST 栈（24KB）、`sched::KSTACKS`（48KB）
+
+**模块 7：系统调用接到 fs 层 + 内核栈池移出 BSS**（2026-08-06）
+- **21 个系统调用从 `-ENOSYS` 占位改成真接 fs 层**：`open`/`creat`/`close`/`read`、`dup`/`dup2`、`chdir`/`chmod`/`truncate`、`mkdir`/`rmdir`/`unlink`/`link`/`mknod`(→`fs::namei::do_*`)、`fsync`、`stat`/`lstat`/`fstat`(→`fs::stat::*`)、`getdents`/`getdents64`。fs 层一直是好的，只是没接上
+- `write` 改成 fs 优先 + 控制台兜底：先走 `fs::read_write::write`，只有 fd 1/2 拿到 `-EBADF` 才退回内核控制台（task[0] 没有 stdout/stderr）
+- 用户指针护栏 `check_range`/`user_path`/`user_buf`/`user_buf_mut`/`user_stat_out`：只接受恒等映射低 1GB 内的地址，路径按 PATH_MAX 4096 有界 strnlen。⚠️ **它不阻止用户态读写内核内存**，只挡未映射地址；等 `mm/mmap.c` 的 `vm_area_struct` 移植完必须换成真的 `verify_area`
+- 新增 `syscall_fs_selftest()`（9 组，全走真 `int 0x80`）：creat+write、lseek+read 内容比对、fstat st_size、dup 相异、close×2 + 二次 close 得 `-EBADF`、按路径 stat、mkdir/rmdir 往返、unlink + stat 失败、EFAULT 护栏（坏指针 + NULL）。必须挂在 `fs_init_thread` 里，**不能在 task[0]**（所有 fs 路径都可能睡）
+- **内核栈池移出 BSS**：`.text`/`.rodata` 涨了约 24KB 后 `_kernel_end` 冲到 0x922C0，超 0x90000 共 8896 字节。`sched::KSTACKS`（48KB，BSS 最大项）改成由 `page_alloc::init` 在 `page_ref` 表之后划出、清零、调 `sched::attach_kstacks()`（照 bug-024 的 `page_ref::attach()` 套路），`map_end` 抬到池尾之后确保不进空闲链表；`MemInfo` 加 `kstack_addr`
+- 顺带解掉一个长期限制：`KSTACK_SLOTS` **3 → 8**。原注释写明「再加一份就会越界」，现在池子不占 BSS，内核线程数不再被 BSS 卡着
+- 修 `write` 自检的过期期望：`write(0,…)` 现在返 `-EBADF`（POSIX 语义，未打开的 fd），此前只认 fd 1/2 直写控制台所以期望的是 `-EINVAL`
+- `scripts/check-syscall-nr.py`（新，可执行）：解析 `nr` 模块的 `pub const X: usize = N` 对比内核头的 `#define __NR_x N`，自动找 `/usr/src/linux-headers-*/`，带 `PRIVATE` 白名单和 `sysctl`→`_sysctl` 拼写映射，另自查重号。输出 `官方 360 个号，本树 360 个 / 全部一致`，exit 0
+- `scripts/test.sh` 加 `MEM=` 覆盖（默认 256M），照 `TIMEOUT`/`PROFILE` 的既有约定，用来跑内存矩阵
+- 验证：`_kernel_end` = **0x854F0**（debug）/ 0x5B4E0（release），距 0x90000 约 44KB 余量，`kernel.ld` 的 ASSERT 原样保留（量溢出时临时放宽过，已完全还原并核对与 HEAD 一致）；debug 与 release **都报 361 wired**（`WIRED` 位图消掉了 ICF 分歧）；`-m 32M/128M/1G/3G` 全部启动且 `syscall-fs` 绿
+- ⚠️ **HEAD 基线不可用**：另开 worktree 跑 `HEAD` 会撞同一条 `overlaps setup parameter area` —— 这个树里未提交的 `page_alloc.rs`/`page_ref.rs` 改动**就是**那个修复。别拿 HEAD 做基线对比
+
 ## 🚀 Next phase
 
-**Goal（先做）:** 收尾模块 5 的一个未解决缺陷 —— fs 自检约 **15%**
+**Goal（先做）:** fs 自检 flake 的**真正**根因。这一轮把几个假设读代码排除了，
+并拿到一条新线索。
+
+**已排除（读代码，不是猜）:**
+- `do_unlink` 每条早退路径都正确取负（`-(e as i64)`），`dir_namei` 的错误是 `u16`
+- `minix::namei::unlink` 全部 5 条返回路径都只返正 errno，所以 `-(r as i64)` 是对的
+- `Task::errno` 是 `i32`，**全树除了 `do_syscall` 里那句 `= 0` 没人写它**，所以
+  `do_syscall` 的 errno 覆盖分支（`regs.rax = -(errno)`）永不触发
+- 系统调用号无重号、`UNLINK` 槽位（87）挂的就是 `sys::unlink`（`check-syscall-nr.py` 过）
+
+**探针实测（临时探针已删）:** 失败那次 `unlink=-2, errno 0->0` ——
+符号是**对**的，文件确实已经不在了。所以问题不是符号，是文件**提前消失**。
+
+**新线索（下一步从这里查）:** 同一次失败里 `stat st_size FAILED (got 32)`，
+而写进去的是 **20** 字节、自检的读缓冲正好是 **32** 字节。`st_size` 取到了
+缓冲长度而不是文件长度，指向 inode/缓冲被串写。查 `fs::stat` 填 `st_size`
+的路径与 `read` 的缓冲归还顺序。
+
+**⚠️ 与「换 ext4 就能绕开」有关的判断更正:** 这个 flake **大概率不是
+minix 独有**。`do_unlink`/`dir_namei`/buffer cache 都在 VFS 层、与文件系统
+无关，换 ext4 会一起带过去。而且 ext4 现在**挂不上**（见下），换不了。
+
+**⚠️ 上一版 Next phase 把这个 flake 归给 bug-012/bug-023 是错的**：两条都记录为
+已修，且 bug-012 的修法（把 fs 挪进 `fs_init_thread`）正好消掉了它自己写的
+「在 task[0] 里睡」这个成因。别再直接套用那两条的结论。
+
+**（旧描述保留作参考）:** fs 自检约 **10-15%**
 概率失败（`buf 0 bytes` / 缓冲里出现 BIOS ROM 的 `0xf000ff53` /
-mount 找不到魔数 / 漏一个 zone）。详见 buglog **bug-023**。
+`mkfs.minix failed` / mount 找不到魔数 / 漏一个 zone）。详见 buglog **bug-023**。
 
 已排除：页分配器重复派页、缓冲数据页落在低端内存、ramdisk `PAGES`
 未初始化、一块两缓冲、空闲环下标越界、内核栈溢出。已确认现象：某个
@@ -90,9 +158,43 @@ mount 找不到魔数 / 漏一个 zone）。详见 buglog **bug-023**。
 `add_request`/`end_request`/`getblk` 里记录事件序列（环形缓冲，事后
 dump），而不是继续加断言。护栏已就位，不要删。
 
-**Goal（然后）:** 移植信号与进程生命周期 —— `kernel/signal.c` 的信号投递/`sigaction`、
+**这个 bug 与后续所有提交都无关**：`HEAD~2` 基线 20 次失败 2 次，COW/ext4
+提交后同样频率，系统调用号补齐后 debug 6 次失败 1 次、32M 首轮失败但同镜像
+重跑 3/3 过。每次看到 `mkfs.minix failed` 先归给它，别当成新回归。
+护栏 panic（bug-025）不是它的症状，两者不要混。
+
+**Goal（LFS 集成的真实结论 —— 读代码核实过，不是估计）:**
+用户问「能否集成进 LFS 系统」。**当前内核跑不了 LFS 用户态**，缺的不是零碎补丁：
+- **完全没有 ring-3 切换**。`USER_CS` 只出现在常量定义里，全树没有任何地方
+  `iretq` 到用户态 —— 内核**从未执行过一条用户态指令**
+- `sys_execve` 是 `-ENOSYS` 占位，函数体里是注释掉的伪代码
+- **ELF 加载器只认 32 位**（`parse_elf32`/`Elf32Header`/`parse_phdr32`），LFS 的
+  x86_64 二进制是 ELF64
+- 没有 `copy_from_user`/`copy_to_user`/`verify_area`/`access_ok`（现在的
+  `check_range` 只挡未映射地址，见模块 7）
+- `fs::stat::Stat` 是 1.0.9 的 i386 布局（`u16 st_dev`、`u32 st_ino/st_size`），
+  **不是** x86_64 glibc 的 `struct stat` —— 对真实用户态是 ABI 不匹配
+- `arch_prctl` 是占位（glibc 靠 `ARCH_SET_FS` 装 TLS），且没有 per-task FS/GS base
+- `clone` 的 flags 语义、信号投递到用户态、`fork` 的页表复制都缺
+- **ext4 挂不上**：`src/fs/ext4/` 共 1291 行，全是磁盘结构解析器（超级块/inode
+  字段访问器/extent 结构/特性位查询），**没有** `read_inode`/`lookup`/目录操作/
+  块分配器/`mkfs`。`FsType::Ext2` 这个枚举变体除了定义处和 `do_unlink` 里
+  一句 `FsType::Ext2 => ENOSYS, // TODO` 之外全树没人用。对比 minix：1250 行
+  + 12 处 VFS 分发点，是唯一能挂的磁盘文件系统。
+  「换成 ext4」不是配置开关，是一个与刚做完的系统调用工作量相当的独立模块：
+  extent 树查找 + 目录操作 + 块组/位图分配 + mkfs，外加把 ramdisk 从 256KB
+  扩到几 MB（`mkfs.ext4` 的元数据放不进 256KB）并写一个本树没有的 `rd_load()`
+  把宿主造好的镜像搬进 ramdisk 的动态页
+
+**所以下一阶段（然后）:** 移植信号与进程生命周期 —— `kernel/signal.c` 的信号投递/`sigaction`、
 `kernel/exit.c` 的 `do_exit`/`sys_waitpid` 收尸链、`kernel/fork.c` 的真正
 `sys_fork`。这三者互相咬合，且是把现有调度器接到用户态的前提。
+
+**系统调用侧的接续点已经标好了**：`sys.rs` 里 89 个占位实现每个都注明缺哪个
+子系统。信号那批（`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`rt_sigpending`/
+`rt_sigtimedwait`/`rt_sigqueueinfo`/`rt_sigsuspend`/`sigaltstack`）就是这一阶段
+要填的；`restart_syscall` 依赖 `ERESTART*` 的回绕逻辑，一并做。
+`pselect6`/`ppoll`/`epoll_pwait` 等「带信号屏蔽的等待」也在信号到位后才好转发。
 
 ### Acceptance criteria
 1. `send_sig(SIGSEGV, ...)` 能真正投递：用户态触发 page fault 后进程被杀而不是只打一行日志
@@ -103,9 +205,9 @@ dump），而不是继续加断言。护栏已就位，不要删。
 ### Files to create / edit
 | Type | File | Content |
 |---|---|---|
-| new | `src/signal.rs` | `sigaction`/`sigset`/`send_sig`/`do_signal`（原版 `kernel/signal.c`）|
-| new | `src/exit.rs` | `do_exit`/`sys_waitpid`/`notify_parent`/`release`（原版 `kernel/exit.c`）|
-| new | `src/fork.rs` | `sys_fork`/`copy_process`（原版 `kernel/fork.c`）|
+| edit | `src/signal.rs`（已存在，缺用户态栈帧）| `sigaction`/`sigset`/`send_sig`/`do_signal`（原版 `kernel/signal.c`）|
+| edit | `src/exit.rs`（已存在，缺收尸链）| `do_exit`/`sys_waitpid`/`notify_parent`/`release`（原版 `kernel/exit.c`）|
+| new | `src/fork.rs` | `sys_fork`/`copy_process`（原版 `kernel/fork.c`）；同时把 `sys::clone` 的 flags 语义接上 |
 | edit | `src/mm/paging.rs` | 加 `copy_page_tables`/`clone_page_tables`（原版 `mm/memory.c`）|
 | edit | `boot/entry.S` | `ret_from_sys_call` 里插 `do_signal` 调用（原版 `signal_return` 那段）|
 | edit | `src/traps.rs` | 把 `send_sig_stub` 换成真的 `send_sig` |
@@ -139,11 +241,11 @@ dump），而不是继续加断言。护栏已就位，不要删。
 ## 📁 Active architecture
 
 - **Stack:** Rust `#![no_std]` + edition 2024 + **nightly**（`rust-toolchain.toml` 固定），crate-type = `staticlib`，依赖 `x86_64` 0.15；GNU as + ld；QEMU x86_64
-- **Key modules:** `src/lib.rs`(入口) / `src/console.rs`(VGA) / `src/serial.rs`(COM1) / `src/e820.rs` / `src/mm/`(page, page_alloc, kmalloc, paging) / `src/klib/`(ctype, string, errno, vsprintf, printk) / `src/desc.rs`(GDT/TSS/IDT) / `src/traps.rs` / `src/irq.rs` / `src/sched/`(task, mod) / `src/syscall/`(mod, sys) / `boot/*.S`(bootsect, setup, head, **entry**) + `boot/*.ld`
+- **Key modules:** `src/lib.rs`(入口) / `src/console.rs`(VGA) / `src/serial.rs`(COM1) / `src/e820.rs` / `src/mm/`(page, page_alloc, kmalloc, paging) / `src/klib/`(ctype, string, errno, vsprintf, printk) / `src/desc.rs`(GDT/TSS/IDT) / `src/traps.rs` / `src/irq.rs` / `src/sched/`(task, mod) / `src/syscall/`(mod=nr 表+分发表, sys=341 个实现) / `boot/*.S`(bootsect, setup, head, **entry**) + `boot/*.ld`
 - **陷入/返回 ABI:** `boot/entry.S` 的 `SAVE_ALL` 压栈顺序 == `src/traps.rs` 的 `PtRegs` 字段顺序，改一侧必须同步另一侧。`orig_rax` 格三用途：系统调用号 / 异常错误码 / `!irq`
 - **段选择子:** KERNEL_CS=0x08 KERNEL_DS=0x10 USER_CS=0x1B USER_DS=0x23 TSS=0x28（entry.S 里有同名 .set 常量，必须一致）
 - **中断向量:** 0-20 异常（2/8/14 走 IST）、0x20-0x2F 是 PIC 重映射后的 IRQ0-15、0x80 是 int 0x80
-- **系统调用约定:** 号在 rax，参数 rdi/rsi/rdx/r10/r8/r9（r10 而非 rcx，为兼容 syscall 指令）
+- **系统调用约定:** 号在 rax，参数 rdi/rsi/rdx/r10/r8/r9（r10 而非 rcx，为兼容 syscall 指令）。**调用号用 x86_64 正式表**，加新号照 `syscall_64.tbl` 逐号填，不要按功能分组手写（重号会静默覆盖，见 bug-026）
 - **物理内存约定:** 低 1MB 永久保留（启动期结构）；`mem_map` 放 0x100000 起；可管理内存 clamp 到 1GB（setup.S 的恒等映射上限）
 - **Patterns:**
   - 每个 `unsafe` 块上方写 `// SAFETY:`；`unsafe fn` 写 `# Safety` 文档段

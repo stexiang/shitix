@@ -88,6 +88,16 @@ pub unsafe fn sys_open(path: &[u8], flags: u32, m: u16) -> i64 {
             }
         };
 
+        // 用裸指针避免产生多个 &mut 别名（buglog bug-029 根因）
+        let i_ptr = inode::inode_ptr(n);
+        let (i_op, i_rdev, i_size) = unsafe {
+            (
+                core::ptr::addr_of!((*i_ptr).i_op).read_volatile(),
+                core::ptr::addr_of!((*i_ptr).i_rdev).read_volatile(),
+                core::ptr::addr_of!((*i_ptr).i_size).read_volatile(),
+            )
+        };
+
         {
             let fp = filp(f);
             fp.f_flags = flags;
@@ -97,14 +107,14 @@ pub unsafe fn sys_open(path: &[u8], flags: u32, m: u16) -> i64 {
             fp.f_inode = n;
             fp.f_pos = 0;
             fp.f_reada = 0;
-            fp.f_rdev = inode::inode(n).i_rdev;
+            fp.f_rdev = i_rdev;
         }
 
         // 设备文件要走驱动的 open（原版 chrdev_open/blkdev_open，
         // 由 def_chr_fops.open 转过来）
-        let r = match inode::inode(n).i_op {
-            FsType::Chr => super::devices::chrdev_open(inode::inode(n).i_rdev),
-            FsType::Blk => super::devices::blkdev_open(inode::inode(n).i_rdev),
+        let r = match i_op {
+            FsType::Chr => super::devices::chrdev_open(i_rdev),
+            FsType::Blk => super::devices::blkdev_open(i_rdev),
             FsType::Minix => 0,
             FsType::Ext2 => 0, // TODO: ext2 open
             FsType::None => -(EINVAL as i64),
@@ -120,7 +130,7 @@ pub unsafe fn sys_open(path: &[u8], flags: u32, m: u16) -> i64 {
         // O_APPEND：位置直接到末尾（原版在 sys_write 里每次都重取，
         // 见 read_write.rs 的注释）
         if flags & oflags::O_APPEND != 0 {
-            filp(f).f_pos = inode::inode(n).i_size as u64;
+            filp(f).f_pos = i_size as u64;
         }
         fd as i64
     }
@@ -217,7 +227,9 @@ pub unsafe fn sys_chdir(path: &[u8]) -> i64 {
             Ok(n) => n,
             Err(e) => return -(e as i64),
         };
-        if !mode::is_dir(inode::inode(n).i_mode) {
+        // 用裸指针避免多个 &mut 别名
+        let i_mode = core::ptr::addr_of!((*inode::inode_ptr(n)).i_mode).read_volatile();
+        if !mode::is_dir(i_mode) {
             inode::iput(n);
             return -(ENOTDIR as i64);
         }
@@ -247,17 +259,25 @@ pub unsafe fn sys_chmod(path: &[u8], m: u16) -> i64 {
             Ok(n) => n,
             Err(e) => return -(e as i64),
         };
-        if inode::inode(n).is_rdonly() {
-            inode::iput(n);
-            return -(EROFS as i64);
+        // 全程用裸指针，避免 &mut 别名 UB
+        let i_ptr = inode::inode_ptr(n);
+        let i_sb = core::ptr::addr_of!((*i_ptr).i_sb).read_volatile();
+        if i_sb != NIL {
+            let sb_flags = core::ptr::addr_of!((*super_block::sb_ptr(i_sb)).s_flags).read_volatile();
+            if sb_flags & crate::fs::MS_RDONLY != 0 {
+                inode::iput(n);
+                return -(EROFS as i64);
+            }
         }
         // 原版：`if (current->euid != inode->i_uid && !suser())
         //          { iput(inode); return -EPERM; }`
         // 没有 euid（见 namei.rs 文档第 3 点），等价于 suser() 恒真。
-        let i = inode::inode(n);
-        i.i_mode = (m & 0o7777) | (i.i_mode & mode::S_IFMT);
-        i.i_ctime = crate::sched::current_time();
-        i.i_dirt = true;
+        let old_mode = core::ptr::addr_of!((*i_ptr).i_mode).read_volatile();
+        let new_mode = (m & 0o7777) | (old_mode & mode::S_IFMT);
+        let now = crate::sched::current_time();
+        core::ptr::addr_of_mut!((*i_ptr).i_mode).write_volatile(new_mode);
+        core::ptr::addr_of_mut!((*i_ptr).i_ctime).write_volatile(now);
+        core::ptr::addr_of_mut!((*i_ptr).i_dirt).write_volatile(true);
         inode::iput(n);
         0
     }
@@ -274,7 +294,13 @@ pub unsafe fn sys_truncate(path: &[u8], length: u32) -> i64 {
             Ok(n) => n,
             Err(e) => return -(e as i64),
         };
-        if mode::is_dir(inode::inode(n).i_mode) {
+        // 全程用裸指针，避免 &mut 别名 UB（bug-029）
+        let i_ptr = inode::inode_ptr(n);
+        let (i_mode, i_op) = (
+            core::ptr::addr_of!((*i_ptr).i_mode).read_volatile(),
+            core::ptr::addr_of!((*i_ptr).i_op).read_volatile(),
+        );
+        if mode::is_dir(i_mode) {
             inode::iput(n);
             return -(EINVAL as i64);
         }
@@ -282,14 +308,15 @@ pub unsafe fn sys_truncate(path: &[u8], length: u32) -> i64 {
             inode::iput(n);
             return -(EINVAL as i64);
         }
-        inode::inode(n).i_size = length;
-        if (*inode::inode_ptr(n)).i_op == FsType::Minix {
+        // 修改 inode 字段全用 write_volatile
+        let now = crate::sched::current_time();
+        core::ptr::addr_of_mut!((*i_ptr).i_size).write_volatile(length);
+        core::ptr::addr_of_mut!((*i_ptr).i_mtime).write_volatile(now);
+        core::ptr::addr_of_mut!((*i_ptr).i_ctime).write_volatile(now);
+        core::ptr::addr_of_mut!((*i_ptr).i_dirt).write_volatile(true);
+        if i_op == FsType::Minix {
             super::minix::truncate::truncate(n);
         }
-        let i = inode::inode(n);
-        i.i_mtime = crate::sched::current_time();
-        i.i_ctime = i.i_mtime;
-        i.i_dirt = true;
         inode::iput(n);
         0
     }

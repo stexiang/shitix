@@ -92,6 +92,109 @@ pub struct Stat {
     pub _unused: [i64; 3],
 }
 
+// =============================================================================
+// 用户指针访问的临时护栏
+//
+// 原版靠 `verify_area(VERIFY_READ/WRITE, ptr, len)` + 段限长挡住越界；本树还没
+// 有 `vm_area_struct`（见 STATUS 的 Open decisions），做不到真正的按 VMA 校验。
+// 折中办法：只接受落在恒等映射低 1GB 内的地址——这段在 `boot/setup.S` 里被
+// 2MB 大页整体映射过，读写不会触发 page fault，所以「坏指针把内核打挂」这类
+// 后果被挡住了。**但它挡不住「用户态读写内核内存」**，等 mmap 到位后必须换成
+// 真的 `verify_area`。这是已知的安全缺口，不是最终形态。
+// =============================================================================
+
+/// 恒等映射上限。与 `boot/setup.S` 建的页表一致，也与
+/// `drivers/char_dev/mem.rs` 的 `IDENTITY_LIMIT` 同源。
+const IDENTITY_LIMIT: u64 = 1 << 30;
+
+/// 校验 `[ptr, ptr+len)` 落在恒等映射内。对应原版 `verify_area()` 的位置，
+/// 但强度弱得多，见上面的说明。
+fn check_range(ptr: u64, len: u64) -> bool {
+    ptr != 0 && len <= IDENTITY_LIMIT && ptr.checked_add(len).is_some_and(|e| e <= IDENTITY_LIMIT)
+}
+
+/// 把用户传来的路径指针借成字节切片，顺带做 [`check_range`] 校验。
+///
+/// 长度上限取 `PATH_MAX`(4096)，避免坏指针上 `strlen` 一路扫到映射边界。
+///
+/// # Safety
+/// 返回的切片只在本次系统调用期间使用；调用方不得让它逃出去。
+unsafe fn user_path<'a>(ptr: u64) -> Result<&'a [u8], i64> {
+    if !check_range(ptr, 1) {
+        return Err(-(EFAULT as i64));
+    }
+    // SAFETY: check_range 保证起始地址在恒等映射内可读；strnlen 有上界，
+    // 不会越过 PATH_MAX 继续扫。
+    let n = unsafe { crate::klib::string::strnlen(ptr as *const u8, 4096) };
+    if n == 0 || n >= 4096 {
+        return Err(-(EINVAL as i64));
+    }
+    if !check_range(ptr, n as u64) {
+        return Err(-(EFAULT as i64));
+    }
+    // SAFETY: 同上，n 是刚量出来的长度，整段可读。
+    Ok(unsafe { core::slice::from_raw_parts(ptr as *const u8, n) })
+}
+
+/// 把用户缓冲区借成可写切片，带 [`check_range`] 校验。
+///
+/// # Safety
+/// 同 [`user_path`]。
+unsafe fn user_buf_mut<'a>(ptr: u64, len: u64) -> Result<&'a mut [u8], i64> {
+    if len == 0 {
+        return Ok(&mut []);
+    }
+    if !check_range(ptr, len) {
+        return Err(-(EFAULT as i64));
+    }
+    // SAFETY: check_range 保证整段在恒等映射内可读写。
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) })
+}
+
+/// 把用户缓冲区借成只读切片，带 [`check_range`] 校验。
+///
+/// # Safety
+/// 同 [`user_path`]。
+unsafe fn user_buf<'a>(ptr: u64, len: u64) -> Result<&'a [u8], i64> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if !check_range(ptr, len) {
+        return Err(-(EFAULT as i64));
+    }
+    // SAFETY: 同上。
+    Ok(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
+}
+
+/// 校验并借出用户态的 `struct stat` 缓冲区，再把 fs 层的结果写进去。
+///
+/// 单独抽出来是因为 `stat`/`lstat`/`fstat` 三个都要做同一件事，而
+/// `Stat` 有对齐要求，不能像字节缓冲那样直接 `from_raw_parts`。
+///
+/// # Safety
+/// 同 [`user_path`]：借出的引用不得逃出本次系统调用。
+unsafe fn user_stat_out(
+    ptr: u64,
+    f: impl FnOnce(&mut crate::fs::stat::Stat) -> i64,
+) -> i64 {
+    let need = core::mem::size_of::<crate::fs::stat::Stat>() as u64;
+    if !check_range(ptr, need) {
+        return -(EFAULT as i64);
+    }
+    // 先填一份内核栈上的副本，成功了再整体拷回去——避免 fs 层中途出错
+    // 时留下半个写坏的结构（原版靠 verify_area 先校验、cp_new_stat 直接
+    // 往用户内存写，本树没有校验所以改成两步）。
+    let mut tmp = crate::fs::stat::Stat::zeroed();
+    let r = f(&mut tmp);
+    if r < 0 {
+        return r;
+    }
+    // SAFETY: check_range 已确认目标落在恒等映射内可写；用 unaligned 写
+    // 是因为用户传来的指针不保证满足 Stat 的对齐要求。
+    unsafe { (ptr as *mut crate::fs::stat::Stat).write_unaligned(tmp) };
+    r
+}
+
 /// 未实现的调用。对应原版 `sched.c:sys_ni_syscall()`，同样返回 `-EINVAL`。
 ///
 /// 原版返回 `-EINVAL` 而不是 `-ENOSYS` 有点反直觉，但那是 1.0.9 的实际行为，
@@ -217,35 +320,45 @@ pub fn times(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// fd 0 或其他值返回 `-EINVAL`（原版是 `-EBADF`，但那需要 file 表才能区分
 /// 「无效 fd」和「未打开」，暂时统一）。
 pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let (fd, buf, count) = (args.a0, args.a1 as *const u8, args.a2 as usize);
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    // SAFETY: user_buf 已校验范围。
+    let buf = match unsafe { user_buf(args.a1, args.a2) } {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if buf.is_empty() {
+        return 0;
+    }
+
+    // 先走 fs 层：fd 真的 open 过就写文件/设备。
+    // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
+    let r = unsafe { crate::fs::read_write::write(fd as usize, buf) };
+    if r != -(EBADF as i64) {
+        return r;
+    }
+
+    // fd 1/2 尚未 open 过就退回内核控制台。原版不需要这条路径（init 在
+    // 用户态第一件事就是 open("/dev/tty0")），本树的自检和早期用户态还
+    // 没有文件系统里的 stdout，所以留一条兜底。
     if fd != 1 && fd != 2 {
-        return -(EINVAL as i64);
+        return -(EBADF as i64);
     }
-    if buf.is_null() {
-        return -(EFAULT as i64);
-    }
-    // 没有 verify_area，所以只接受内核地址（恒等映射的低 1GB 内）。
-    // 用户态传进来的地址将来要经 verify_area 校验。
-    if (buf as u64) >= (1 << 30) {
-        return -(EFAULT as i64);
-    }
-    // SAFETY: 上面已确认 buf 非空且落在恒等映射的低 1GB 内；count 由调用方
-    // 保证不越过该缓冲区（暂无 verify_area 可校验，这是已知的待补项）。
-    let bytes = unsafe { core::slice::from_raw_parts(buf, count) };
-    match core::str::from_utf8(bytes) {
+    match core::str::from_utf8(buf) {
         Ok(s) => {
             crate::print!("{}", s);
             crate::serial::print(s);
-            count as i64
         }
         // 非 UTF-8 就逐字节送，保持 write(2) 的字节流语义
         Err(_) => {
-            for &b in bytes {
+            for &b in buf {
                 crate::print!("{}", b as char);
             }
-            count as i64
         }
     }
+    buf.len() as i64
 }
 
 /// 退出当前进程。对应原版 `exit.c:sys_exit()` → `do_exit()`。
@@ -353,30 +466,20 @@ pub fn getbrk(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// - a1: 缓冲区地址
 /// - a2: 读取字节数
 pub fn read(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let (fd, buf, count) = (args.a0 as i32, args.a1 as *mut u8, args.a2 as usize);
-    
-    if buf.is_null() {
-        return -(EFAULT as i64);
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
     }
-    
-    if count == 0 {
+    // SAFETY: user_buf_mut 已校验范围。
+    let buf = match unsafe { user_buf_mut(args.a1, args.a2) } {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if buf.is_empty() {
         return 0;
     }
-    
-    // TODO: 集成 fs/file_table.rs
-    // 目前只支持标准文件描述符
-    match fd {
-        0 => {
-            // stdin - 目前不支持
-            crate::pr_warn!("sys_read: stdin not implemented");
-            -(ENOSYS as i64)
-        }
-        1 | 2 => {
-            // stdout/stderr - 不支持读取
-            -(EINVAL as i64)
-        }
-        _ => -(EINVAL as i64),
-    }
+    // SAFETY: 同 [`open`]，fs 层会睡。
+    unsafe { crate::fs::read_write::read(fd as usize, buf) }
 }
 
 /// 打开文件。对应原版 `fs/open.c:sys_open()`。
@@ -386,82 +489,67 @@ pub fn read(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// - a1: 标志 (O_RDONLY, O_WRONLY, etc.)
 /// - a2: 模式
 pub fn open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let flags = args.a1 as u32;
-    let mode = args.a2 as u32;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs/namei.rs 和 fs/open.rs
-    // 目前返回 ENOSYS 表示未实现
-    crate::pr_warn!("sys_open: not fully implemented, flags=0x{:x}", flags);
-    -(ENOSYS as i64)
+    // SAFETY: user_path 已校验范围；fs 层自己处理不存在/权限。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 系统调用上下文，fs 层会睡（getblk/wait_on_buffer），
+    // 所以只能在有 current 的任务里调——系统调用天然满足。
+    unsafe { crate::fs::open::sys_open(path, args.a1 as u32, args.a2 as u16) }
 }
 
 /// 关闭文件。对应原版 `fs/open.c:sys_close()`。
 pub fn close(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let fd = args.a0 as i32;
-    
+    let fd = args.a0 as i64;
     if fd < 0 {
         return -(EBADF as i64);
     }
-    
-    // TODO: 关闭文件描述符
-    0
+    // SAFETY: fs 层校验 fd 是否真的打开着，未打开返回 -EBADF。
+    unsafe { crate::fs::open::sys_close(fd as usize) }
 }
 
 /// 创建文件。对应原版 `fs/open.c:sys_creat()`。
 pub fn creat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let mode = args.a1 as u32;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    crate::pr_warn!("sys_creat: not implemented, mode=0o{:o}", mode);
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::open::sys_creat(path, args.a1 as u16) }
 }
 
 /// 文件状态。对应原版 `fs/stat.c:sys_stat()`。
 pub fn stat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let statbuf = args.a1 as *mut u8;
-    
-    if pathname.is_null() || statbuf.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs/stat.rs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]；out 的范围由 user_stat_out 校验。
+    unsafe { user_stat_out(args.a1, |out| crate::fs::stat::sys_stat(path, out)) }
 }
 
 /// 文件状态（lstat，不跟随符号链接）。对应原版 `fs/stat.c:sys_lstat()`。
 pub fn lstat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let statbuf = args.a1 as *mut u8;
-    
-    if pathname.is_null() || statbuf.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`stat`]。
+    unsafe { user_stat_out(args.a1, |out| crate::fs::stat::sys_lstat(path, out)) }
 }
 
 /// fstat - 文件状态（通过 fd）。对应原版 `fs/stat.c:sys_fstat()`。
 pub fn fstat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let fd = args.a0 as i32;
-    let statbuf = args.a1 as *mut u8;
-    
-    if fd < 0 || statbuf.is_null() {
-        return -(EFAULT as i64);
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
     }
-    
-    // TODO: 集成 fs/file_table.rs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`stat`]。
+    unsafe { user_stat_out(args.a1, |out| crate::fs::stat::sys_fstat(fd as usize, out)) }
 }
 
 /// 内存映射。对应原版 `mm/mmap.c:sys_mmap()`。
@@ -546,14 +634,13 @@ pub fn getcwd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 改变当前工作目录。对应原版 `fs/open.c:sys_chdir()`。
 pub fn chdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let path = args.a0 as *const u8;
-    
-    if path.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::open::sys_chdir(path) }
 }
 
 /// 重命名。对应原版 `fs/namei.c:sys_rename()`。
@@ -571,39 +658,35 @@ pub fn rename(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 删除文件。对应原版 `fs/namei.c:sys_unlink()`。
 pub fn unlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::namei::do_unlink(path) }
 }
 
 /// 创建目录。对应原版 `fs/namei.c:sys_mkdir()`。
 pub fn mkdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let mode = args.a1 as u32;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::namei::do_mkdir(path, args.a1 as u16) }
 }
 
 /// 删除目录。对应原版 `fs/namei.c:sys_rmdir()`。
 pub fn rmdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::namei::do_rmdir(path) }
 }
 
 /// 创建符号链接。对应原版 `fs/namei.c:sys_symlink()`。
@@ -635,27 +718,22 @@ pub fn readlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 复制文件描述符。对应原版 `fs/fcntl.c:sys_dup()`。
 pub fn dup(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let oldfd = args.a0 as i32;
-    
-    if oldfd < 0 {
+    let fd = args.a0 as i64;
+    if fd < 0 {
         return -(EBADF as i64);
     }
-    
-    // TODO: 集成 fs/file_table.rs
-    -(ENOSYS as i64)
+    // SAFETY: fs 层校验 fd。
+    unsafe { crate::fs::open::sys_dup(fd as usize) }
 }
 
 /// 复制文件描述符（指定新 fd）。对应原版 `fs/fcntl.c:sys_dup2()`。
 pub fn dup2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let oldfd = args.a0 as i32;
-    let newfd = args.a1 as i32;
-    
-    if oldfd < 0 || newfd < 0 {
+    let (old, new) = (args.a0 as i64, args.a1 as i64);
+    if old < 0 || new < 0 {
         return -(EBADF as i64);
     }
-    
-    // TODO: 集成 fs/file_table.rs
-    -(ENOSYS as i64)
+    // SAFETY: fs 层校验两个 fd。
+    unsafe { crate::fs::open::sys_dup2(old as usize, new as usize) }
 }
 
 /// 文件控制。对应原版 `fs/fcntl.c:sys_fcntl()`。
@@ -724,30 +802,24 @@ pub fn pipe(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 创建特殊文件（设备/管道）。对应原版 `fs/namei.c:sys_mknod()`。
 pub fn mknod(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let mode = args.a1 as u32;
-    let dev = args.a2 as u32;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    crate::pr_warn!("sys_mknod: mode=0o{:o}, dev=0x{:x}", mode, dev);
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::namei::do_mknod(path, args.a1 as u16, args.a2 as u16) }
 }
 
 /// 改变权限。对应原版 `fs/open.c:sys_chmod()`。
 pub fn chmod(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let pathname = args.a0 as *const u8;
-    let mode = args.a1 as u32;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
-    }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::open::sys_chmod(path, args.a1 as u16) }
 }
 
 /// 改变所有者。对应原版 `fs/open.c:sys_chown()`。
@@ -818,15 +890,56 @@ pub fn setsid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 同步文件系统。
 pub fn sync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 文件同步。
-pub fn fsync(args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn fsync(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    // SAFETY: fs 层校验 fd。
+    unsafe { crate::fs::read_write::fsync(fd as usize) }
+}
 /// 设置文件长度。
-pub fn truncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn truncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::open::sys_truncate(path, args.a1 as u32) }
+}
 /// 设置文件长度（ftruncate）。
 pub fn ftruncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 获取目录项。
-pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    let need = core::mem::size_of::<crate::fs::Dirent>() as u64;
+    if args.a2 < need {
+        return -(EINVAL as i64);
+    }
+    if !check_range(args.a1, need) {
+        return -(EFAULT as i64);
+    }
+    // 一次只返回一项：fs 层的 readdir 就是单项语义（原版 1.0.9 的
+    // `sys_readdir` 同样一次一项，getdents 是 1.2 之后才有的批量接口）。
+    let mut d = crate::fs::Dirent { d_ino: 0, d_off: 0, d_reclen: need as u16, d_name: [0; 32] };
+    // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
+    let r = unsafe { crate::fs::read_write::readdir(fd as usize, &mut d) };
+    if r <= 0 {
+        return r;
+    }
+    // SAFETY: check_range 已确认目标落在恒等映射内可写。
+    unsafe { (args.a1 as *mut crate::fs::Dirent).write_unaligned(d) };
+    need as i64
+}
 /// 获取目录项64。
-pub fn getdents64(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn getdents64(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    // 本树的 Dirent 已经是 64 位字段（d_ino: u64），两者布局一致。
+    getdents(args, regs)
+}
 /// 文件描述符控制。
 pub fn fchdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 获取 umask。
@@ -1206,3 +1319,460 @@ pub fn membarrier(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64)
 pub fn clock_adjtime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn setns(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn rseq(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+
+// =============================================================================
+// 补齐 x86_64 正式调用号 0..=334 的空洞（对应 `arch/x86/entry/syscalls/
+// syscall_64.tbl`）。这一段的目标是让调用号连续排满，用户态拿到的是
+// `-ENOSYS`/合理默认值而不是「越界」——真正的实现随对应子系统移植逐个替换。
+//
+// 分三类：
+// 1. 能靠现有子系统真做的（lseek / readv / writev / sched_yield / …）；
+// 2. 有合理默认值的（getgroups 返回 0、madvise 是建议可忽略、…）；
+// 3. 纯占位返回 `-ENOSYS`（信号 rt_* 系列、POSIX 定时器、mq_*、futex、…）。
+// =============================================================================
+
+/// 移动文件读写位置。对应原版 `fs/read_write.c:sys_lseek()`。
+/// 直接转给 [`crate::fs::read_write::lseek`]。
+pub fn lseek(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: fs 层自己校验 fd，越界/未打开返回 -EBADF。
+    unsafe { crate::fs::read_write::lseek(args.a0 as usize, args.a1 as i64, args.a2 as u32) }
+}
+
+/// 分散读。对应原版 1.0.9 之后才有的 `sys_readv()`。
+/// 拆成对每个 iovec 调一次 [`read`]，短读即停（与原版语义一致）。
+pub fn readv(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    iov_loop(args, regs, read)
+}
+
+/// 分散写。对应 `sys_writev()`，实现方式同 [`readv`]。
+pub fn writev(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    iov_loop(args, regs, write)
+}
+
+/// `struct iovec`。字段顺序与 x86_64 ABI 一致。
+#[repr(C)]
+struct IoVec {
+    base: u64,
+    len: u64,
+}
+
+/// `readv`/`writev` 的公共循环。
+fn iov_loop(args: &SysArgs, regs: &mut PtRegs, f: fn(&SysArgs, &mut PtRegs) -> i64) -> i64 {
+    let (fd, iov, cnt) = (args.a0, args.a1 as *const IoVec, args.a2 as usize);
+    if iov.is_null() {
+        return -(EFAULT as i64);
+    }
+    // 原版 UIO_MAXIOV = 1024
+    if cnt > 1024 {
+        return -(EINVAL as i64);
+    }
+    let mut total: i64 = 0;
+    for i in 0..cnt {
+        // SAFETY: 缺 verify_area，这里和 sys_write 一样只能信任调用方；
+        // 等 mm/mmap.c 的 vm_area_struct 到位后加校验。
+        let v = unsafe { &*iov.add(i) };
+        if v.len == 0 {
+            continue;
+        }
+        let sub = SysArgs { a0: fd, a1: v.base, a2: v.len, a3: 0, a4: 0, a5: 0 };
+        let r = f(&sub, regs);
+        if r < 0 {
+            return if total > 0 { total } else { r };
+        }
+        total += r;
+        // 短读/短写：不再继续下一个 iovec
+        if (r as u64) < v.len {
+            break;
+        }
+    }
+    total
+}
+
+/// 主动让出 CPU。对应原版没有（1.0.9 无 `sched_yield`），语义等价于
+/// 直接调一次 `schedule()`。
+pub fn sched_yield(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 系统调用上下文，不在中断里，可以安全切换。
+    unsafe { sched::schedule() };
+    0
+}
+
+/// 返回线程 ID。本树没有线程，tid == pid（原版 1.0.9 同样没有）。
+pub fn gettid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 系统调用上下文里 current 必然有效。
+    unsafe { sched::current() }.pid as i64
+}
+
+/// 秒级时间。对应原版 `kernel/time.c:sys_time()`。
+/// 没有 RTC 驱动，用 jiffies/HZ 当作开机以来的秒数。
+pub fn time(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let secs = (sched::jiffies() / crate::sched::task::HZ) as i64;
+    let p = args.a0 as *mut i64;
+    if !p.is_null() {
+        // SAFETY: 缺 verify_area，同 sys_write 的限制。
+        unsafe { p.write_volatile(secs) };
+    }
+    secs
+}
+
+/// 退出整个线程组。没有线程组，退化成 [`exit`]。
+pub fn exit_group(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    exit(args, regs)
+}
+
+/// 按 tid 发信号。没有线程，等价于按 pid 发（转给 [`kill`]）。
+pub fn tkill(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    kill(args, regs)
+}
+
+/// 按 tgid+tid 发信号。同 [`tkill`]，忽略 tgid。
+pub fn tgkill(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    let sub = SysArgs { a0: args.a1, a1: args.a2, a2: 0, a3: 0, a4: 0, a5: 0 };
+    kill(&sub, regs)
+}
+
+/// 建立硬链接。对应原版 `fs/namei.c:sys_link()`。
+/// minix 层的 link 还没接出来，先返回 `-ENOSYS`。
+pub fn link(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 同 [`open`]，两个路径各自校验。
+    let old = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同上。
+    let new = match unsafe { user_path(args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::namei::do_link(old, new) }
+}
+
+// --- 有合理默认值的一批 -------------------------------------------------------
+
+/// 建议内核的页面使用方式。建议性调用，忽略即合法（原版无）。
+pub fn madvise(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 查询页面是否驻留。没有换页，全部驻留 → 直接返回成功。
+pub fn mincore(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 预读提示。无预读机制，忽略。
+pub fn readahead(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 文件访问模式提示。同 [`madvise`]，忽略。
+pub fn fadvise64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 数据同步（不含元数据）。缓冲缓存是写回的，转给 [`fsync`]。
+pub fn fdatasync(args: &SysArgs, regs: &mut PtRegs) -> i64 { fsync(args, regs) }
+/// 文件加锁。单进程内核，无竞争 → 直接成功。
+pub fn flock(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件权限（按 fd）。minix 层还没接 chmod，先当成功。
+pub fn fchmod(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件属主（不跟随符号链接）。同 [`chown`] 的限制。
+pub fn lchown(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件时间戳。没有 RTC，忽略。
+pub fn utime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件时间戳（μs 精度）。同 [`utime`]。
+pub fn utimes(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件时间戳（ns 精度 + dirfd）。同 [`utime`]。
+pub fn utimensat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件时间戳（dirfd 版）。同 [`utime`]。
+pub fn futimesat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+
+/// 取附加组列表。没有组机制，返回 0 个组（原版 `sys.c:sys_getgroups()`
+/// 在 NGROUPS 为空时同样返回 0）。
+pub fn getgroups(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置附加组列表。需要 root，本树无 uid 概念 → `-EPERM`。
+pub fn setgroups(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置真实/有效 uid。同 [`setuid`] 的限制。
+pub fn setreuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置真实/有效 gid。同上。
+pub fn setregid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置真实/有效/保存 uid。同上。
+pub fn setresuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置真实/有效/保存 gid。同上。
+pub fn setresgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+/// 设置文件系统 uid。返回旧值（恒为 0），与原版「返回旧 fsuid」一致。
+pub fn setfsuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置文件系统 gid。同 [`setfsuid`]。
+pub fn setfsgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 取真实/有效/保存 uid。三个都是 0，写回三个指针。
+pub fn getresuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { put_triple(args, 0) }
+/// 取真实/有效/保存 gid。同 [`getresuid`]。
+pub fn getresgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { put_triple(args, 0) }
+
+/// `getresuid`/`getresgid` 的公共写回。
+fn put_triple(args: &SysArgs, v: u32) -> i64 {
+    for p in [args.a0, args.a1, args.a2] {
+        let p = p as *mut u32;
+        if p.is_null() {
+            return -(EFAULT as i64);
+        }
+        // SAFETY: 缺 verify_area，同 sys_write 的限制。
+        unsafe { p.write_volatile(v) };
+    }
+    0
+}
+
+/// 取进程组。a0 == 0 表示当前进程；本树只支持当前进程。
+pub fn getpgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    if args.a0 != 0 {
+        return -(ENOSYS as i64);
+    }
+    // SAFETY: 系统调用上下文里 current 必然有效。
+    unsafe { sched::current() }.pgrp as i64
+}
+
+/// 取会话 ID。限制同 [`getpgid`]。
+pub fn getsid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    if args.a0 != 0 {
+        return -(ENOSYS as i64);
+    }
+    // SAFETY: 同上。
+    unsafe { sched::current() }.session as i64
+}
+
+/// 设资源限制。没有 rlimit 强制机制，接受但不生效。
+pub fn setrlimit(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 调度参数（优先级）。本树的 nice 值在 `getpriority`/`setpriority` 里，
+/// 这四个 POSIX 实时调度接口没有对应实现。
+pub fn sched_setparam(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取调度参数。同 [`sched_setparam`]。
+pub fn sched_getparam(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设调度策略。只有 SCHED_OTHER，改成别的都拒绝。
+pub fn sched_setscheduler(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EINVAL as i64) }
+/// 取调度策略。恒为 SCHED_OTHER(0)。
+pub fn sched_getscheduler(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 实时优先级上限。SCHED_OTHER 下为 0。
+pub fn sched_get_priority_max(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 实时优先级下限。同上。
+pub fn sched_get_priority_min(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 取 RR 时间片。没有 SCHED_RR。
+pub fn sched_rr_get_interval(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取/设 CPU 亲和性。单核，掩码恒为 {0}。
+pub fn sched_getaffinity(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let p = args.a2 as *mut u64;
+    if p.is_null() {
+        return -(EFAULT as i64);
+    }
+    // SAFETY: 缺 verify_area，同 sys_write 的限制。
+    unsafe { p.write_volatile(1) };
+    8
+}
+/// 设 CPU 亲和性。单核，只能是 CPU0，任何掩码都当成功。
+pub fn sched_setaffinity(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+
+// --- 纯占位：对应子系统未移植，统一返回 -ENOSYS -----------------------------
+
+/// 安装信号处理函数（rt 版）。`src/signal.rs` 的 sigaction 还没接到用户态栈帧。
+pub fn rt_sigaction(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 改信号屏蔽字（rt 版）。同 [`rt_sigaction`]。
+pub fn rt_sigprocmask(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 从信号处理函数返回。需要 entry.S 里的信号栈帧，见 STATUS 的下一阶段。
+pub fn rt_sigreturn(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 指定偏移读，不改 f_pos。要先给 fs 层加一个不动 f_pos 的读路径。
+pub fn pread64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 指定偏移写，不改 f_pos。同 [`pread64`]。
+pub fn pwrite64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 内核内文件到文件的搬运。需要 fs 层的 splice 基础设施。
+pub fn sendfile(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 创建进程/线程。`sys_fork` 已有，clone 的 flags 语义（共享地址空间/文件表）还没有。
+pub fn clone(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 进程跟踪。需要 `arch_ptrace` 与调试寄存器支持。
+pub fn ptrace(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 读内核日志环。`klib::printk::read_log()` 已有，缺用户地址校验才好接。
+pub fn syslog(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取进程能力集。没有 capability 机制。
+pub fn capget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设进程能力集。同 [`capget`]。
+pub fn capset(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取待处理信号集（rt 版）。
+pub fn rt_sigpending(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带超时地等信号（rt 版）。
+pub fn rt_sigtimedwait(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带 siginfo 发信号。
+pub fn rt_sigqueueinfo(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 临时换屏蔽字并挂起。
+pub fn rt_sigsuspend(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置备用信号栈。
+pub fn sigaltstack(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 加载共享库（老式 a.out）。`src/elf/` 走的是现代路径，不打算实现。
+pub fn uselib(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置执行域。只有一种 personality。
+pub fn personality(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 文件系统统计（已废弃接口）。用 [`statfs`] 代替。
+pub fn ustat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 查询已注册的文件系统类型。`fs/devices.rs` 里还没有类型注册表。
+pub fn sysfs(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 改 LDT。`src/desc.rs` 只建了 GDT，没有 LDT。
+pub fn modify_ldt(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 换根挂载点。需要挂载树，现在只支持单个根。
+pub fn pivot_root(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 旧式 sysctl（已废弃）。
+pub fn sysctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 架构相关的进程控制（ARCH_SET_FS 等）。需要 per-task 的 FS/GS base。
+pub fn arch_prctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 调整系统时钟。没有 RTC 与 NTP 环路。
+pub fn adjtimex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 换根目录。需要 per-task 的 root inode。
+pub fn chroot(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 开启进程记账。
+pub fn acct(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置系统时间。没有 RTC。
+pub fn settimeofday(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 启用交换分区。没有换页子系统。
+pub fn swapon(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 关闭交换分区。同 [`swapon`]。
+pub fn swapoff(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 改 IOPL。会放开用户态端口访问，等有真用户态进程再说。
+pub fn iopl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 改 I/O 端口位图。需要 TSS 里的 I/O 位图。
+pub fn ioperm(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 装载模块（1.0.9 的老接口）。没有模块加载器。
+pub fn create_module(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取内核符号表。同 [`create_module`]。
+pub fn get_kernel_syms(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 查询模块信息。同 [`create_module`]。
+pub fn query_module(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 磁盘配额控制。minix 层没有配额。
+pub fn quotactl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// NFS 服务端控制（已从 Linux 移除）。
+pub fn nfsservctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// STREAMS 接口，Linux 从未实现，占号。
+pub fn getpmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// STREAMS 接口，Linux 从未实现，占号。
+pub fn putpmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// AFS 保留号，Linux 从未实现。
+pub fn afs_syscall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// TUX web 服务器保留号，已废弃。
+pub fn tuxcall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// LSM 保留号，Linux 从未实现。
+pub fn security(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 快速用户态互斥。需要 per-address 的等待队列哈希。
+pub fn futex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设 TLS 段（i386 遗留）。x86_64 用 [`arch_prctl`]。
+pub fn set_thread_area(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取 TLS 段（i386 遗留）。同上。
+pub fn get_thread_area(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// epoll 的废弃老接口，占号。
+pub fn epoll_ctl_old(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// epoll 的废弃老接口，占号。
+pub fn epoll_wait_old(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 重排文件映射（已废弃）。
+pub fn remap_file_pages(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 重启被信号打断的调用。需要 `ERESTART*` 的完整回绕逻辑。
+pub fn restart_syscall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 创建 POSIX 定时器。只有 itimer，没有 POSIX 定时器池。
+pub fn timer_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置 POSIX 定时器。同 [`timer_create`]。
+pub fn timer_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 读 POSIX 定时器。同 [`timer_create`]。
+pub fn timer_gettime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 读 POSIX 定时器溢出次数。同 [`timer_create`]。
+pub fn timer_getoverrun(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 删除 POSIX 定时器。同 [`timer_create`]。
+pub fn timer_delete(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// vserver 保留号，Linux 从未实现。
+pub fn vserver(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 打开 POSIX 消息队列。只有 SysV 消息队列。
+pub fn mq_open(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 删除 POSIX 消息队列。同 [`mq_open`]。
+pub fn mq_unlink(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带超时发送。同 [`mq_open`]。
+pub fn mq_timedsend(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带超时接收。同 [`mq_open`]。
+pub fn mq_timedreceive(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 注册消息到达通知。同 [`mq_open`]。
+pub fn mq_notify(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 读写队列属性。同 [`mq_open`]。
+pub fn mq_getsetattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 等子进程（可不收尸）。`wait4` 已有，WNOWAIT 语义还没有。
+pub fn waitid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设 I/O 优先级。`ll_rw_blk` 的请求队列没有优先级。
+pub fn ioprio_set(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取 I/O 优先级。同 [`ioprio_set`]。
+pub fn ioprio_get(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// `fstatat` 的正式名。需要 dirfd 相对解析。
+pub fn newfstatat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带信号屏蔽的 select。转 [`select`] 前要先接上信号。
+pub fn pselect6(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带信号屏蔽的 poll。同 [`pselect6`]。
+pub fn ppoll(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 拆分命名空间。没有命名空间。
+pub fn unshare(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 注册健壮 futex 链。同 [`futex`]。
+pub fn set_robust_list(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 读健壮 futex 链。同 [`futex`]。
+pub fn get_robust_list(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带信号屏蔽的 epoll_wait。同 [`pselect6`]。
+pub fn epoll_pwait(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 把信号变成可读的 fd。
+pub fn signalfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`signalfd`] 的带 flags 版本。
+pub fn signalfd4(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`readv`] + 指定偏移。同 [`pread64`] 的限制。
+pub fn preadv(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`writev`] + 指定偏移。同 [`pwrite64`] 的限制。
+pub fn pwritev(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 按 tgid 带 siginfo 发信号。
+pub fn rt_tgsigqueueinfo(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 批量收包。`net/` 层还没有 msghdr 批处理。
+pub fn recvmmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取文件句柄。minix 层没有导出句柄的概念。
+pub fn name_to_handle_at(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 按句柄打开。同 [`name_to_handle_at`]。
+pub fn open_by_handle_at(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 批量发包。同 [`recvmmsg`]。
+pub fn sendmmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 比较两个进程的内核资源。
+pub fn kcmp(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 从 fd 装载模块。同 [`create_module`]。
+pub fn finit_module(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 从 fd 加载 kexec 镜像。
+pub fn kexec_file_load(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// BPF 系统调用。没有 BPF 虚拟机。
+pub fn bpf(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 按 dirfd 执行。`execve` 已有，缺 dirfd 相对解析。
+pub fn execveat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取进程的 pidfd。没有 pidfd 类型。
+pub fn pidfd_open(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`clone`] 的结构体参数版本。
+pub fn clone3(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`faccessat`] 的带 flags 版本。
+pub fn faccessat2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`epoll_pwait`] 的 ns 超时版本。
+pub fn epoll_pwait2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+
+// --- 正式表 424..=448（335..423 是 x32 保留段，官方 x86_64 表里没有）------------
+
+/// 给 pidfd 发信号。没有 pidfd 类型，见 [`pidfd_open`]。
+pub fn pidfd_send_signal(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 克隆一棵挂载树。需要挂载树，现在只支持单个根。
+pub fn open_tree(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 移动挂载点。同 [`open_tree`]。
+pub fn move_mount(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 新式挂载 API：打开文件系统上下文。`fs/devices.rs` 里没有 fs_context。
+pub fn fsopen(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 新式挂载 API：配置文件系统上下文。同 [`fsopen`]。
+pub fn fsconfig(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 新式挂载 API：由上下文生成挂载点。同 [`fsopen`]。
+pub fn fsmount(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 新式挂载 API：由已有挂载点取上下文。同 [`fsopen`]。
+pub fn fspick(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 批量关闭 fd 区间。`fs/open.rs` 的 fd 表是每进程 16 项，加这个要先决定 EBADF 语义。
+pub fn close_range(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带 `open_how` 结构的 openat。需要 RESOLVE_* 解析约束。
+pub fn openat2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 从别的进程偷一个 fd。同 [`pidfd_open`]。
+pub fn pidfd_getfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 对别的进程做 madvise。需要跨进程地址空间访问。
+pub fn process_madvise(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 改挂载点属性。同 [`open_tree`]。
+pub fn mount_setattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 按 fd 的配额控制。同 [`quotactl`]。
+pub fn quotactl_fd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// Landlock LSM：建规则集。没有 LSM 框架。
+pub fn landlock_create_ruleset(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// Landlock LSM：加规则。同上。
+pub fn landlock_add_rule(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// Landlock LSM：自我限制。同上。
+pub fn landlock_restrict_self(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 建不可映射到内核的匿名内存 fd。同 [`memfd_create`] 的限制。
+pub fn memfd_secret(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 提前释放被杀进程的内存。需要 `do_exit` 的完整回收链。
+pub fn process_mrelease(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }

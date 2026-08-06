@@ -112,6 +112,44 @@ fn do_rd_request() {
                 READ => core::ptr::copy_nonoverlapping(disk, buf, len),
                 _ => panic!("RAMDISK: unknown RAM disk command!"),
             }
+            // bug-029 定位：`53 ff 00 f0` 是实模式 IVT 里那条 BIOS IRET 桩
+            // （0xf000ff53）。它出现在块数据里，说明某处从物理 0 附近搬了
+            // 一整块。在驱动这一侧先查一次，好把「驱动搬错了」和「搬完之后
+            // 被别人改了」分开。
+            {
+                let sig = |p: *const u8| {
+                    core::ptr::read_volatile(p) == 0x53
+                        && core::ptr::read_volatile(p.add(1)) == 0xff
+                        && core::ptr::read_volatile(p.add(2)) == 0x00
+                        && core::ptr::read_volatile(p.add(3)) == 0xf0
+                };
+                if sig(buf) || sig(disk) {
+                    panic!(
+                        "rd: IVT pattern after cmd={} blk={} disk={:#x} buf={:#x} \
+                         (disk_sig={} buf_sig={})",
+                        cmd, byte_off / BLOCK_SIZE, disk as usize, buf as usize,
+                        sig(disk), sig(buf)
+                    );
+                }
+            }
+            // 传输完成与「置 b_uptodate」之间要有一道编译器屏障。
+            //
+            // 缓冲数据区是通过裸指针 (`buf`) 写进去的，而读的一侧是
+            // `BufferHead::data()` 交出来的 `&[u8]`——共享引用带 `noalias` +
+            // `readonly`，LLVM 由此认为「这段内存在切片活着的期间没人写」，
+            // 于是可以把读提到本次 memcpy 之前，或者跨调用缓存住旧值。
+            //
+            // 这就是 bug-029：`minix::read_inode` 里 `parse_inode(bh(b).data())`
+            // 解出 `i_mode=0o177523`、`i_nlink=255`（一整块 0xFF 的形态），
+            // 而事后用同一个指针再读同一个地址，内容是完全正确的
+            // `ed 41 ...`（0o40755）。两次地址一模一样、内存也没坏，
+            // 差别只在编译器把哪一次的载入排在了 memcpy 的哪一侧。
+            //
+            // 单核不需要 CPU 级的内存屏障（没有别的核会看到中间状态，
+            // ramdisk 也不是真 DMA），要挡的只是编译期重排，所以
+            // `compiler_fence` 就够，不必用 `fence`/`mfence`。
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+
             end_request(MEM_MAJOR, true);
         }
     }

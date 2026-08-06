@@ -101,6 +101,35 @@ pub unsafe fn new_block(sb_nr: usize) -> u32 {
                 i += 1;
             }
             if map == NIL || j >= BITS_PER_BLOCK {
+                // bug-029 定位：自检里看到 write 返回 -ENOSPC，而随后统计
+                // 又说还有 235 个空闲 zone。把这一刻位图的实际样子打出来，
+                // 区分「位图真满」和「位图这一刻内容不对」。
+                let (fdz, nz, nzm) = {
+                    let p = sb(sb_nr);
+                    (p.s_firstdatazone as u32, p.s_nzones as u32, p.s_zmap_blocks as usize)
+                };
+                pr_warn!(
+                    "new_block: ENOSPC map={} j={} nzmap={} fdz={} nz={}",
+                    map, j, nzm, fdz, nz
+                );
+                for k in 0..nzm {
+                    let b = sb(sb_nr).s_zmap[k];
+                    if b == NIL {
+                        pr_warn!("new_block:   zmap[{}] = NIL", k);
+                        continue;
+                    }
+                    let (bdev, bblk, bup, bp) = {
+                        let h = bh(b);
+                        (h.b_dev, h.b_blocknr, h.b_uptodate, h.b_data)
+                    };
+                    let d0 = core::ptr::read_volatile(bp);
+                    let d1 = core::ptr::read_volatile(bp.add(1));
+                    pr_warn!(
+                        "new_block:   zmap[{}] = buf {} dev={:#06x} blk={} up={} \
+                         first2={:02x} {:02x} ffz={}",
+                        k, b, bdev, bblk, bup, d0, d1, find_first_zero(bh(b).data())
+                    );
+                }
                 return 0; // 磁盘满
             }
             if set_bit(bh(map).data_mut(), j) {
@@ -114,6 +143,15 @@ pub unsafe fn new_block(sb_nr: usize) -> u32 {
             let block = j + i as u32 * BITS_PER_BLOCK + sb(sb_nr).s_firstdatazone as u32 - 1;
             let (fdz, nz) = { let p = sb(sb_nr); (p.s_firstdatazone as u32, p.s_nzones as u32) };
             if block < fdz || block >= nz {
+                // bug-029 定位：这条原本是静默 return 0（同原版）。它同时也是
+                // 一个泄漏点——位已经置上、缓冲已标脏，却把块丢了，所以
+                // 「空闲 zone 少了一个」和「write 返回 -ENOSPC」会一起出现。
+                pr_warn!(
+                    "new_block: out of range i={} j={} -> block {} not in [{}, {})",
+                    i, j, block, fdz, nz
+                );
+                clear_bit(bh(map).data_mut(), j);
+                buffer::mark_buffer_dirty(map);
                 return 0;
             }
 

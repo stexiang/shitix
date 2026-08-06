@@ -97,9 +97,11 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
               info.available / 1024, info.high_memory / 1024,
               info.kernel_pages, info.reserved_pages);
 
-    sprintln!("mm: {}k/{}k available, {} kernel, {} reserved, mem_map at {:#x}",
+    sprintln!("mm: {}k/{}k available, {} kernel, {} reserved, mem_map at {:#x}, page_ref at {:#x} ({} slots), kstacks at {:#x} ({}x{}K)",
               info.available / 1024, info.high_memory / 1024,
-              info.kernel_pages, info.reserved_pages, info.mem_map_addr);
+              info.kernel_pages, info.reserved_pages, info.mem_map_addr,
+              info.page_ref_addr, info.nr_pages,
+              info.kstack_addr, sched::KSTACK_SLOTS, sched::KSTACK_SIZE / 1024);
 
     mm_selftest();
     klib_selftest();
@@ -516,7 +518,7 @@ fn syscall_selftest() {
             syscall::syscall0(nr::GETPID),
             syscall::syscall0(nr::GETPPID),
             syscall::syscall0(9999),            // 越界 → -ENOSYS
-            syscall::syscall0(nr::OPEN),        // 表里是 ni_syscall → -EINVAL
+            syscall::syscall0(nr::UNUSED),      // 表里是 ni_syscall → -EINVAL
             syscall::syscall3(nr::TIMES, 0, 0, 0),
         )
     };
@@ -536,11 +538,17 @@ fn syscall_selftest() {
     let n = unsafe {
         syscall::syscall3(nr::WRITE, 1, msg.as_ptr() as u64, msg.len() as u64)
     };
-    // SAFETY: 同上；fd=0 不被支持，应返回 -EINVAL。
+    // fd=0 在 task[0] 里没打开过，应返回 -EBADF。
+    //
+    // 这里曾经期望 -EINVAL：那时 sys_write 只认 fd 1/2 并直写控制台。现在
+    // sys_write 先走 fs 层（`fs::read_write::write`），未打开的 fd 由文件表
+    // 判定为 -EBADF——这才是 POSIX 的语义，只有 fd 1/2 拿到 -EBADF 时才回退
+    // 到内核控制台（task[0] 没有 stdout/stderr）。
+    // SAFETY: 同上。
     let bad_fd = unsafe { syscall::syscall3(nr::WRITE, 0, msg.as_ptr() as u64, 1) };
     kprintln!("syscall: write returned {} (expect {}), bad fd {} -> {}",
               n, msg.len(), bad_fd,
-              if n == msg.len() as i64 && bad_fd == -(klib::errno::EINVAL as i64) {
+              if n == msg.len() as i64 && bad_fd == -(klib::errno::EBADF as i64) {
                   "ok"
               } else {
                   "FAIL"
@@ -633,6 +641,21 @@ fn sched_selftest() {
     kprintln!("kthread: worker0 ran {} times, worker1 ran {} times -> {}",
               w0, w1, if w0 > 0 && w1 > 0 { "ok" } else { "FAIL" });
 
+    // 让两个 worker 退出，别活到 fs 自检期间去搅调度（见 `worker` 的注释）。
+    // SAFETY: 只写一个 u8；worker 侧是 volatile 读。
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(WORKER_STOP), 1) };
+    // 等它们真的走完。worker 最多睡 3 tick，给足余量；task[0] 只能轮询。
+    let stop_start = sched::jiffies();
+    while sched::jiffies() < stop_start + 20 {
+        // SAFETY: 只读一个 i32。
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(sched::need_resched)) } != 0 {
+            // SAFETY: task[0] 的正常上下文，不在中断里。
+            unsafe { sched::schedule() };
+        }
+        // SAFETY: 中断已开，hlt 会被时钟唤醒。见上面循环里关于不加 nomem 的注释。
+        unsafe { core::arch::asm!("hlt") }
+    }
+
     sched::show_state();
     irq::dump();
     kprintln!("stack[0]: high water {} bytes, guard {}",
@@ -684,6 +707,7 @@ fn fs_init_thread(_arg: u64) {
     }
 
     fs_selftest();
+    syscall_fs_selftest();
 
     // 栈底魔数还在吗？内核线程只有一页栈，fs 的调用链又深，溢出是
     // 真实风险（踩过一次）。这里显式查一次，比事后从 page fault 的
@@ -703,6 +727,10 @@ fn fs_init_thread(_arg: u64) {
 /// 两个测试线程各自的运行计数。
 static mut WORKER_TICKS: [u64; 2] = [0; 2];
 
+/// 让 sched 自检的 worker 退出。置 1 后两个 worker 从循环里出来并结束，
+/// 这样它们不会活到 fs 自检期间去干扰调度（见 `worker` 的注释）。
+static mut WORKER_STOP: u8 = 0;
+
 /// 测试用内核线程：自增自己的计数器，睡几个滴答，重复。
 ///
 /// 必须**睡**而不是 yield：task[0]（主自检所在的 idle 任务）只有在没有
@@ -710,7 +738,12 @@ static mut WORKER_TICKS: [u64; 2] = [0; 2];
 /// 乒乓下去，主线程永远回不来。
 fn worker(id: u64) {
     let idx = (id & 1) as usize;
-    loop {
+    // 原来这里是 `loop {}`：worker 永不退出，于是 sched 自检之后它们仍活着，
+    // 与后面的 fs 自检全程并发。两者共享全局 `WAIT_NEXT` 等待链和调度器，
+    // worker 每 3 tick 醒一次，fs 自检一旦在 `wait_on_buffer` 里睡下就会切到
+    // worker——这是 fs 自检间歇性失败（bug-029）的时序来源。自检只需要看到
+    // 「两个线程都被调度过」，跑够次数就退出。
+    while unsafe { core::ptr::read_volatile(core::ptr::addr_of!(WORKER_STOP)) } == 0 {
         // SAFETY: 单核，且我们只在自己的槽位上自增；主线程只读。
         unsafe {
             let p = core::ptr::addr_of_mut!(WORKER_TICKS).cast::<u64>().add(idx);
@@ -1070,4 +1103,135 @@ fn panic(info: &PanicInfo) -> ! {
 
     serial::print("SHITIX_PANIC\n");
     halt_loop();
+}
+
+/// 系统调用层接到 fs 层之后的自检：**全程走真正的 `int 0x80`**，不直接调
+/// `fs::*`。原版没有对应物。
+///
+/// 存在的理由：`sys_open`/`read`/`write`/`stat` 这些以前是 `-ENOSYS` 占位，
+/// 底下的 `fs/` 却是能用的——两层之间没接上，而 `fs_selftest` 直接调 fs 层，
+/// 恰好绕过了这个断点，所以断了很久都没被发现。这个自检专门守住那条边界：
+/// 从调用号一路走到 minix 磁盘块，任何一环断掉都会红。
+///
+/// 必须在 `fs_init_thread` 里跑（不能在 task[0]）：fs 全路径都可能睡。
+fn syscall_fs_selftest() {
+    kprintln!("--- syscall→fs selftest ---");
+    use fs::oflags::{O_CREAT, O_RDWR};
+    use syscall::nr;
+
+    let mut ok = true;
+    let mut check = |cond: bool, what: &str, got: i64| {
+        if !cond {
+            ok = false;
+            kprintln!("syscall-fs: {} FAILED (got {})", what, got);
+        }
+    };
+
+    // 1. creat + write：新建 /sctest 并写进去
+    let path = b"/sctest\0";
+    let data = b"syscall wired to fs\n";
+    // SAFETY: IDT 就绪；我们在内核线程的 4 页栈上，pt_regs 放得下。
+    // path/data 是内核 rodata，落在恒等映射低 1GB 内，能过 user_path 的护栏。
+    let fd = unsafe {
+        syscall::syscall3(nr::OPEN, path.as_ptr() as u64,
+                          (O_RDWR | O_CREAT) as u64, 0o644)
+    };
+    check(fd >= 0, "open(O_CREAT) returned fd", fd);
+    if fd < 0 {
+        kprintln!("syscall-fs: -> FAIL (cannot continue)");
+        return;
+    }
+
+    // SAFETY: 同上。
+    let n = unsafe {
+        syscall::syscall3(nr::WRITE, fd as u64, data.as_ptr() as u64, data.len() as u64)
+    };
+    check(n == data.len() as i64, "write byte count", n);
+
+    // 2. lseek 回到开头，再 read 回来比对
+    // SAFETY: 同上。SEEK_SET = 0
+    let pos = unsafe { syscall::syscall3(nr::LSEEK, fd as u64, 0, 0) };
+    check(pos == 0, "lseek(SEEK_SET) new position", pos);
+
+    let mut buf = [0u8; 32];
+    // SAFETY: 同上；buf 在本函数的内核栈上，同样落在恒等映射内。
+    let r = unsafe {
+        syscall::syscall3(nr::READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    };
+    check(r == data.len() as i64, "read byte count", r);
+    check(&buf[..data.len()] == &data[..], "read content matches written", r);
+
+    // 3. fstat：大小应等于写进去的字节数
+    let mut st = fs::stat::Stat::zeroed();
+    // SAFETY: 同上；st 在内核栈上。
+    let e = unsafe {
+        syscall::syscall3(nr::FSTAT, fd as u64, &mut st as *mut _ as u64, 0)
+    };
+    check(e == 0, "fstat return", e);
+    check(st.st_size == data.len() as u32, "fstat st_size", st.st_size as i64);
+
+    // 4. dup：新 fd 应该指向同一个 file，位置共享
+    // SAFETY: 同上。
+    let fd2 = unsafe { syscall::syscall3(nr::DUP, fd as u64, 0, 0) };
+    check(fd2 >= 0 && fd2 != fd, "dup returned a distinct fd", fd2);
+
+    // 5. close 两个 fd
+    // SAFETY: 同上。
+    let c1 = unsafe { syscall::syscall3(nr::CLOSE, fd as u64, 0, 0) };
+    check(c1 == 0, "close(fd)", c1);
+    if fd2 >= 0 {
+        // SAFETY: 同上。
+        let c2 = unsafe { syscall::syscall3(nr::CLOSE, fd2 as u64, 0, 0) };
+        check(c2 == 0, "close(dup fd)", c2);
+    }
+    // 关过之后再关一次必须是 -EBADF（证明 fd 真的被释放了，而不是
+    // 老那个「close 直接 return 0」的假实现）
+    // SAFETY: 同上。
+    let c3 = unsafe { syscall::syscall3(nr::CLOSE, fd as u64, 0, 0) };
+    check(c3 == -(klib::errno::EBADF as i64), "close twice gives -EBADF", c3);
+
+    // 6. stat 按路径查，大小应一致
+    let mut st2 = fs::stat::Stat::zeroed();
+    // SAFETY: 同上。
+    let e2 = unsafe {
+        syscall::syscall3(nr::STAT, path.as_ptr() as u64, &mut st2 as *mut _ as u64, 0)
+    };
+    check(e2 == 0, "stat(path) return", e2);
+    check(st2.st_size == data.len() as u32, "stat st_size", st2.st_size as i64);
+
+    // 7. mkdir/rmdir 往返
+    let dir = b"/scdir\0";
+    // SAFETY: 同上。
+    let md = unsafe { syscall::syscall3(nr::MKDIR, dir.as_ptr() as u64, 0o755, 0) };
+    check(md == 0, "mkdir", md);
+    // SAFETY: 同上。
+    let rd = unsafe { syscall::syscall3(nr::RMDIR, dir.as_ptr() as u64, 0, 0) };
+    check(rd == 0, "rmdir", rd);
+
+    // 8. unlink 掉测试文件，再 stat 应该 -ENOENT
+    // SAFETY: 同上。
+    let ul = unsafe { syscall::syscall3(nr::UNLINK, path.as_ptr() as u64, 0, 0) };
+    check(ul == 0, "unlink", ul);
+    // SAFETY: 同上。
+    let e3 = unsafe {
+        syscall::syscall3(nr::STAT, path.as_ptr() as u64, &mut st2 as *mut _ as u64, 0)
+    };
+    check(e3 < 0, "stat after unlink fails", e3);
+
+    // 9. 护栏：坏用户指针必须被 user_path/user_buf 挡成 -EFAULT，
+    //    而不是让内核去碰一个没映射的地址。
+    // SAFETY: 同上；这里故意传一个恒等映射之外的地址。
+    let bad = unsafe { syscall::syscall3(nr::OPEN, 0xdead_0000_0000, 0, 0) };
+    check(bad == -(klib::errno::EFAULT as i64), "open(bad ptr) gives -EFAULT", bad);
+    // SAFETY: 同上；NULL 路径。
+    let nul = unsafe { syscall::syscall3(nr::STAT, 0, 0, 0) };
+    check(nul == -(klib::errno::EFAULT as i64), "stat(NULL) gives -EFAULT", nul);
+
+    kprintln!("syscall-fs: open/write/lseek/read/fstat/dup/close/stat/mkdir/rmdir/unlink \
+               + EFAULT guards -> {}", if ok { "ok" } else { "FAIL" });
+    serial::print(if ok {
+        "syscall-fs: selftest done\n"
+    } else {
+        "syscall-fs: selftest FAILED\n"
+    });
 }

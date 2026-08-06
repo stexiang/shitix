@@ -7,6 +7,7 @@
 #   scripts/test.sh run          构建并交互式运行（显示 QEMU 窗口/曲线图形）
 #   scripts/test.sh debug        构建并挂起等待 GDB (localhost:1234)
 #   PROFILE=release scripts/test.sh   用 release 构建
+#   MEM=32M scripts/test.sh       改 QEMU 内存大小（默认 256M），用于跑内存矩阵
 #
 set -euo pipefail
 
@@ -17,6 +18,7 @@ MODE="${1:-test}"
 IMG="target/boot/shitix.img"
 LOG="target/boot/serial.log"
 TIMEOUT="${TIMEOUT:-20}"
+MEM="${MEM:-256M}"
 QEMU="qemu-system-x86_64"
 # 成功标记，由 src/lib.rs 在启动末尾写到串口
 OK_MARK="SHITIX_BOOT_OK"
@@ -32,7 +34,7 @@ bash scripts/build.sh
 
 QEMU_BASE=(
     -drive "format=raw,file=$IMG,if=ide"
-    -m 256M
+    -m "$MEM"
     -no-reboot
     -no-shutdown
 )

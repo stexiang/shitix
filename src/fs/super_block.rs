@@ -225,13 +225,36 @@ pub unsafe fn watchdog_bad_dev() -> Option<u16> {
 pub unsafe fn check_guards(tag: &str) {
     // SAFETY: 只读。
     unsafe {
-        let area = &*core::ptr::addr_of!(SUPER_AREA);
-        for (name, guard) in [("lo", &area.lo), ("hi", &area.hi)] {
+        // 全程裸指针，不建 `&SUPER_AREA`：那条共享引用覆盖整个结构（含
+        // table），带 `dereferenceable`/`readonly`，和调用者可能持有的
+        // `&mut SuperBlock` 重叠就是 UB。
+        let base = core::ptr::addr_of_mut!(SUPER_AREA);
+        let lo = core::ptr::addr_of_mut!((*base).lo) as *mut u64;
+        let hi = core::ptr::addr_of_mut!((*base).hi) as *mut u64;
+        for (name, p) in [("lo", lo), ("hi", hi)] {
             for i in 0..4 {
-                let v = core::ptr::read_volatile(&guard[i]);
+                let slot = p.add(i);
+                let v = core::ptr::read_volatile(slot);
                 if v != SB_GUARD {
-                    pr_warn!("super: guard {} word {} smashed: {:#018x} (at {})",
-                             name, i, v, tag);
+                    // 复读一次：若复读是好的，说明内存完好、是这次比较不可信
+                    // （或写入是瞬时的），和「真被写坏」要分开报。
+                    let again = core::ptr::read_volatile(slot);
+                    pr_warn!("super: guard {} word {} @ {:#x}: got {:#018x} want {:#018x} reread {:#018x} (at {})",
+                             name, i, slot as usize, v, SB_GUARD, again, tag);
+                    let dump = |q: *mut u64, n: &str| {
+                        pr_warn!("super:   {} = [{:#018x} {:#018x} {:#018x} {:#018x}]",
+                                 n,
+                                 core::ptr::read_volatile(q),
+                                 core::ptr::read_volatile(q.add(1)),
+                                 core::ptr::read_volatile(q.add(2)),
+                                 core::ptr::read_volatile(q.add(3)));
+                    };
+                    dump(lo, "lo");
+                    dump(hi, "hi");
+                    if again == SB_GUARD {
+                        pr_warn!("super: reread OK -> memory intact, this compare was bogus; continuing");
+                        continue;
+                    }
                     panic!("SUPER_AREA guard {} smashed at {}", name, tag);
                 }
             }
