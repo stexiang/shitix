@@ -711,3 +711,86 @@ mod tests {
         assert!(um.find_vma(0x50000000).is_none());
     }
 }
+
+/// 尝试处理 COW 页面故障
+/// 
+/// 从 page fault handler 调用，检查是否是 COW 页面故障并进行相应处理。
+/// 
+/// # Arguments
+/// * `fault_addr` - 故障地址
+/// * `pml4` - 当前进程的页表根
+/// 
+/// # Returns
+/// * `Some(true)` - 成功处理了 COW 故障
+/// * `Some(false)` - 不是 COW 故障，需要其他处理
+/// * `None` - 错误发生
+pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool> {
+    use crate::mm::page_ref;
+    
+    // 确保地址在用户空间
+    if fault_addr < USERSPACE_START as u64 || fault_addr >= USERSPACE_END as u64 {
+        return Some(false);
+    }
+    
+    // 检查页面是否存在且是只读
+    // SAFETY: 调用者确保 pml4 有效，fault_addr 是用户空间地址
+    if let Some(phys) = unsafe { crate::mm::paging::translate(pml4, fault_addr as usize) } {
+        let pfn = page_ref::phys_to_pfn(phys);
+        
+        // 检查页面引用计数
+        let refs = page_ref::page_ref_count(pfn);
+        
+        // 如果引用计数 > 1，说明是共享页面 (COW)
+        if refs > 1 {
+            // 需要复制页面
+            let new_page = crate::mm::get_free_page();
+            if new_page == 0 {
+                crate::pr_warn!("COW: out of memory");
+                return None;
+            }
+            
+            // 复制页面内容
+            let src = phys as *const u8;
+            let dst = new_page as *mut u8;
+            // SAFETY: 两边都是有效的物理页面
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, dst, crate::mm::page::PAGE_SIZE);
+            }
+            
+            // 更新页表
+            // SAFETY: 映射新的物理页面
+            let _ = unsafe { crate::mm::paging::unmap_page(pml4, fault_addr as usize) };
+            let prot = crate::mm::paging::flags::SHARED; // present + rw + user
+            if !unsafe { crate::mm::paging::map_page(pml4, fault_addr as usize, new_page, prot) } {
+                crate::pr_warn!("COW: failed to map new page");
+                return None;
+            }
+            
+            // 减少原页面的引用计数
+            page_ref::page_ref_dec(pfn);
+            
+            // 释放新页面的引用计数（因为它现在是唯一引用）
+            let new_pfn = page_ref::phys_to_pfn(new_page);
+            page_ref::page_ref_set(new_pfn, 1);
+            
+            crate::pr_debug!("COW: copied page from {:x} to {:x}", phys, new_page);
+            return Some(true);
+        } else if refs == 1 {
+            // 引用计数为 1，只需要启用写权限
+            let flags = crate::mm::paging::get_page_flags(pml4, fault_addr as usize);
+            if let Some(flags) = flags {
+                // 设置写权限
+                if !crate::mm::paging::set_page_flags(pml4, fault_addr as usize, 
+                    flags | crate::mm::paging::flags::RW) {
+                    crate::pr_warn!("COW: failed to set write flags");
+                    return None;
+                }
+            }
+            crate::pr_debug!("COW: enabled write for single-reference page");
+            return Some(true);
+        }
+    }
+    
+    // 不是 COW 故障
+    Some(false)
+}

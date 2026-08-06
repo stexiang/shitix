@@ -17,6 +17,7 @@
 
 use crate::desc::selector;
 use crate::klib::printk::Level;
+use crate::sched;
 
 /// 陷入内核时保存的寄存器组。**字段顺序必须与 `boot/entry.S` 的
 /// SAVE_ALL 压栈顺序完全一致**（压栈是反序，所以这里从 r15 开始）。
@@ -213,6 +214,26 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
     };
 
     if regs.from_user() {
+        // page fault: 尝试处理 COW 页面故障
+        if v == 14 {
+            if let Some(fault_addr) = cr2 {
+                let pml4 = unsafe { sched::current().tss.cr3 } as usize;
+                // 检查是否是 COW 页面错误 (write + present + not-write)
+                let is_write = (error_code & 2) != 0;  // 写错误
+                let is_present = (error_code & 1) == 0;  // 页面存在但权限不足
+                
+                if is_write && is_present {
+                    // 尝试处理 COW 页面故障
+                    if let Some(umm) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
+                        if umm {
+                            crate::pr_debug!("COW page fault handled at {:#x}", fault_addr);
+                            return;  // 成功处理，恢复执行
+                        }
+                    }
+                }
+            }
+        }
+        
         // 原版这里 send_sig(signr, current, 1) 让进程自己去死。
         // 我们暂时只打印——signal.c 未移植。
         let signr = info.map(|i| i.signr).unwrap_or(SIGSEGV);

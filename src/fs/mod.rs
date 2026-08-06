@@ -17,7 +17,8 @@
 
 pub mod buffer;
 pub mod devices;
-pub mod ext2;        // ext2/ext3/ext4 filesystem support
+pub mod ext2;        // ext2 filesystem support
+pub mod ext4;        // ext4 filesystem support
 pub mod file_table;
 pub mod inode;
 pub mod minix;
@@ -33,6 +34,11 @@ pub use ext2::{
     Ext2SuperBlock,     // ext2 superblock
     Ext2Inode,          // ext2 inode structure
     Ext2GroupDesc,       // ext2 block group descriptor
+};
+pub use ext4::{
+    Ext4SuperBlock,      // ext4 superblock
+    Ext4Inode,           // ext4 inode structure
+    Ext4FeatureFlags,    // ext4 feature flags
 };
 pub use file_table::{File, get_empty_filp};
 pub use inode::{Inode, iget, iput};

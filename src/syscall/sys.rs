@@ -106,16 +106,53 @@ pub fn ni_syscall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// - a0: 文件名
 /// - a1: 参数数组
 /// - a2: 环境变量数组
-pub fn execve(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    // TODO: 实现真正的程序加载
-    // 需要：
-    // 1. 解析 ELF 文件格式
-    // 2. 分配用户内存空间
-    // 3. 加载代码段和数据段
-    // 4. 设置栈
-    // 5. 切换到用户态
-    crate::pr_warn!("sys_execve: not implemented");
+pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::ENOENT;
+    use crate::elf as elf_loader;
+    
+    let filename = args.a0 as *const u8;
+    if filename.is_null() {
+        return -(ENOENT as i64);
+    }
+    
+    // TODO: 实际从文件系统读取 ELF 文件
+    // 目前只是占位实现
+    crate::pr_warn!("sys_execve: full implementation pending filesystem integration");
     -(ENOSYS as i64)
+    
+    /*
+    // 完整实现需要:
+    // 1. 从文件系统读取 ELF 文件到内存
+    // let data = fs::read_file(filename)?;
+    // 
+    // 2. 解析 ELF 头
+    // let header = elf_loader::parse_elf32(&data)?;
+    // 
+    // 3. 验证 ELF
+    // let _ = elf_loader::is_executable(&header)?;
+    // 
+    // 4. 获取当前进程的页表
+    // let pml4 = unsafe { sched::current().tss.cr3 };
+    // 
+    // 5. 加载每个 PT_LOAD 段
+    // let phdr_count = elf_loader::get_phdr_count(&header);
+    // let phdr_offset = elf_loader::get_phdr_offset(&header);
+    // let phdr_size = elf_loader::get_phdr_size(&header);
+    // 
+    // for i in 0..phdr_count {
+    //     let phdr = elf_loader::parse_phdr32(&data, phdr_offset + i * phdr_size)?;
+    //     unsafe { elf_loader::load_segment(&data, &phdr, dest)?; }
+    // }
+    // 
+    // 6. 设置栈
+    // let stack_top = 0x7FFF_FFFF_F000;
+    // regs.rsp = stack_top;
+    // 
+    // 7. 设置入口点
+    // regs.rip = header.e_entry as u64;
+    // 
+    // 0
+    */
 }
 
 /// 返回当前进程 pid。对应原版 `sched.c:sys_getpid()`。

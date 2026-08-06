@@ -245,3 +245,130 @@ pub unsafe fn unmap_page(pml4: usize, vaddr: usize) -> Option<usize> {
         Some((e & ADDR_MASK) as usize)
     }
 }
+
+/// 复制页表项到新的页表
+/// 
+/// 复制源页表的映射到目标页表，适用于 fork 时的页表复制。
+/// 
+/// # Safety
+/// - src_pml4 和 dst_pml4 必须是有效的四级页表根
+/// - 此函数不处理 COW 标记，需要调用者设置
+pub unsafe fn copy_page_table(src_pml4: usize, dst_pml4: usize, user: bool) -> bool {
+    // 用户空间范围: 0x40000000 - 0xFFFF_FFFF
+    const USERSPACE_START: usize = 0x4000_0000;
+    const USERSPACE_END: usize = 0xFFFF_FFFF;
+    
+    // 遍历用户空间的每一页
+    let mut vaddr = USERSPACE_START;
+    while vaddr < USERSPACE_END {
+        // 检查源页表中的映射
+        if let Some(phys) = unsafe { translate(src_pml4, vaddr) } {
+            // 获取当前权限
+            let prot = unsafe {
+                let pte = entry(pml4_index(vaddr), pml4_index(vaddr));
+                let pdpt = (pte & ADDR_MASK) as usize;
+                let pde = entry(pdpt, pdpt_index(vaddr));
+                let pt_base = (pde & ADDR_MASK) as usize;
+                let pte_val = entry(pt_base, pt_index(vaddr));
+                pte_val & 0xFFF  // 获取标志位
+            };
+            
+            // 在目标页表中创建映射
+            if !map_page(dst_pml4, vaddr, phys, prot | flags::PRESENT | flags::USER) {
+                return false;
+            }
+        }
+        vaddr += PAGE_SIZE;
+    }
+    true
+}
+
+/// 复制并设置 COW 页表
+/// 
+/// 复制父进程的页表到子进程，将所有页面设置为只读 (COW)。
+/// 
+/// # Safety
+/// 同 copy_page_table
+pub unsafe fn cow_copy_page_table(src_pml4: usize, dst_pml4: usize) -> bool {
+    // 用户空间范围
+    const USERSPACE_START: usize = 0x4000_0000;
+    const USERSPACE_END: usize = 0xFFFF_FFFF;
+    
+    let mut vaddr = USERSPACE_START;
+    while vaddr < USERSPACE_END {
+        // 检查源页表中的映射
+        if let Some(phys) = unsafe { translate(src_pml4, vaddr) } {
+            // 设置为只读 (COW)
+            let cow_prot = flags::PRESENT | flags::USER;  // 没有 RW 标志
+            
+            if !map_page(dst_pml4, vaddr, phys, cow_prot) {
+                return false;
+            }
+        }
+        vaddr += PAGE_SIZE;
+    }
+    true
+}
+
+/// 获取页表项的权限标志
+pub fn get_page_flags(pml4: usize, vaddr: usize) -> Option<u64> {
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return None;
+        }
+        let pdpt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return None;
+        }
+        let pd = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return None;
+        }
+        let pt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pt, pt_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return None;
+        }
+        
+        Some(e & 0xFFF)
+    }
+}
+
+/// 设置页表项的权限
+pub fn set_page_flags(pml4: usize, vaddr: usize, new_flags: u64) -> bool {
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        let pdpt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return false;
+        }
+        let pd = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return false;
+        }
+        let pt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pt, pt_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        
+        let phys = e & ADDR_MASK;
+        set_entry(pt, pt_index(vaddr), phys | new_flags | flags::PRESENT);
+        invalidate_page(vaddr);
+        true
+    }
+}
