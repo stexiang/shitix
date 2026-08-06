@@ -60,6 +60,11 @@
 
 <!-- Mistakes made and corrected. Each entry prevents the same mistake recurring. -->
 <!-- Format: [YYYY-MM-DD] Description of what went wrong and what to do instead. -->
+- [2026-08-06] **低 1GB 是恒等映射，所以空指针读不会 page fault——它静默返回实模式 IVT 的字节。** 任何地方看到 `0xff53`、`nlink=255`、`0xf000ff53`，先怀疑「某个指针/基址是 0」或「读到了缓冲上一轮的内容」，不要当成内存被写坏。F000:FF53 是 BIOS 的 IRET 桩，IVT 里大量未用向量都指向它，所以从地址 0 读一整块出来就是这个重复模式。判据：坏值的每个字节都能在 IVT 对应偏移上找到。
+- [2026-08-06] **别把「屏障」当成 `noalias`/`readonly` 的解药。** 缓冲数据区是驱动用裸指针 memcpy 填的，把它当 `&[u8]` 交出去，LLVM 就能证明「切片存活期间无人写」并沿用上一轮的载入。`compiler_fence` 无效（只约束原子操作），空 `asm!` 的 memory clobber 也无效（屏障之后新建的引用照样满足 readonly 推断）。有效的两种：(a) 根本不建引用，全程 `read_volatile`；(b) 把指针本身穿一条 `asm!("/* {0} */", inout(reg) p)` 再建切片，断掉来源推断。见 bug-029。
+- [2026-08-06] **失败率对代码生成敏感时，停止「读源码找错处」。** 本轮只改注释/删诊断打印就让失败率在 24%↔56% 之间跳；同一手 launder 加到 `data()` 上把 44% 压到 24%，加到 `inode()`/`sb()`/`buf_ptr()` 上反而升到 64%。这种敏感性排除了「某一处源码写错」，指向栈帧尺寸/布局相关的破坏或与中断时序耦合的竞态。该换手段（栈护栏高水位、单步比对反汇编、把可疑路径整段串行化），不要继续加屏障或改访问器。
+- [2026-08-06] **测量前必须确认镜像真的重建了。** `scripts/build.sh` 编译失败时 `test.sh` 提前退出、`serial.log` 保持上一轮不变，于是 25 次循环全读同一份旧日志，报出 25/25 全过的假结果。每次循环前 `rm -f target/boot/serial.log`，并且先单独 `cargo build` 确认 0 error 再进循环。
+- [2026-08-06] **`git checkout <file>` 会连本会话未提交的诊断脚手架一起丢掉。** 想回退一处改动时对整个文件 checkout，把同文件里的 `INODE_AREA` 护栏一起revert了。回退单点改动用 Edit 精确改回，不要整文件 checkout。
 - [2026-08-06] **静态数组一旦大到 KB 级必须评估 BSS 余量，否则等链接期 ASSERT 拦下就太晚了。** `KSTACKS` 48KB 让 `_kernel_end` 从 0x854F0 冲到 0x922C0，超 0x90000 共 8896 字节。BSS 余量只有约 44KB（0x90000 - 内核镜像末尾），加一个大数组前要先 `nm target/boot/system.elf | grep _kernel_end` 确认还有空间，或者直接按 `page_ref` (bug-024) 和本次 `KSTACKS` 的做法改成动态划分。
 - [2026-08-06] **「换 ext4 就能绕开」是个要核实的假设，不能直接写进 Next phase。** 这次说「minix 的 flake 换 ext4 就好」，读代码后发现：(1) `do_unlink`/`dir_namei`/buffer cache 都在 VFS 层，换 ext4 会一起带过去；(2) ext4 模块只有 1291 行结构定义，没有 `read_inode`/`lookup`/目录操作/块分配/mkfs，`FsType::Ext2` 除了定义和一句 `TODO` 全树没人用，无法挂载。「换 ext4」不是配置开关，是个与刚做完的系统调用工作量相当的独立模块。假设涉及代码能力时，先 grep/读关键函数确认再写结论。
 - [2026-08-02] 用 `if=floppy` 手工启动镜像 → 根本没引导，截屏只有 BIOS 的 "no bootable device"。手工跑 QEMU 时要照抄 `scripts/test.sh` 里的 `QEMU_BASE`（`if=ide`）。
@@ -84,6 +89,20 @@
 - [2026-08-06] 改完代码跑 `scripts/test.sh`，结果和改动完全不符 → 工作区里有未提交的本地改动把 `bash scripts/build.sh` 注释掉了，测的是旧镜像。**自检结果异常时先确认 `serial.log` 里出现了本次改动引入的新字样**（比如改过的打印文案），再去怀疑代码。详见 buglog bug-027。
 - [2026-08-06] 用 `f as usize != ni_syscall as usize` 数表里已实现的项 → release 下少数一个。identical code folding 会合并函数体相同的实现，Rust 也不保证 fn 指针相等的语义。要数「有没有被赋值」就另建 bool 位图。详见 buglog bug-028。
 - [2026-08-06] 顺手用了 `git stash` 想拿基线对比 → 把本次未提交的工作全卷走了（`git stash pop` 救回）。这个树的改动都没提交，**不要用 stash 做基线对比**，改用 `git worktree` 或直接看已有的历史记录数据。
+
+### 2026-08-06 — 中断入口在 SAVE_ALL 之前动寄存器（bug-029 根因）
+**别在 SAVE_ALL 之前碰任何通用寄存器。** `irq_common` 原本 `popq %rax` 取 IRQ 号，
+把被打断上下文的 %rax 毁在保存之前，SAVE_ALL 存的是 IRQ 号，RESTORE_ALL 如实恢复
+——每个滴答都让被打断的内核代码带着 %rax = 0 继续跑。要传向量号就用 CPU 已经压好的
+那一格（orig_rax 存 ~nr），或者先 SAVE_ALL 再从 pt_regs 上方的临时槽取。
+
+**诊断顺序上的教训（这条比修复本身值钱）：**
+- 「失败率对无关代码改动敏感」= 寄存器分配/活跃区间敏感 = **某个寄存器被外力改了**。
+  这不是「LLVM 优化问题」也不是「内存破坏」，我在这两条错路上花了整整两个会话。
+- 一个 `cli` 包住可疑区段的实验（20/20 过 vs 9/20）在 5 分钟内把范围从「整个 fs 层」
+  缩到「中断路径」。**先做能一刀切掉半个假设空间的实验，再读源码。**
+- 加屏障（`compiler_fence`、空 `asm!` memory clobber）、改访问器、调栈大小——全是在
+  给一个寄存器 bug 打内存补丁。症状「像」内存问题不代表它是。
 
 ## Decision Log
 

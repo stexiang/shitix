@@ -1,4 +1,4 @@
-<!-- Last updated: 2026-08-06 (模块 7：21 个 syscall 接 fs 层、内核栈池移出 BSS、LFS 集成结论) -->
+<!-- Last updated: 2026-08-06 (bug-029 已修复：irq_common 在 SAVE_ALL 前 popq %rax 毁掉被打断的寄存器；45 连过) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
@@ -121,47 +121,45 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
 
 ## 🚀 Next phase
 
-**Goal（先做）:** fs 自检 flake 的**真正**根因。这一轮把几个假设读代码排除了，
-并拿到一条新线索。
+**bug-029 已修复（✅ 45 连过：25/25 + 20/20，修复前 40~55% 失败）。**
 
-**已排除（读代码，不是猜）:**
-- `do_unlink` 每条早退路径都正确取负（`-(e as i64)`），`dir_namei` 的错误是 `u16`
-- `minix::namei::unlink` 全部 5 条返回路径都只返正 errno，所以 `-(r as i64)` 是对的
-- `Task::errno` 是 `i32`，**全树除了 `do_syscall` 里那句 `= 0` 没人写它**，所以
-  `do_syscall` 的 errno 覆盖分支（`regs.rax = -(errno)`）永不触发
-- 系统调用号无重号、`UNLINK` 槽位（87）挂的就是 `sys::unlink`（`check-syscall-nr.py` 过）
+**根因：`boot/entry.S` 的中断入口在 SAVE_ALL 之前毁寄存器。**
+`BUILD_IRQ` 压了 `~nr` 和 `nr` 两格，`irq_common` 用 `popq %rax` 取 IRQ 号——那条 pop
+在 SAVE_ALL **之前**，把被打断上下文的 %rax 就地毁掉；SAVE_ALL 存下去的是 IRQ 号，
+RESTORE_ALL 又如实恢复回去。于是**每个时钟滴答都让被打断的内核代码带着 %rax = 0
+继续跑**（时钟是 IRQ 0）。低 1GB 恒等映射，那个 0 当指针用时不 page fault，而是静默
+读回实模式 IVT 的 `F000:FF53` BIOS IRET 桩字节 —— 于是有 `i_mode=0xff53`、`nlink=255`、
+`s_magic=0xff53`、`guard=0xf000ff53f000ff53`；当计数用时就是「readdir 列出 0 项」。
+%rax 在滴答那一刻是否活着完全由寄存器分配决定，这就是失败率随无关改动在 24%~64%
+之间跳动的原因。
 
-**探针实测（临时探针已删）:** 失败那次 `unlink=-2, errno 0->0` ——
-符号是**对**的，文件确实已经不在了。所以问题不是符号，是文件**提前消失**。
+**修复：**
+1. `BUILD_IRQ` 去掉多余的 `pushq $nr`；`irq_common` 先 SAVE_ALL，再从 `PT_ORIG_RAX`
+   取 `~nr` 取反得到 IRQ 号 —— 保存前不动任何寄存器。
+2. `exc_common` 同一处写法（潜伏 bug：目前多数异常直接 panic，但 `page_fault` 在
+   用户态/COW 接上后会变成高频可恢复异常）。改为先 SAVE_ALL，向量号从 pt_regs 上方的
+   临时槽读出，再把「错误码 + iretq 帧」整体下移 8 字节盖掉临时槽，恢复标准布局。
 
-**新线索（下一步从这里查）:** 同一次失败里 `stat st_size FAILED (got 32)`，
-而写进去的是 **20** 字节、自检的读缓冲正好是 **32** 字节。`st_size` 取到了
-缓冲长度而不是文件长度，指向 inode/缓冲被串写。查 `fs::stat` 填 `st_size`
-的路径与 `read` 的缓冲归还顺序。
+**顺带落地的三处独立真修复（与 029 无关但都是真 bug，别 revert）：**
+- `minix/inode_ops.rs::parse_inode` —— 收裸指针 + 逐字节 `read_volatile`，不经 `&[u8]`
+- `fs/buffer.rs::data`/`data_mut` —— `b_data` 穿一条 asm 断 provenance
+- `minix/bitmap.rs::new_block` —— 越界分支原本静默 `return 0` 丢块，现在把位还回去
 
-**⚠️ 与「换 ext4 就能绕开」有关的判断更正:** 这个 flake **大概率不是
-minix 独有**。`do_unlink`/`dir_namei`/buffer cache 都在 VFS 层、与文件系统
-无关，换 ext4 会一起带过去。而且 ext4 现在**挂不上**（见下），换不了。
+**⚠️ 诊断方法上的教训（比修复本身值钱，已进 cerebrum）：**
+- 「失败率对无关代码改动敏感」= 寄存器分配敏感 = **某个寄存器被外力改了**。不是 LLVM
+  优化问题，也不是内存破坏。在这两条错路上花了两个会话。
+- 一个 `cli` 包住可疑区段的实验（20/20 vs 9/20）5 分钟内把范围从「整个 fs 层」缩到
+  「中断路径」。**先做能一刀切掉半个假设空间的实验，再读源码。**
+- 加屏障、改访问器、调栈大小 —— 全是在给一个寄存器 bug 打内存补丁。
 
-**⚠️ 上一版 Next phase 把这个 flake 归给 bug-012/bug-023 是错的**：两条都记录为
-已修，且 bug-012 的修法（把 fs 挪进 `fs_init_thread`）正好消掉了它自己写的
-「在 task[0] 里睡」这个成因。别再直接套用那两条的结论。
-
-**（旧描述保留作参考）:** fs 自检约 **10-15%**
-概率失败（`buf 0 bytes` / 缓冲里出现 BIOS ROM 的 `0xf000ff53` /
-`mkfs.minix failed` / mount 找不到魔数 / 漏一个 zone）。详见 buglog **bug-023**。
-
-已排除：页分配器重复派页、缓冲数据页落在低端内存、ramdisk `PAGES`
-未初始化、一块两缓冲、空闲环下标越界、内核栈溢出。已确认现象：某个
-缓冲头的 `b_size` 变成 0（从没 init 过却挂进了链）。指向仍有一处非
-原子的链表/指针更新与中断交错。**下一步**：用 `qemu -d int` 配合在
-`add_request`/`end_request`/`getblk` 里记录事件序列（环形缓冲，事后
-dump），而不是继续加断言。护栏已就位，不要删。
-
-**这个 bug 与后续所有提交都无关**：`HEAD~2` 基线 20 次失败 2 次，COW/ext4
-提交后同样频率，系统调用号补齐后 debug 6 次失败 1 次、32M 首轮失败但同镜像
-重跑 3/3 过。每次看到 `mkfs.minix failed` 先归给它，别当成新回归。
-护栏 panic（bug-025）不是它的症状，两者不要混。
+**🚀 下一步：** 用户请求的剩余三阶段（bug-029 是第一阶段）——
+- **阶段 2：进程生命周期** —— 移植 `signal.c` / `exit.c` / `fork.c`。`ret_from_sys_call`
+  里已经预留了 `do_signal` 的插入点（见那段注释）。
+- **阶段 3：用户态切换** —— ring-3 转换、`copy_from_user`/`copy_to_user`、真正的
+  `verify_area`（当前 `sys.rs::check_range` 只是恒等映射范围检查）。注意 `syscall_entry`
+  目前是 `cli; hlt` 桩，需要 per-cpu 的用户栈暂存位才能启用。
+- **阶段 4：ELF64 + execve** —— 替掉现在只认 ELF32 的加载器，补 x86_64 的 `struct stat`
+  ABI 与 `arch_prctl`（FS/GS base）。
 
 **Goal（LFS 集成的真实结论 —— 读代码核实过，不是估计）:**
 用户问「能否集成进 LFS 系统」。**当前内核跑不了 LFS 用户态**，缺的不是零碎补丁：

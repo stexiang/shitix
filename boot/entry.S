@@ -158,13 +158,41 @@
  * 21 份几乎相同的代码）。
  *
  * 进入时栈顶是刚压的向量号，紧下面是 orig_rax 格（错误码）。
- * 先把向量号弹到 rax 暂存，SAVE_ALL 之后再作为第二参数传出去。
  */
 exc_common:
-    popq    %rax                    /* 向量号 */
-    SAVE_ALL
+    /*
+     * 不能像原来那样 `popq %rax` 取向量号：那会在 SAVE_ALL **之前**毁掉被
+     * 打断上下文的 %rax——IRQ 路径上同样的写法就是 bug-029 的根因（见
+     * irq_common 的注释）。异常路径上这条一直是潜伏的，因为目前绝大多数
+     * 异常直接 panic；但 int3/debug/overflow 本来就可恢复，而 page_fault
+     * 在用户态与 COW 接上之后会变成高频可恢复异常，那时每次缺页都会把
+     * 被打断代码的 %rax 换成向量号 14。
+     *
+     * 改成先 SAVE_ALL（此时 %rax 还是真值，被如实存进 PT_RAX），向量号留在
+     * pt_regs 上方的临时槽里，保存完再取。
+     */
+    SAVE_ALL                        /* 此刻 0x78(%rsp)=向量号, 0x80=错误码 */
+    movq    0x78(%rsp), %rsi        /* 参数 2: 向量号 */
+    /*
+     * 把「错误码 + CPU 压的 iretq 帧」整体下移 8 字节，盖掉那个临时槽，
+     * 让栈恢复成标准 pt_regs 布局（orig_rax 回到 PT_ORIG_RAX = 0x78）。
+     * 从低地址往高地址依次搬，源永远在目标上方 8 字节，不会自我覆盖。
+     * 这里拿 %rax 当搬运寄存器是安全的：它的真值已经在 PT_RAX 里，
+     * RESTORE_ALL 从那一格恢复，我们不碰那一格。
+     */
+    movq    0x80(%rsp), %rax        /* 错误码 → orig_rax */
+    movq    %rax, 0x78(%rsp)
+    movq    0x88(%rsp), %rax        /* rip */
+    movq    %rax, 0x80(%rsp)
+    movq    0x90(%rsp), %rax        /* cs */
+    movq    %rax, 0x88(%rsp)
+    movq    0x98(%rsp), %rax        /* rflags */
+    movq    %rax, 0x90(%rsp)
+    movq    0xa0(%rsp), %rax        /* rsp */
+    movq    %rax, 0x98(%rsp)
+    movq    0xa8(%rsp), %rax        /* ss */
+    movq    %rax, 0xa0(%rsp)
     movq    %rsp, %rdi              /* 参数 1: &mut PtRegs */
-    movq    %rax, %rsi              /* 参数 2: 向量号 */
     /* SysV ABI 要求 call 时 rsp 16 字节对齐。此刻 rsp 指向 pt_regs 起点，
        pt_regs 是 0xa8 字节且 iretq 帧本身 8 字节对齐，所以对齐性取决于
        进入异常时的栈。统一用 rbp 对齐一次，代价一条指令。 */
@@ -190,7 +218,6 @@ exc_common:
     .global IRQ\nr\()_interrupt
 IRQ\nr\()_interrupt:
     pushq   $~\nr
-    pushq   $\nr
     jmp     irq_common
     .endm
 
@@ -212,9 +239,23 @@ IRQ\nr\()_interrupt:
     BUILD_IRQ 15
 
 irq_common:
-    popq    %rax                    /* IRQ 号 */
+    /*
+     * bug-029：这里原本是「先 `pushq $nr` 传 IRQ 号，再在 irq_common 里
+     * `popq %rax` 取回」——而那条 pop **在 SAVE_ALL 之前**，把被打断任务的
+     * %rax 就地毁掉了，SAVE_ALL 存下去的是 IRQ 号，RESTORE_ALL 又老实把它
+     * 恢复回去。于是每个时钟滴答都让被打断的内核代码带着 %rax = 0 继续跑
+     * （时钟是 IRQ 0）。低 1GB 是恒等映射，所以那个 0 当指针用时不 page
+     * fault，而是静默读回实模式 IVT 的字节——`0xf000ff53` 那串 BIOS IRET
+     * 桩，表现为 i_mode=0xff53 / nlink=255 / s_magic=0xff53；当计数用时
+     * 就是「readdir 列出 0 项」。%rax 在滴答那一刻是否活着完全取决于寄存器
+     * 分配，所以改一行无关代码都能让失败率大幅跳动。
+     *
+     * orig_rax 那一格本来就存着 ~nr，SAVE_ALL 之后从 PT_ORIG_RAX 取出来取反
+     * 即可，不需要额外的 scratch push，也就不需要在保存前动任何寄存器。
+     */
     SAVE_ALL
-    movq    %rax, %rdi              /* 参数 1: irq */
+    movq    PT_ORIG_RAX(%rsp), %rdi /* 参数 1: irq = ~orig_rax */
+    notq    %rdi
     movq    %rsp, %rsi              /* 参数 2: &mut PtRegs（原版 do_IRQ 同序）*/
     movq    %rsp, %rbp
     andq    $-16, %rsp

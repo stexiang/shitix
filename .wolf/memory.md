@@ -216,3 +216,41 @@
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|
+
+## 2026-08-06 — bug-029 攻坚（症状归一，未关闭）
+
+| HH:MM | description | file(s) | outcome | ~tokens |
+|-------|-------------|---------|---------|---------|
+| -- | 修正失败率记录：不是 10-15%，是 40-55% | .wolf/STATUS.md | 旧记录误导了两个会话 | 2k |
+| -- | 症状归一：所有坏值 = 从物理地址 0 读（IVT 的 F000:FF53 BIOS IRET 桩） | -- | 0xFF53/255/65363 逐字节对上，低 1GB 恒等映射所以空指针不 fault | 8k |
+| -- | parse_inode 改裸指针 + read_volatile，不再经 &[u8] | src/fs/minix/inode_ops.rs | 有效 | 4k |
+| -- | BufferHead::data/data_mut 把 b_data 穿 asm 断 provenance | src/fs/buffer.rs | 与上一条合计 44%→24% 失败 | 3k |
+| -- | new_block 越界分支的 zone 泄漏修复（原版静默 return 0） | src/fs/minix/bitmap.rs | 真 bug，独立于 029 | 2k |
+| -- | reschedule / kernel_thread_entry 补 call 前 16B 栈对齐 | boot/entry.S | 正确性修复，对失败率无影响 | 2k |
+| -- | 排除 red zone / SSE spill：target spec 已 disable-redzone + soft-float | x86_64-shitix.json | 假设从机制上就不成立 | 1k |
+| -- | 排除 KSTACK_PAGES 4→8、compiler_fence、空 asm memory clobber | src/sched/mod.rs | 均无改善，已还原 | 3k |
+| -- | launder 加到 inode()/sb()/buf_ptr() 反而升到 64% 失败 | 三处，已 revert | 关键：失败率对 codegen 极敏感 | 4k |
+| -- | 清诊断 + 干净构建复测 | -- | PASS=9/20（45%），仅删打印语句就让率变动 | 6k |
+| -- | 更新 buglog bug-029 / cerebrum 五条 DNR / STATUS Next phase | .wolf/*.json,md | 交接完成 | 5k |
+
+**结论：** bug-029 未修复。三处真修复把率砍半但没关掉。下一步该换手段——查内核栈高水位
+（现有 `stack_high_water` 只覆盖 task[0] 静态栈，没覆盖 KSTACK 池那 8 份）、比对失败/
+成功两版的 objdump、或把 fs 自检整段 `cli` 串行化验证是否与中断时序耦合。**不要**再加
+屏障或审源码，这两条路本轮已走尽。
+
+### 同日续：bug-029 定位并修复 ✅
+
+| HH:MM | description | file(s) | outcome | ~tokens |
+|-------|-------------|---------|---------|---------|
+| -- | 决定性实验：用 cli 包住两个 fs 自检 | src/lib.rs（临时） | 20/20 过 vs 基线 9/20 → 范围缩到中断路径 | 3k |
+| -- | 关掉 do_timer 里整组看门狗单测 | src/sched/mod.rs（临时） | 18/20 → 看门狗只是噪声，不是根因 | 2k |
+| -- | KSTACK_PAGES 4→8 在干净基线上复测 | src/sched/mod.rs | 17/20，与 18/20 无差别 → 栈溢出彻底排除 | 2k |
+| -- | 读 irq_common：`popq %rax` 在 SAVE_ALL **之前** | boot/entry.S | **根因**：每滴答让被打断代码带 %rax=0 继续跑 | 4k |
+| -- | 修 BUILD_IRQ + irq_common：先 SAVE_ALL，IRQ 号从 PT_ORIG_RAX 取反 | boot/entry.S | 25/25 过（看门狗全开） | 3k |
+| -- | 修 exc_common 同一处潜伏写法 + 下移 iretq 帧 8 字节 | boot/entry.S | trap 自检 int3/div/ud 全绿；20/20 过 | 4k |
+| -- | 清临时诊断、复测、更新 buglog/cerebrum/STATUS | .wolf/*, src/lib.rs | 累计 45 连过 | 4k |
+
+**根因一句话：** `irq_common` 在 SAVE_ALL 之前 `popq %rax` 取 IRQ 号，毁掉被打断上下文的
+%rax；RESTORE_ALL 把 IRQ 号当 rax 恢复。时钟是 IRQ 0，所以每滴答注入一个 %rax=0。低 1GB
+恒等映射 ⇒ 空指针读不 fault，静默返回 IVT 的 `f000ff53`，于是 `i_mode=0xff53`/`nlink=255`
+/`readdir 0 项` 全部对上。失败率对无关改动敏感，是因为 %rax 是否活着取决于寄存器分配。

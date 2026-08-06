@@ -155,11 +155,17 @@ impl BufferHead {
         // LLVM 认为内存已被外部改写，从而作废所有缓存的载入——这正是需要的。
         // 单核不需要 CPU 级屏障（没有别的核，ramdisk 也不是真 DMA），
         // 所以不用 `mfence`，一条空 asm 就够。
-        // SAFETY: 空指令序列，只借它的 memory clobber 语义。
-        unsafe { core::arch::asm!("", options(nostack, preserves_flags)) };
+        // 单独一条 memory clobber 还不够：屏障之后新建的引用照样满足
+        // `readonly` 推断，LLVM 仍能证明「从这条引用建立到失效期间无人写」，
+        // 于是把上一轮的载入 CSE 过来。要断掉的是**来源**——把指针本身穿过
+        // 一条 asm，LLVM 就追不到它从哪来，只能老老实实每次都真读。
         // SAFETY: b_data 由 init 从页分配器取得，长度恰为 b_size；
-        // 契约保证没有并发 I/O 在改它。
-        unsafe { core::slice::from_raw_parts(self.b_data, self.b_size) }
+        // 契约保证没有并发 I/O 在改它。上面 data_ok() 已校验非空/对齐/在界。
+        unsafe {
+            let mut p = self.b_data;
+            core::arch::asm!("/* launder {0} */", inout(reg) p, options(nostack, preserves_flags));
+            core::slice::from_raw_parts(p, self.b_size)
+        }
     }
 
     /// 数据区的可写切片。改完必须置 `b_dirt = true`。
@@ -174,12 +180,14 @@ impl BufferHead {
                    index_of(self), self.b_data as usize, self.b_size,
                    self.b_dev, self.b_blocknr, self.b_count, self.b_lock);
         }
-        // 同 data() 里那段长注释：空 asm 的 memory clobber 作废掉编译器
-        // 缓存的载入。`&mut` 上还多一层 noalias，重排的余地比只读切片更大。
-        // SAFETY: 空指令序列，只借它的 memory clobber 语义。
-        unsafe { core::arch::asm!("", options(nostack, preserves_flags)) };
+        // 同 data()：把指针穿过 asm 断掉来源推断。`&mut` 上还多一层
+        // noalias，重排的余地比只读切片更大，更需要这一手。
         // SAFETY: 同 data；&mut self 保证 Rust 侧独占。
-        unsafe { core::slice::from_raw_parts_mut(self.b_data, self.b_size) }
+        unsafe {
+            let mut p = self.b_data;
+            core::arch::asm!("/* launder {0} */", inout(reg) p, options(nostack, preserves_flags));
+            core::slice::from_raw_parts_mut(p, self.b_size)
+        }
     }
 }
 
@@ -818,20 +826,6 @@ pub unsafe fn bread(dev: u16, block: u32, size: usize) -> Option<usize> {
         ll_rw_block(READ, &mut [n]);
         wait_on_buffer(n);
         if bh(n).b_uptodate {
-            // bug-029 定位：见 ramdisk 里同样的检查。驱动那一侧不报、这里报，
-            // 就说明数据是在 memcpy 之后、交回调用方之前被改的。
-            let p = bh(n).b_data;
-            if core::ptr::read_volatile(p) == 0x53
-                && core::ptr::read_volatile(p.add(1)) == 0xff
-                && core::ptr::read_volatile(p.add(2)) == 0x00
-                && core::ptr::read_volatile(p.add(3)) == 0xf0
-            {
-                panic!(
-                    "bread: IVT pattern in buf {} dev={:#06x} blk={} b_data={:#x} \
-                     (asked dev={:#06x} blk={})",
-                    n, bh(n).b_dev, bh(n).b_blocknr, p as usize, dev, block
-                );
-            }
             return Some(n);
         }
         brelse(n);
