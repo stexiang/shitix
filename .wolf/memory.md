@@ -254,3 +254,29 @@
 %rax；RESTORE_ALL 把 IRQ 号当 rax 恢复。时钟是 IRQ 0，所以每滴答注入一个 %rax=0。低 1GB
 恒等映射 ⇒ 空指针读不 fault，静默返回 IVT 的 `f000ff53`，于是 `i_mode=0xff53`/`nlink=255`
 /`readdir 0 项` 全部对上。失败率对无关改动敏感，是因为 %rax 是否活着取决于寄存器分配。
+
+## Session: 2026-08-06 00:23
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 00:36
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 00:37
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 00:37
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07
+
+| Time  | Action | File(s) | Outcome | ~Tokens |
+|-------|--------|---------|---------|--------|
+| 17:22 | ext4 selftest 体积超限修复：_kernel_end 0x934F0→0x8A4F0（23KB 余量）；selftest.rs 重写为零 format_args!（42KB→8KB 对象文件）；新增 Ext4SuperBlock::from_slice(&[u8])；修 gd 64bit hi 字节偏移；51/51 全通过 | src/fs/ext4/selftest.rs, src/fs/ext4/super_block.rs | PASS | ~25k |

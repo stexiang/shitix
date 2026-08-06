@@ -2,19 +2,19 @@
   "version": 1,
   "created_at": "2026-08-01T19:00:19.430Z",
   "lifetime": {
-    "total_tokens_estimated": 33769,
-    "total_reads": 21,
+    "total_tokens_estimated": 168948,
+    "total_reads": 49,
     "total_writes": 0,
-    "total_sessions": 37,
-    "anatomy_hits": 9,
-    "anatomy_misses": 12,
-    "repeated_reads_blocked": 2,
-    "estimated_savings_vs_bare_cli": 13896,
-    "real_input_tokens": 534038,
-    "real_output_tokens": 251091,
-    "real_cache_read_tokens": 50147596,
-    "real_cache_creation_tokens": 11792561,
-    "real_api_calls": 695
+    "total_sessions": 43,
+    "anatomy_hits": 33,
+    "anatomy_misses": 16,
+    "repeated_reads_blocked": 14,
+    "estimated_savings_vs_bare_cli": 77215,
+    "real_input_tokens": 1071494,
+    "real_output_tokens": 481599,
+    "real_cache_read_tokens": 107109971,
+    "real_cache_creation_tokens": 22369835,
+    "real_api_calls": 1300
   },
   "sessions": [
     {
@@ -333,6 +333,222 @@
         "cache_read_input_tokens": 12014735,
         "cache_creation_input_tokens": 1465546,
         "api_calls": 128
+      }
+    },
+    {
+      "id": "session-2026-08-06-2104",
+      "agent": "claude",
+      "started": "2026-08-06T13:04:03.489Z",
+      "ended": "2026-08-06T16:23:02.018Z",
+      "reads": [
+        {
+          "file": "/root/shitix/src/fs/buffer.rs",
+          "tokens_estimated": 10437,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/syscall/sys.rs",
+          "tokens_estimated": 16229,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/drivers/block/ll_rw.rs",
+          "tokens_estimated": 5167,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/minix/bitmap.rs",
+          "tokens_estimated": 3290,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/sched/mod.rs",
+          "tokens_estimated": 10110,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/mm/page_alloc.rs",
+          "tokens_estimated": 5091,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/drivers/block/ramdisk.rs",
+          "tokens_estimated": 2184,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/minix/namei.rs",
+          "tokens_estimated": 5300,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/minix/dir.rs",
+          "tokens_estimated": 1153,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/lib.rs",
+          "tokens_estimated": 11062,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [],
+      "totals": {
+        "input_tokens_estimated": 70023,
+        "output_tokens_estimated": 0,
+        "reads_count": 10,
+        "writes_count": 0,
+        "repeated_reads_blocked": 6,
+        "anatomy_lookups": 10
+      },
+      "real_usage": {
+        "input_tokens": 531768,
+        "output_tokens": 148042,
+        "cache_read_input_tokens": 46809367,
+        "cache_creation_input_tokens": 7836110,
+        "api_calls": 495
+      }
+    },
+    {
+      "id": "session-2026-08-06-0037",
+      "agent": "claude",
+      "started": "2026-08-06T16:37:27.814Z",
+      "ended": "2026-08-06T17:33:27.026Z",
+      "reads": [
+        {
+          "file": "/root/shitix/src/fs/ext4/inode.rs",
+          "tokens_estimated": 2440,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/lib.rs",
+          "tokens_estimated": 11062,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4/selftest.rs",
+          "tokens_estimated": 0,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4/extent.rs",
+          "tokens_estimated": 1613,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4",
+          "tokens_estimated": 0,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4/super_block.rs",
+          "tokens_estimated": 4300,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4/group_desc.rs",
+          "tokens_estimated": 0,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/fs/ext4/dir.rs",
+          "tokens_estimated": 0,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/serial.rs",
+          "tokens_estimated": 723,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/console.rs",
+          "tokens_estimated": 2187,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/signal.rs",
+          "tokens_estimated": 3493,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/exit.rs",
+          "tokens_estimated": 1709,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/sched/task.rs",
+          "tokens_estimated": 1936,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/syscall/sys.rs",
+          "tokens_estimated": 16229,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/boot/entry.S",
+          "tokens_estimated": 2628,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/traps.rs",
+          "tokens_estimated": 3490,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/sched/mod.rs",
+          "tokens_estimated": 10110,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/root/shitix/src/mm/paging.rs",
+          "tokens_estimated": 3236,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [],
+      "totals": {
+        "input_tokens_estimated": 65156,
+        "output_tokens_estimated": 0,
+        "reads_count": 18,
+        "writes_count": 0,
+        "repeated_reads_blocked": 6,
+        "anatomy_lookups": 14
+      },
+      "real_usage": {
+        "input_tokens": 5688,
+        "output_tokens": 82466,
+        "cache_read_input_tokens": 10153008,
+        "cache_creation_input_tokens": 2741164,
+        "api_calls": 110
       }
     }
   ],

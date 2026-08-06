@@ -56,6 +56,10 @@
 - 分发表现在是「按号顺序逐项赋值 + 一张 `WIRED` 位图」。位图存在的理由：release 下 LLVM 会把函数体相同的 `sys_*` 折叠成同一地址，靠比函数指针数已实现槽位会漏数，见 buglog bug-028。
 - `ni_syscall` 返回 `-EINVAL`（号合法但未实现，照抄 1.0.9），`do_syscall` 的越界分支返回 `-ENOSYS`。两条路径的返回值不同，自检靠这个区分，别统一。
 
+- **selftest 里用 `serial::print`/`serial::print_dec` 而不是 `kprintln!`**（2026-08-07）：`kprintln!` 宏展开成 `println!` + `sprintln!`，每次调用生成**两份** `format_args!` 描述符（静态 `.rodata`：格式片段数组 + 参数类型数组）。opt-level=0 下 LLVM 不合并不同调用点的相同字面量，50 个 `kprintln!("ext4: {} -> ok", tag)` 产生 ~100 份描述符，把 selftest 对象从 8KB 涨到 43KB，直接撞 `_kernel_end <= 0x90000` 的 ASSERT。修法：selftest 里改用 `crate::serial::print(s: &str)` 和 `crate::serial::print_dec(v: u64)` 直接写串口，**零 `format_args!`**；失败才打印，成功静默；宏 `check!(tag, bool_expr)` 在检查宏里做分支。降到 8KB（减少 80%）。
+
+- **`block_bitmap_hi` 是 offset 32 的 little-endian u32，不是 offset 34 的字节**（2026-08-07）：`group_desc.rs::rd32(32)` 读 `u32::from_le_bytes([d[32],d[33],d[34],d[35]])`。要让 `hi=1`，必须 `d[32]=1`（LSB 在低地址），不是 `d[34]=1`（那会让 rd32(32)=0x00010000，hi 高 16 位为 1 而非低 16 位）。见 bug-030。规律：**构造 LE 字段的测试数据时，永远把期望值写进最低地址字节（小端序 LSB first）**。
+
 ## Do-Not-Repeat
 
 <!-- Mistakes made and corrected. Each entry prevents the same mistake recurring. -->

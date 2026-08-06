@@ -1,4 +1,4 @@
-<!-- Last updated: 2026-08-06 (bug-029 已修复：irq_common 在 SAVE_ALL 前 popq %rax 毁掉被打断的寄存器；45 连过) -->
+<!-- Last updated: 2026-08-07 (ext4 selftest 51/51 all ok；_kernel_end=0x8A4F0；bug-030 已修) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
@@ -50,10 +50,16 @@
 - 验证：三个自检全绿 —— traps(int3/除零/无效opcode 都打印完整现场并恢复继续跑)、syscall(getpid/getppid/越界→-ENOSYS/未实现→-EINVAL/write 到控制台/uname)、sched(timer 21 ticks、两个内核线程各跑 14 轮、42 次上下文切换)；debug + release + `-m 32M/1G` 四轮均 PASS；零警告
 - 踩坑五个，全部记入 buglog bug-003..009：GDT 代码段 L&&D 非法组合→三重错误；`asm!` 的 nomem/nostack 谎报；jiffies/TRAP_COUNT 非 volatile 被提升；schedule 候选扫描没跳过 task[0]；do_timer 跳过 task[0] 导致 need_resched 永不置位
 
+**模块 8：ext4 磁盘结构解析器 + 51 项自检**（2026-08-07）
+- `src/fs/ext4/` 共 1291 行：超级块、GroupDesc（32B/64B）、inode、ExtentHeader/Idx/Extent、DirIter 等结构体及访问器
+- `src/fs/ext4/selftest.rs`：51 项覆盖超级块字段、GroupDesc 32B/64B、inode 类型/uid/gid/size、extent lookup（hit/hole/mid/unwritten/48bit phys）、DirIter、corruption dir、ino_to_group/disk；零 `format_args!` 节约约 35KB rodata
+- `src/fs/ext4/super_block.rs`：加 `from_slice(&[u8])` 变体，selftest 用 128 字节缓冲而不是 1024
+- 验证：QEMU `ext4: selftest 51/51 all ok`，`_kernel_end = 0x8A4F0`（23KB 余量）
+- 踩坑：`kprintln!` 双份 `format_args!` 让 selftest 对象涨 5× → 撞 ASSERT（详见 cerebrum 2026-08-07 条目）；block_bitmap_hi 字节偏移写错（bug-030）
+
 ---
 
 
-### 模块 5：文件系统与设备驱动（2026-08-02）
 22 个新文件，约 5000 行：缓冲缓存（`fs/buffer.c`）、块请求队列
 （`ll_rw_blk.c`）、ramdisk、tty/console/keyboard/mem 字符设备、
 VFS（inode/file_table/super_block/devices/namei/open/read_write/stat）、

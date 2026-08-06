@@ -43,12 +43,17 @@ pub mod super_block;
 pub mod inode;
 pub mod extent;
 pub mod feature;
+pub mod group_desc;
+pub mod dir;
+pub mod selftest;
 
 // Re-exports
 pub use super_block::{Ext4SuperBlock, Ext4FeatureFlags};
 pub use inode::Ext4Inode;
-pub use extent::{ExtentHeader, ExtentIdx, Extent, ExtentTree};
+pub use extent::{ExtentHeader, ExtentIdx, Extent, ExtentNode};
 pub use feature::Ext4Features;
+pub use group_desc::Ext4GroupDesc;
+pub use dir::{Ext4DirEntry, DirIter};
 
 /// ext4 文件类型
 pub mod file_type {

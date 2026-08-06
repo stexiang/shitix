@@ -563,6 +563,19 @@
       "last_seen": "2026-08-06",
       "notes": "此前被归给 bug-023 (mkfs.minix failed / unable to mount root)，但 bug-023 已记录为已修 (fs_init_thread 不在 task[0] 里跑)，且其成因「在 task[0] 里睡」已不存在。两者症状重叠但可能是不同根因。大概率不是 minix 独有：do_unlink/dir_namei/buffer cache 都在 VFS 层，换 ext4 会一起带过去。",
       "status": "fixed"
+    },
+    {
+      "id": "bug-030",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "ext4 selftest FAIL: gd 64bit hi — block_bitmap 期望 0x1_0000_0001, 实际 0x0001_0000_0001",
+      "file": "src/fs/ext4/selftest.rs",
+      "root_cause": "测试构造 GroupDesc 64 位时，设 d[34]=1 想让 block_bitmap_hi=1。但 group_desc.rs 的 rd32(32) 按 little-endian u32 读 offset 32，即 u32::from_le_bytes([d[32],d[33],d[34],d[35]])。d[34]=1 → rd32(32)=0x0001_0000，block_bitmap = (0x0001_0000u64 << 32) | 1 ≠ 0x1_0000_0001。",
+      "fix": "d[34]=1 改为 d[32]=1，使 rd32(32)=1，block_bitmap = (1u64 << 32) | 1 = 0x1_0000_0001。",
+      "tags": ["ext4","group-desc","selftest","little-endian","field-offset"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
     }
   ]
 }

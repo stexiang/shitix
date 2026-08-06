@@ -50,51 +50,67 @@ pub struct Ext4Inode {
     pub i_block_triple_indirect: u32,
     /// 世代数
     pub i_generation: u32,
-    /// 文件 ACL
+    /// 扩展属性块（低 32 位）
     pub i_file_acl: u32,
-    /// 目录 ACL
+    /// 文件大小高 32 位（老名字 i_dir_acl）
     pub i_size_high: u32,
-    /// 碎片块号
+    /// 碎片块号（ext4 已废弃，恒为 0）
     pub i_fragment_addr: u32,
-    /// 操作系统特定值 2
+    /// 操作系统特定值 2。Linux 下是
+    /// `l_i_blocks_hi(2) l_i_file_acl_high(2) l_i_uid_high(2)
+    ///  l_i_gid_high(2) l_i_checksum_lo(2) l_i_reserved(2)`
     pub i_osd2: [u8; 12],
-    
-    // ext4 特定字段 (偏移 128)
-    /// 创建时间 (ctime nanoseconds)
-    pub i_crtime_extra: u32,
-    /// 修改时间 (mtime nanoseconds)
-    pub i_mtime_extra: u32,
-    /// 访问时间 (atime nanoseconds)
-    pub i_atime_extra: u32,
-    /// 创建时间
-    pub i_crtime: u32,
-    /// 版本号
-    pub i_version_hi: u32,
-    /// 扩展属性大小
+
+    // ---- ext4 额外字段（偏移 128 起，仅当 i_extra_isize 覆盖到才有效）----
+    /// 本 inode 用掉的额外字节数。它自己在偏移 128，是判断后面字段
+    /// 是否存在的依据（内核 `EXT4_FITS_IN_INODE` 宏）。
     pub i_extra_isize: u16,
-    /// 保留
-    pub i_pad1: u16,
-    /// 保留用于 i_links_count
-    pub i_links_count_hi: u16,
-    /// 保留用于 i_uid
-    pub i_uid_hi: u16,
-    /// 保留用于 i_gid
-    pub i_gid_hi: u16,
-    /// 校验和
-    pub i_checksum_lo: u16,
-    /// 保留
-    pub i_reserved: u16,
+    /// inode 校验和高 16 位
+    pub i_checksum_hi: u16,
+    /// ctime 的纳秒 + 纪元高位
+    pub i_ctime_extra: u32,
+    /// mtime 的纳秒 + 纪元高位
+    pub i_mtime_extra: u32,
+    /// atime 的纳秒 + 纪元高位
+    pub i_atime_extra: u32,
+    /// 创建时间（秒）
+    pub i_crtime: u32,
+    /// 创建时间的纳秒 + 纪元高位
+    pub i_crtime_extra: u32,
+    /// inode 版本高 32 位
+    pub i_version_hi: u32,
+    /// project id
+    pub i_projid: u32,
 }
 
 impl Ext4Inode {
-    /// inode 大小 (ext4 默认 256)
+    /// ext4 默认的磁盘 inode 大小
     pub const SIZE: usize = 256;
+    /// ext2 老格式的 inode 大小，也是解析所需的最小字节数
+    pub const MIN_SIZE: usize = 128;
     
-    /// 从字节创建
-    pub unsafe fn from_bytes(data: &[u8]) -> Self {
-        debug_assert!(data.len() >= Self::SIZE);
-        
-        Self {
+    /// 从磁盘字节解析一个 inode。
+    ///
+    /// `data` 至少要有 [`Self::MIN_SIZE`]（128）字节；不足 256 字节时
+    /// ext4 额外字段全部按 0 处理（那是 ext2 的 128 字节 inode）。
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::MIN_SIZE {
+            return None;
+        }
+
+        // 越界返 0 的读取器：128 字节 inode 走这条路，读到 128 之后全是 0。
+        fn rd16(d: &[u8], o: usize) -> u16 {
+            if o + 2 <= d.len() { u16::from_le_bytes([d[o], d[o + 1]]) } else { 0 }
+        }
+        fn rd32(d: &[u8], o: usize) -> u32 {
+            if o + 4 <= d.len() {
+                u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+            } else {
+                0
+            }
+        }
+
+        let mut inode = Self {
             i_mode: u16::from_le_bytes([data[0], data[1]]),
             i_uid: u16::from_le_bytes([data[2], data[3]]),
             i_size_lo: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
@@ -127,44 +143,91 @@ impl Ext4Inode {
                 osd2.copy_from_slice(&data[116..128]);
                 osd2
             },
-            i_crtime_extra: if data.len() >= 132 { u32::from_le_bytes([data[128], data[129], data[130], data[131]]) } else { 0 },
-            i_mtime_extra: if data.len() >= 136 { u32::from_le_bytes([data[132], data[133], data[134], data[135]]) } else { 0 },
-            i_atime_extra: if data.len() >= 140 { u32::from_le_bytes([data[136], data[137], data[138], data[139]]) } else { 0 },
-            i_crtime: if data.len() >= 144 { u32::from_le_bytes([data[140], data[141], data[142], data[143]]) } else { 0 },
-            i_version_hi: if data.len() >= 148 { u32::from_le_bytes([data[144], data[145], data[146], data[147]]) } else { 0 },
-            i_extra_isize: if data.len() >= 150 { u16::from_le_bytes([data[148], data[149]]) } else { 0 },
-            i_pad1: if data.len() >= 152 { u16::from_le_bytes([data[150], data[151]]) } else { 0 },
-            i_links_count_hi: if data.len() >= 154 { u16::from_le_bytes([data[152], data[153]]) } else { 0 },
-            i_uid_hi: if data.len() >= 156 { u16::from_le_bytes([data[154], data[155]]) } else { 0 },
-            i_gid_hi: if data.len() >= 158 { u16::from_le_bytes([data[156], data[157]]) } else { 0 },
-            i_checksum_lo: if data.len() >= 160 { u16::from_le_bytes([data[158], data[159]]) } else { 0 },
-            i_reserved: if data.len() >= 162 { u16::from_le_bytes([data[160], data[161]]) } else { 0 },
+            // 128 字节 inode（ext2 老格式）没有下面这些字段。逐个字段
+            // 单独判长度是原来的写法，但那样 i_extra_isize 说了不算——
+            // 真正的判据是 128 + i_extra_isize 是否覆盖到该字段（内核
+            // EXT4_FITS_IN_INODE）。这里先按缓冲长度取，再用 extra_isize
+            // 把没覆盖到的清掉。
+            i_extra_isize: rd16(data, 128),
+            i_checksum_hi: rd16(data, 130),
+            i_ctime_extra: rd32(data, 132),
+            i_mtime_extra: rd32(data, 136),
+            i_atime_extra: rd32(data, 140),
+            i_crtime: rd32(data, 144),
+            i_crtime_extra: rd32(data, 148),
+            i_version_hi: rd32(data, 152),
+            i_projid: rd32(data, 156),
+        };
+
+        // i_extra_isize 之后没覆盖到的额外字段按「不存在」处理，避免把
+        // 别人的 xattr 数据当时间戳用。
+        let covered = 128usize + inode.i_extra_isize as usize;
+        let fits = |end: usize| end <= covered;
+        if !fits(132) { inode.i_checksum_hi = 0 }
+        if !fits(136) { inode.i_ctime_extra = 0 }
+        if !fits(140) { inode.i_mtime_extra = 0 }
+        if !fits(144) { inode.i_atime_extra = 0 }
+        if !fits(148) { inode.i_crtime = 0 }
+        if !fits(152) { inode.i_crtime_extra = 0 }
+        if !fits(156) { inode.i_version_hi = 0 }
+        if !fits(160) { inode.i_projid = 0 }
+        Some(inode)
+    }
+    
+    /// 从 `i_osd2` 里取一个小端 u16（Linux 的 `osd2.linux2` 各字段）
+    #[inline]
+    fn osd2_u16(&self, off: usize) -> u16 {
+        let b = self.i_osd2;
+        u16::from_le_bytes([b[off], b[off + 1]])
+    }
+
+    /// 文件大小（64 位）。
+    ///
+    /// 只有常规文件才用 `i_size_high` 当高 32 位——目录里那个字段是老的
+    /// `i_dir_acl`。内核 `ext4_isize()` 同样只对 S_ISREG 合并高位。
+    pub fn i_size(&self) -> u64 {
+        if self.is_reg() {
+            ((self.i_size_high as u64) << 32) | (self.i_size_lo as u64)
+        } else {
+            self.i_size_lo as u64
         }
     }
-    
-    /// 获取文件大小 (64 位)
-    pub fn i_size(&self) -> u64 {
-        (self.i_size_high as u64) << 32 | (self.i_size_lo as u64)
-    }
-    
-    /// 获取块数 (64 位支持)
+
+    /// 512 字节扇区数（48 位）。高 16 位在 `i_osd2` 的 `l_i_blocks_hi`。
     pub fn i_blocks(&self) -> u64 {
-        self.i_blocks_lo as u64
+        ((self.osd2_u16(0) as u64) << 32) | (self.i_blocks_lo as u64)
     }
-    
-    /// 获取链接计数 (支持 > 65535)
+
+    /// 硬链接数。ext4 的 `i_links_count` 就是 16 位，没有高位扩展；
+    /// 目录链接数超过 65000 时内核把它写成 1（`EXT4_LINK_MAX` 语义）。
     pub fn links_count(&self) -> u32 {
-        ((self.i_links_count_hi as u32) << 16) | (self.i_links_count as u32)
+        self.i_links_count as u32
     }
-    
-    /// 获取 UID (支持 > 65535)
+
+    /// UID（32 位）。高 16 位在 `i_osd2` 的 `l_i_uid_high`（偏移 4）。
     pub fn uid(&self) -> u32 {
-        ((self.i_uid_hi as u32) << 16) | (self.i_uid as u32)
+        ((self.osd2_u16(4) as u32) << 16) | (self.i_uid as u32)
     }
-    
-    /// 获取 GID (支持 > 65535)
+
+    /// GID（32 位）。高 16 位在 `i_osd2` 的 `l_i_gid_high`（偏移 6）。
     pub fn gid(&self) -> u32 {
-        ((self.i_gid_hi as u32) << 16) | (self.i_gid as u32)
+        ((self.osd2_u16(6) as u32) << 16) | (self.i_gid as u32)
+    }
+
+    /// `i_block` 那 60 字节的原始内容。
+    ///
+    /// 走 extent 的 inode 把 extent 树根（12 字节头 + 最多 4 条）塞在这里，
+    /// 所以不能只当 15 个 u32 块号看。这里把结构体里拆开存的三个间接块号
+    /// 拼回去，还原成磁盘上连续的 60 字节。
+    pub fn i_block_raw(&self) -> [u8; 60] {
+        let mut out = [0u8; 60];
+        for i in 0..12 {
+            out[i * 4..i * 4 + 4].copy_from_slice(&self.i_block[i].to_le_bytes());
+        }
+        out[48..52].copy_from_slice(&self.i_block_indirect.to_le_bytes());
+        out[52..56].copy_from_slice(&self.i_block_double_indirect.to_le_bytes());
+        out[56..60].copy_from_slice(&self.i_block_triple_indirect.to_le_bytes());
+        out
     }
     
     /// 获取访问时间 (秒)
@@ -182,19 +245,33 @@ impl Ext4Inode {
         self.i_ctime
     }
     
-    /// 检查是否是目录
+    // 类型判断必须先用 S_IFMT 掩掉低位再比相等。原来写的是
+    // `mode & 0x4000 != 0` 之类：0xA000（符号链接）会同时被 is_dir
+    // 判成真（0xA000 & 0x4000 == 0）——实际上 0xA000 & 0x8000 != 0，
+    // 于是符号链接被 is_reg 认成常规文件，而 i_size 又只对常规文件
+    // 合并高 32 位，链接目标长度会被当成 64 位大小读。
+
+    /// 是否是目录
     pub fn is_dir(&self) -> bool {
-        (self.i_mode & 0x4000) != 0
+        self.i_mode & mode::S_IFMT == mode::S_IFDIR
     }
-    
-    /// 检查是否是常规文件
+
+    /// 是否是常规文件
     pub fn is_reg(&self) -> bool {
-        (self.i_mode & 0x8000) != 0
+        self.i_mode & mode::S_IFMT == mode::S_IFREG
     }
-    
-    /// 检查是否是符号链接
+
+    /// 是否是符号链接
     pub fn is_symlink(&self) -> bool {
-        (self.i_mode & 0xA000) == 0xA000
+        self.i_mode & mode::S_IFMT == mode::S_IFLNK
+    }
+
+    /// 是否是快速符号链接（目标直接存在 `i_block` 的 60 字节里）。
+    ///
+    /// 判据是内核的 `ext4_inode_is_fast_symlink()`：符号链接且没有分配
+    /// 数据块。LFS 的 `/lib`、`/bin` 之类几乎全是快速符号链接。
+    pub fn is_fast_symlink(&self) -> bool {
+        self.is_symlink() && self.i_blocks() == 0 && self.i_size_lo as usize <= 60
     }
     
     /// 检查是否使用 extent

@@ -708,6 +708,9 @@ fn fs_init_thread(_arg: u64) {
 
     fs_selftest();
     syscall_fs_selftest();
+    // ext4 解析器自检（纯内存，不依赖挂载状态；放在这里只是跟其他 fs
+    // 自检放一起，实际上在 task[0] 里跑也行）。
+    fs::ext4::selftest::ext4_selftest();
 
     // 栈底魔数还在吗？内核线程只有一页栈，fs 的调用链又深，溢出是
     // 真实风险（踩过一次）。这里显式查一次，比事后从 page fault 的

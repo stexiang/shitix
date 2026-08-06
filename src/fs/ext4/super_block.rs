@@ -213,8 +213,77 @@ pub struct Ext4SuperBlock {
 }
 
 impl Ext4SuperBlock {
+    /// 从任意长度字节切片读取超级块核心字段（offset 0..103）。
+    /// 超出切片范围的字段置零；s_uuid、s_reserved 等大字段始终置零。
+    /// 适合探测与测试时传入小缓冲。
+    ///
+    /// # Safety
+    /// 调用方保证 `data` 来自合法映射内存。
+    pub unsafe fn from_slice(data: &[u8]) -> Self {
+        #[inline(always)]
+        fn r16(d: &[u8], o: usize) -> u16 {
+            if o + 1 < d.len() { u16::from_le_bytes([d[o], d[o+1]]) } else { 0 }
+        }
+        #[inline(always)]
+        fn r32(d: &[u8], o: usize) -> u32 {
+            if o + 3 < d.len() { u32::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3]]) } else { 0 }
+        }
+        Self {
+            s_inodes_count:        r32(data,  0),
+            s_blocks_count_lo:     r32(data,  4),
+            s_r_blocks_count_lo:   r32(data,  8),
+            s_free_blocks_count_lo:r32(data, 12),
+            s_free_inodes_count:   r32(data, 16),
+            s_first_data_block:    r32(data, 20),
+            s_log_block_size:      r32(data, 24),
+            s_log_frag_size:       r32(data, 28),
+            s_blocks_per_group:    r32(data, 32),
+            s_fragments_per_group: r32(data, 36),
+            s_inodes_per_group:    r32(data, 40),
+            s_mtime:               r32(data, 44),
+            s_wtime:               r32(data, 48),
+            s_mnt_count:           r16(data, 52),
+            s_max_mnt_count:       r16(data, 54),
+            s_magic:               r16(data, 56),
+            s_state:               r16(data, 58),
+            s_errors:              r16(data, 60),
+            s_minor_rev_level:     r16(data, 62),
+            s_lastcheck:           r32(data, 64),
+            s_checkinterval:       r32(data, 68),
+            s_creator_os:          r32(data, 72),
+            s_rev_level:           r32(data, 76),
+            s_def_resuid:          r16(data, 80),
+            s_def_resgid:          r16(data, 82),
+            s_first_ino:           r32(data, 84),
+            s_inode_size:          r16(data, 88),
+            s_block_group_nr:      r16(data, 90),
+            s_feature_compat:      r32(data, 92),
+            s_feature_incompat:    r32(data, 96),
+            s_feature_ro_compat:   r32(data,100),
+            s_uuid:                [0; 16],
+            s_volume_name:         [0; 16],
+            s_last_mounted:        [0; 64],
+            s_algo_bitmap:         0,
+            s_prealloc_blocks:     0,
+            s_prealloc_dir_blocks: 0,
+            s_padding1:            0,
+            s_journal_uuid:        [0; 16],
+            s_journal_inum:        0,
+            s_journal_dev:         0,
+            s_last_orphan:         0,
+            s_hash_seed:           [0; 4],
+            s_def_hash_version:    0,
+            s_reserved_char_pad:   0,
+            s_reserved_word_pad:   0,
+            s_default_mount_opts:  0,
+            s_first_meta_bg:       0,
+            s_reserved:            [0; 190],
+            s_checksum:            0,
+        }
+    }
+
     /// 从原始字节读取超级块
-    /// 
+    ///
     /// ext4 超级块只占用 1024 字节，ext4 特有的 checksum 字段在 1024 字节之外
     /// 需要从额外的数据中读取
     pub unsafe fn from_bytes(data: &[u8; 1024]) -> Self {
