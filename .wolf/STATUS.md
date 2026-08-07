@@ -1,9 +1,9 @@
-<!-- Last updated: 2026-08-07 (ext4 selftest 51/51 all ok；_kernel_end=0x8A4F0；bug-030 已修) -->
+<!-- Last updated: 2026-08-07 (Stage 3 完成——ring-3 往返成功；_kernel_end=0x8D570, 10.6KB 余量；bug-034~037 已修) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
 > Update this file at the end of every work phase so the next `/clear` resumes in 1 read.
-> Last updated (was): 2026-08-06 (模块 7 完成；syscall 表 361 wired，fs 层通畅，BSS 44KB 余量)
+> Last updated (was): 2026-08-07 (ext4 selftest 51/51 all ok；_kernel_end=0x8A4F0；bug-030 已修)
 
 ---
 
@@ -56,6 +56,49 @@
 - `src/fs/ext4/super_block.rs`：加 `from_slice(&[u8])` 变体，selftest 用 128 字节缓冲而不是 1024
 - 验证：QEMU `ext4: selftest 51/51 all ok`，`_kernel_end = 0x8A4F0`（23KB 余量）
 - 踩坑：`kprintln!` 双份 `format_args!` 让 selftest 对象涨 5× → 撞 ASSERT（详见 cerebrum 2026-08-07 条目）；block_bitmap_hi 字节偏移写错（bug-030）
+
+**Stage 2：进程生命周期——signal / exit / fork / wait4**（2026-08-07）
+- 接受标准全部达标（见 `exit::fork_selftest` 端到端）：
+  1. ✅ `send_sig(SIGSEGV, ...)` 真正投递：用户态异常不再只打日志，`traps.rs` 直接调 `signal::send_sig`，`entry.S:ret_from_sys_call` 钩子接 `do_signal` 在返回用户态前执行
+  2. ✅ `do_exit` 完整流程：close_all → reparent_children → state = Zombie → notify_parent(SIGCHLD + wake_up_waiter) → schedule()
+  3. ✅ `sys_fork` 真正复制：pt_regs 21 qwords 复制到子进程内核栈（rax=0），switch_to 帧（7 slots），挂进调度环，父返 child_pid 子返 0
+  4. ✅ `ret_from_sys_call` 接 `do_signal`：`signal_pending_c` 谓词 → `do_signal(regs)` 循环消费信号（SIG_DFL/SIG_IGN/自定义→terminate）
+- 变更文件：
+  | Type | File | What |
+  |------|------|------|
+  | edit | `src/signal.rs` | per-task sigaction 表（按需分页，128B 指针数组→get_free_page）、`do_signal`（SIG_DFL/SIG_IGN/STOP/CONT 全分支）、`send_sig` 补原版 `generate()` 过滤（SIG_DFL 默认忽略的不置位）|
+  | edit | `src/exit.rs` | `do_exit` 补齐（close_all + reparent_children + 正确退出码/信号编码）、`release` 补 `free_page`/`reset_sigactions`、`sys_wait4` 完整体（四种 pid 语义 + WNOHANG/WUNTRACED + Interruptible 睡眠 + 收尸 release）|
+  | edit | `src/syscall/sys.rs` | `fork` 重写（irq_save 临界区 + 栈魔数 + pt_regs 21 qwords 复制 + rax=0 + switch_to 帧 + 调度环插入）、`wait4` 接到 `exit::sys_wait4` |
+  | edit | `boot/entry.S` | `ret_from_sys_call` 插 `do_signal` 钩子（`call signal_pending_c` → `call do_signal` → 重回 `ret_check_resched`），在 CS 检查之后、need_resched 之前 |
+  | edit | `src/traps.rs` | `send_sig_stub`→真 `signal::send_sig`，swapper 保护（task[0] 收致命信号直接 panic）|
+  | edit | `src/lib.rs` | `fs_init_thread` 末尾挂 `exit::fork_selftest`（fork+wait4 端到端）|
+- 信号位号约定统一：位号 == 信号号，bit 0 空着（以前 mask/blocked 用 sig-1、send_sig 用 sig，错开 1 位→屏蔽字形同虚设，见 bug-032）
+- sigaction 表按需分页：避免 16KB 静态 BSS（见 bug-033），只存 `[usize; NR_TASKS]` 128 字节指针，首次 `set_task_signal` 才 `get_free_page`，`release`/`reset` 时 `free_page`
+- 验证：全部自检通过（traps/syscall/sched/fs/syscall-fs/ext4 51/51/fork），`_kernel_end = 0x8C570`（14.6KB 余量），`SHITIX_BOOT_OK`
+- 未做（留给后续阶段）：用户态栈上的信号帧（`setup_frame`/`sa_restorer`/`sigreturn`）、`copy_page_tables`（所有任务仍共用内核页表，tss.cr3=0）、PER-CS 的内核态跳过 do_signal（已正确实现，但当前没有 PER-CS 任务所以测不到这条分支）
+- 踩坑三个：bug-031（send_sig 漏 generate 过滤→notify_parent 的 SIGCHLD 让 wait4 被自己孩子打断）、bug-032（signal/blocked 位号约定不一致→屏蔽字形同虚设）、bug-033（per-task sigaction 16KB 静态数组吃光 BSS 余量→按需分页）
+- Key learnings 六条进 cerebrum：信号位号约定、send_sig 过滤、_kernel_end 硬约束、内核态 fork 的子进程现场、do_signal 钩子的内核态跳过、汇编不写死 Rust 结构体偏移
+
+**Stage 3：用户态 ring-3 切换**（2026-08-07）
+- 接受标准全部达标：
+  1. ✅ `iretq` 到 USER_CS(DPL=3)、执行用户代码（getpid→exit(42)）、int 0x80 回来
+  2. ✅ fork + per-task PML4：子进程有独立页表（共享内核 PDPT[0]，独立 user PDPT[1]），父 wait4 收尸
+  3. ✅ `copy_from_user`/`copy_to_user` + `verify_area`：新增 `src/mm/area.rs`（逐级查 USER 位），保留 `check_range` 兼容未迁移 syscall
+  4. ✅ 用户态缺页→信号路径：page_fault handler 已接 COW（umm::try_handle_cow_fault），非 COW→send_sig→do_signal→do_exit
+- 变更文件：
+  | Type | File | What |
+  |------|------|------|
+  | edit | `src/mm/paging.rs` | 修 copy_page_table bug（entry 首参数用错）；修复 next_level 缺「对已存在条目追加 USER」→ bug-034；alloc_pml4 + clone_kernel_pdpt；index/entry 函数改 pub |
+  | **new** | `src/mm/area.rs` | verify_area、copy_from_user、copy_to_user、strncpy_from_user（逐页 translate + 恒等映射拷贝） |
+  | edit | `src/umm/mod.rs` | create_user_process（分配 PML4+代码页+栈页，用 map_page 建映射） |
+  | edit | `src/sched/task.rs` | Task 加 pml4: usize（0=共享内核页表） |
+  | edit | `src/sched/mod.rs` | switch_to_task 纠正：next_cr3==0 时切回 0x4000（bug-035）；kernel_thread 用 pml4 替代 tss.cr3 |
+  | edit | `src/syscall/sys.rs` | fork 用 pml4；sys_exit→do_exit（bug-036） |
+  | edit | `src/exit.rs` | pml4 释放移到 release()（bug-035）；do_exit 删 debug_assert |
+  | edit | `src/traps.rs` | page_fault 用 pml4 字段，COW 条件补 is_user |
+  | edit | `src/lib.rs` | user_mode_selftest：fork→launch_user_task→wait4，验证 ring-3 往返 |
+- 踩坑四个（bug-034..037）：next_level 漏 USER 位追加、CR3 从用户切回内核不写、sys_exit 不通知父进程、encode_status 误判退出码为信号
+- `_kernel_end = 0x8D570`（10.6KB 余量），SHITIX_BOOT_OK，全部自检绿色
 
 ---
 
@@ -127,118 +170,48 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
 
 ## 🚀 Next phase
 
-**bug-029 已修复（✅ 45 连过：25/25 + 20/20，修复前 40~55% 失败）。**
+**Stage 2 + 3 完成**（signal/exit/fork + ring-3 往返，见上方 ✅ Done）。
+下一阶段：**Stage 4 — ELF64 + execve**。
 
-**根因：`boot/entry.S` 的中断入口在 SAVE_ALL 之前毁寄存器。**
-`BUILD_IRQ` 压了 `~nr` 和 `nr` 两格，`irq_common` 用 `popq %rax` 取 IRQ 号——那条 pop
-在 SAVE_ALL **之前**，把被打断上下文的 %rax 就地毁掉；SAVE_ALL 存下去的是 IRQ 号，
-RESTORE_ALL 又如实恢复回去。于是**每个时钟滴答都让被打断的内核代码带着 %rax = 0
-继续跑**（时钟是 IRQ 0）。低 1GB 恒等映射，那个 0 当指针用时不 page fault，而是静默
-读回实模式 IVT 的 `F000:FF53` BIOS IRET 桩字节 —— 于是有 `i_mode=0xff53`、`nlink=255`、
-`s_magic=0xff53`、`guard=0xf000ff53f000ff53`；当计数用时就是「readdir 列出 0 项」。
-%rax 在滴答那一刻是否活着完全由寄存器分配决定，这就是失败率随无关改动在 24%~64%
-之间跳动的原因。
+### Objective
+把内核从「纯内核态运行」推到真正 iretq 到 ring-3、跑用户代码、再通过 int 0x80（以及 syscall 指令）回到内核。这是 LFS 集成的前提——当前内核从未执行过一条用户态指令。
 
-**修复：**
-1. `BUILD_IRQ` 去掉多余的 `pushq $nr`；`irq_common` 先 SAVE_ALL，再从 `PT_ORIG_RAX`
-   取 `~nr` 取反得到 IRQ 号 —— 保存前不动任何寄存器。
-2. `exc_common` 同一处写法（潜伏 bug：目前多数异常直接 panic，但 `page_fault` 在
-   用户态/COW 接上后会变成高频可恢复异常）。改为先 SAVE_ALL，向量号从 pt_regs 上方的
-   临时槽读出，再把「错误码 + iretq 帧」整体下移 8 字节盖掉临时槽，恢复标准布局。
-
-**顺带落地的三处独立真修复（与 029 无关但都是真 bug，别 revert）：**
-- `minix/inode_ops.rs::parse_inode` —— 收裸指针 + 逐字节 `read_volatile`，不经 `&[u8]`
-- `fs/buffer.rs::data`/`data_mut` —— `b_data` 穿一条 asm 断 provenance
-- `minix/bitmap.rs::new_block` —— 越界分支原本静默 `return 0` 丢块，现在把位还回去
-
-**⚠️ 诊断方法上的教训（比修复本身值钱，已进 cerebrum）：**
-- 「失败率对无关代码改动敏感」= 寄存器分配敏感 = **某个寄存器被外力改了**。不是 LLVM
-  优化问题，也不是内存破坏。在这两条错路上花了两个会话。
-- 一个 `cli` 包住可疑区段的实验（20/20 vs 9/20）5 分钟内把范围从「整个 fs 层」缩到
-  「中断路径」。**先做能一刀切掉半个假设空间的实验，再读源码。**
-- 加屏障、改访问器、调栈大小 —— 全是在给一个寄存器 bug 打内存补丁。
-
-**🚀 下一步：** 用户请求的剩余三阶段（bug-029 是第一阶段）——
-- **阶段 2：进程生命周期** —— 移植 `signal.c` / `exit.c` / `fork.c`。`ret_from_sys_call`
-  里已经预留了 `do_signal` 的插入点（见那段注释）。
-- **阶段 3：用户态切换** —— ring-3 转换、`copy_from_user`/`copy_to_user`、真正的
-  `verify_area`（当前 `sys.rs::check_range` 只是恒等映射范围检查）。注意 `syscall_entry`
-  目前是 `cli; hlt` 桩，需要 per-cpu 的用户栈暂存位才能启用。
-- **阶段 4：ELF64 + execve** —— 替掉现在只认 ELF32 的加载器，补 x86_64 的 `struct stat`
-  ABI 与 `arch_prctl`（FS/GS base）。
-
-**Goal（LFS 集成的真实结论 —— 读代码核实过，不是估计）:**
-用户问「能否集成进 LFS 系统」。**当前内核跑不了 LFS 用户态**，缺的不是零碎补丁：
-- **完全没有 ring-3 切换**。`USER_CS` 只出现在常量定义里，全树没有任何地方
-  `iretq` 到用户态 —— 内核**从未执行过一条用户态指令**
-- `sys_execve` 是 `-ENOSYS` 占位，函数体里是注释掉的伪代码
-- **ELF 加载器只认 32 位**（`parse_elf32`/`Elf32Header`/`parse_phdr32`），LFS 的
-  x86_64 二进制是 ELF64
-- 没有 `copy_from_user`/`copy_to_user`/`verify_area`/`access_ok`（现在的
-  `check_range` 只挡未映射地址，见模块 7）
-- `fs::stat::Stat` 是 1.0.9 的 i386 布局（`u16 st_dev`、`u32 st_ino/st_size`），
-  **不是** x86_64 glibc 的 `struct stat` —— 对真实用户态是 ABI 不匹配
-- `arch_prctl` 是占位（glibc 靠 `ARCH_SET_FS` 装 TLS），且没有 per-task FS/GS base
-- `clone` 的 flags 语义、信号投递到用户态、`fork` 的页表复制都缺
-- **ext4 挂不上**：`src/fs/ext4/` 共 1291 行，全是磁盘结构解析器（超级块/inode
-  字段访问器/extent 结构/特性位查询），**没有** `read_inode`/`lookup`/目录操作/
-  块分配器/`mkfs`。`FsType::Ext2` 这个枚举变体除了定义处和 `do_unlink` 里
-  一句 `FsType::Ext2 => ENOSYS, // TODO` 之外全树没人用。对比 minix：1250 行
-  + 12 处 VFS 分发点，是唯一能挂的磁盘文件系统。
-  「换成 ext4」不是配置开关，是一个与刚做完的系统调用工作量相当的独立模块：
-  extent 树查找 + 目录操作 + 块组/位图分配 + mkfs，外加把 ramdisk 从 256KB
-  扩到几 MB（`mkfs.ext4` 的元数据放不进 256KB）并写一个本树没有的 `rd_load()`
-  把宿主造好的镜像搬进 ramdisk 的动态页
-
-**所以下一阶段（然后）:** 移植信号与进程生命周期 —— `kernel/signal.c` 的信号投递/`sigaction`、
-`kernel/exit.c` 的 `do_exit`/`sys_waitpid` 收尸链、`kernel/fork.c` 的真正
-`sys_fork`。这三者互相咬合，且是把现有调度器接到用户态的前提。
-
-**系统调用侧的接续点已经标好了**：`sys.rs` 里 89 个占位实现每个都注明缺哪个
-子系统。信号那批（`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`rt_sigpending`/
-`rt_sigtimedwait`/`rt_sigqueueinfo`/`rt_sigsuspend`/`sigaltstack`）就是这一阶段
-要填的；`restart_syscall` 依赖 `ERESTART*` 的回绕逻辑，一并做。
-`pselect6`/`ppoll`/`epoll_pwait` 等「带信号屏蔽的等待」也在信号到位后才好转发。
-
-### Acceptance criteria
-1. `send_sig(SIGSEGV, ...)` 能真正投递：用户态触发 page fault 后进程被杀而不是只打一行日志
-2. `do_exit` 走完整流程：转 `TASK_ZOMBIE` → 通知父进程 → 父进程 `waitpid` 收尸并回收内核栈
-3. `sys_fork` 能复制出一个真正的子进程（需要 `copy_page_tables`），父子各自返回不同的 pid
-4. `ret_from_sys_call` 里接上 `do_signal`，返回用户态前投递待处理信号
+### Scope
+1. **Ring-3 切换基础设施** — 构造用户页表（用户空间 3GB 分割，不使用段基址而是靠页表隔离）、TSS 里填好 rsp0、iretq 到 USER_CS
+2. **`copy_page_tables` / `clone_page_tables`** — fork 不再共用内核页表（当前 tss.cr3 == 0），真正给子进程一份**写时复制**的页表
+3. **`verify_area` / `copy_from_user` / `copy_to_user`** — 替换当前只挡未映射地址的 `check_range`，对用户态指针做真正的 vm_area_struct 校验
+4. **页面错误恢复路径** — page fault 在用户态时不再走 `die_if_kernel`（Stage 2 的 `send_sig_stub` 已经为它留好了信号投递），COW 页的缺页处理也在这里
+5. **`syscall` 指令入口启用**（可选）— 目前 `entry.S:syscall_entry` 是 `cli; hlt` 桩，需要 per-task 的用户栈暂存位 + MSR 配置
+6. **初始化用户态 init 进程** — fork + iretq 一个最简单的用户态任务跑起来（哪怕只是 `hlt` 循环），验证整套 ring-3 ↔ ring-0 往返
 
 ### Files to create / edit
 | Type | File | Content |
-|---|---|---|
-| edit | `src/signal.rs`（已存在，缺用户态栈帧）| `sigaction`/`sigset`/`send_sig`/`do_signal`（原版 `kernel/signal.c`）|
-| edit | `src/exit.rs`（已存在，缺收尸链）| `do_exit`/`sys_waitpid`/`notify_parent`/`release`（原版 `kernel/exit.c`）|
-| new | `src/fork.rs` | `sys_fork`/`copy_process`（原版 `kernel/fork.c`）；同时把 `sys::clone` 的 flags 语义接上 |
-| edit | `src/mm/paging.rs` | 加 `copy_page_tables`/`clone_page_tables`（原版 `mm/memory.c`）|
-| edit | `boot/entry.S` | `ret_from_sys_call` 里插 `do_signal` 调用（原版 `signal_return` 那段）|
-| edit | `src/traps.rs` | 把 `send_sig_stub` 换成真的 `send_sig` |
-| edit | `src/sched/task.rs` | 补 `sigaction[32]`、`exit_signal`、亲子链的 `p_cptr`/`p_ysptr`/`p_osptr` |
+|------|------|---------|
+| edit | `src/mm/paging.rs` | `copy_page_tables`/`clone_page_tables`（COW，fork 时给子进程一份独立的 PML4）|
+| edit | `src/syscall/sys.rs` | fork 里接 `copy_page_tables`、补 `sys_execve` 的用户态入口骨架 |
+| new | `src/mm/user.rs` | 用户页表构造（map user pages to 0..3GB with USER bit, separate from kernel 1:1 map）、`create_user_process`（见 stage 3 下的具体步骤） |
+| edit | `src/mm/page_alloc.rs` | 可能需要加 `get_free_page_for_user`（用户页放在物理地址 > 0x100000 之上） |
+| edit | `src/sched/task.rs` | 补 `vm_area_struct`（原版 `mm/mmap.c`，每个 task 的 mm），或新建 `src/mm/vma.rs` |
+| edit | `boot/entry.S` | 可能启用 `syscall_entry`（MSR STAR/LSTAR/SFMASK）、加 `iretq` 到用户态后第一次被中断/系统调用回来时确保栈正确 |
+| edit | `src/desc.rs` | 确认 USER_DS 的 DPL=3、TSS 的 IST 栈都就绪 |
+| New | `src/mm/area.rs` | `verify_area`/`access_ok`（原版 `mm/memory.c` 和 `asm/segment.h`），替换当前 `sys.rs::check_range` |
+| New | `src/uspace/` (or in `src/syscall`) | `copy_from_user`/`copy_to_user`/`strncpy_from_user` |
 
-### Closed decisions
-- 沿用现有 `extern "C" start_kernel` ABI，不迁移到 `bootloader_api`（理由见 cerebrum Decision Log）
-- 用 nightly，但**手写描述符结构体而不用 `x86_64` crate 的 `InterruptDescriptorTable`**：
-  模块 4 实际实现时发现手写更贴合原版结构（原版 `_set_gate` 宏就是直接拼位），
-  且能精确控制 IST 与 DPL。`x86_64` crate 仍在依赖里但目前未实际使用，
-  下阶段若不再需要可以移除。
-- 内核线程（`sched::kernel_thread`）保留：`sys_fork` 到位后它仍是跑
-  bdflush/kswapd 那类纯内核任务的正确工具。
-- 异常/中断里的打印统一走 `klib::printk` 的 `pr_*!` 宏，不要用 `kprintln!`
+### Open decisions (from Stage 2, mostly still open)
+- **`printk` 临界区**：`klib::printk::emit()` 缺中断保护，已知缺口。Stage 3 开始前应该先做。
+- **per-task filp/pwd/root**：FD 表目前还是全局的 `FD_TABLE`（`fs/open.rs`），`do_exit` 里的 `close_all()` 是对全局操作的。在 fork 真正分出独立地址空间之前，这项工作对 Stage 3 的正确性更关键了。
+- **`arch_prctl`（FS/GS base）**：glibc 启动时调这个装 TLS，execve 之前必须补。
+- **x86_64 `struct stat` ABI**：当前的 `Stat` 是 i386 布局，任何返回给用户态的 `fstat`/`stat` 都会被 glibc 误解。Stage 3 应该补 x86_64 版本。
+- **ELF64 加载器**：当前只认 ELF32。是否在 Stage 3 一起做、还是留给 Stage 4，看复杂度。
+- `syscall` 指令入口是否在 Stage 3 启用待定。
 
-### Open decisions
-- **`printk` 的临界区还没加**：`klib::printk::emit()` 的 SAFETY 注释假设
-  「不与中断上下文并发」，但现在 `do_timer`/`do_IRQ`/`do_trap` 都会 printk。
-  原版靠 `cli()`/`restore_flags()` 保护 `log_buf`。现在 `irq::local_irq_save`
-  已经就绪，应该在下阶段开头就给 `emit()` 包上——这是已知的正确性缺口。
-- **内核线程退出会泄漏一页内核栈**：`do_kthread_exit` 里没法释放自己
-  正在用的栈。原版的做法是转 `TASK_ZOMBIE`，由 `release()` 在父进程
-  `waitpid` 时回收。等 `exit.c` 移植完自然解决。
-- **`sys_write` 缺 `verify_area`**：现在只接受落在恒等映射低 1GB 内的地址，
-  用户态指针无法校验。要等 `mm/mmap.c` 的 `vm_area_struct` 才能做对。
-- `syscall` 指令入口（`entry.S:syscall_entry`）留了符号但未启用，
-  需要 per-cpu 的用户栈暂存位置。要不要在这一阶段启用待定。
+### Acceptance criteria
+1. `iretq` 到用户态（USER_CS DPL=3）的一段代码，用户态触发 `int 0x80` 或 page fault → 内核收到并正确处理（信号投递或服务调用），再 iretq 回去
+2. `fork` + `copy_page_tables`：父进程写 COW 页触发缺页，拿到自己的私有副本；子进程看到的是 fork 时刻的快照
+3. `copy_from_user`/`copy_to_user` 对用户指针做边界检查，写入超出映射范围的地址返回 `-EFAULT`（替换当前 `check_range` 只认恒等映射的假实现）
+4. 用户态 segfault（访问 null 或未映射地址）→ `page_fault` → `send_sig(SIGSEGV)` → `do_signal` → `do_exit(SIGSEGV)`，任务被回收（Stage 2 的信号路径与 Stage 3 的缺页恢复挂上）
+
+---
 
 ---
 

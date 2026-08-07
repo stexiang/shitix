@@ -217,15 +217,16 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
         // page fault: 尝试处理 COW 页面故障
         if v == 14 {
             if let Some(fault_addr) = cr2 {
-                let pml4 = unsafe { sched::current().tss.cr3 } as usize;
-                // 检查是否是 COW 页面错误 (write + present + not-write)
-                let is_write = (error_code & 2) != 0;  // 写错误
-                let is_present = (error_code & 1) == 0;  // 页面存在但权限不足
-                
-                if is_write && is_present {
+                let pml4 = unsafe { (*sched::task_ptr(sched::current_index())).pml4 };
+                // 检查是否是 COW 页面错误 (write + present + user)
+                let is_write = (error_code & 2) != 0;   // 写访问
+                let is_present = (error_code & 1) != 0;  // 页面已映射（只是缺 RW）
+                let is_user = (error_code & 4) != 0;     // CPL=3 触发
+
+                if pml4 != 0 && is_write && is_present && is_user {
                     // 尝试处理 COW 页面故障
-                    if let Some(umm) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
-                        if umm {
+                    if let Some(handled) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
+                        if handled {
                             crate::pr_debug!("COW page fault handled at {:#x}", fault_addr);
                             return;  // 成功处理，恢复执行
                         }
@@ -244,13 +245,33 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
     die_if_kernel(name, regs, error_code, cr2, v);
 }
 
-/// 信号投递的占位实现。原版是 `send_sig(signr, tsk, 1)`（`kernel/signal.c`）。
+/// 用户态异常转信号。对应原版 `send_sig(signr, current, 1)`（`kernel/signal.c`）。
+///
+/// 信号只是**投递**（在 `task.signal` 里置位）；真正的动作由
+/// [`crate::signal::do_signal`] 在 `ret_from_sys_call` 返回用户态前执行。
+/// 对 SIGSEGV / SIGILL / SIGFPE 这些默认动作是终止，所以效果就是进程被杀。
 fn send_sig_stub(signr: u32, name: &str, regs: &PtRegs, error_code: u64, cr2: Option<u64>) {
     // cr2 只有 page fault 才有，用 0 表示不适用（比拼接字符串省事且不引入分配）
     crate::pr!(Level::Err,
-               "{}: sig {} at rip={:#x} err={:#x} cr2={:#x} (user) \
-                -- signal delivery not yet implemented",
+               "{}: sig {} at rip={:#x} err={:#x} cr2={:#x} (user)",
                name, signr, regs.rip, error_code, cr2.unwrap_or(0));
+
+    let nr = sched::current_index();
+
+    // task[0] 收不了致命信号——它是 swapper，杀了就没人可调度。
+    // 原版在 do_exit 里 panic，我们提前在这里拦住并给出更准的现场。
+    if nr == 0 {
+        crate::pr!(Level::Emerg,
+                   "{}: fatal signal {} targets task[0] (swapper) -- cannot deliver",
+                   name, signr);
+        panic!("user-mode exception in task[0]");
+    }
+
+    // priv=1：内核触发，不做权限检查。
+    let rc = crate::signal::send_sig(signr, nr, 1);
+    if rc != 0 {
+        crate::pr!(Level::Emerg, "{}: send_sig({}) failed: {}", name, signr, rc);
+    }
 }
 
 /// 内核态异常的处理：打印完整现场后停机。

@@ -12,6 +12,7 @@
 //!
 //! 尚未移植的部分：`mm/swap.c` 的换页（缺块设备）、`mm/vmalloc.c`（依赖前两者）。
 
+pub mod area;
 pub mod kmalloc;
 pub mod page;
 pub mod page_alloc;

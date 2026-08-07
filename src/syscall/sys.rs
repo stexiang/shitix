@@ -366,23 +366,7 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 原版 `do_exit` 要释放页表、关文件、通知父进程、转 ZOMBIE 等父进程 wait。
 /// 那些依赖 `fs/` 和信号。这里只做内核线程能做的部分：记录退出码后让出 CPU。
 pub fn exit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let code = args.a0 as i32;
-    // SAFETY: 系统调用上下文，current 有效。
-    unsafe {
-        let cur = sched::current();
-        cur.exit_code = code;
-        crate::pr!(Level::Info, "sys_exit: pid {} exiting with code {}", cur.pid, code);
-        // task[0] 退出是致命的（原版 do_exit 里
-        // `if (current == task[0]) panic("task[0] exiting")`）
-        if sched::current_nr() == 0 {
-            panic!("task[0] exiting");
-        }
-        cur.state = crate::sched::task::TaskState::Zombie;
-        sched::set_need_resched();
-        sched::schedule();
-    }
-    // 一个 ZOMBIE 不会被再次调度到，所以走不到这里
-    0
+    crate::exit::do_exit(args.a0 as i32)
 }
 
 /// 系统信息。对应原版 `sys.c:sys_uname()` / `sys_newuname()`。
@@ -994,66 +978,153 @@ pub fn recvmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 ///
 /// 对应原版 `kernel/fork.c:sys_fork()`。
 /// 实现 fork() 系统调用。
-pub fn fork(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::EAGAIN;
-    
-    // SAFETY: 系统调用上下文
-    unsafe {
-        // 查找空闲的 task slot
-        let free_slot = {
-            let mut slot = None;
+    use crate::sched::task::{KERNEL_STACK_SIZE, STACK_MAGIC, TaskState};
+
+    unsafe extern "C" {
+        /// `entry.S` 里新任务的第一次入场点。
+        fn ret_from_fork();
+    }
+
+    /// pt_regs 的 qword 数。必须和 `entry.S` 里的 `PT_SS + 8` 对上
+    /// （0xa8 字节 = 21 个 qword）；下面的 `debug_assert` 兜住。
+    const PTREGS_QWORDS: usize = 21;
+    /// rax 在 pt_regs 里的 qword 下标。对应 `entry.S` 的 `PT_RAX 0x50`。
+    const PTREGS_RAX_IDX: usize = 0x50 / 8;
+
+    debug_assert_eq!(
+        core::mem::size_of::<PtRegs>(),
+        PTREGS_QWORDS * 8,
+        "fork: PtRegs 大小与 entry.S 的 pt_regs 布局不一致"
+    );
+
+    // 中断里不能 fork：会拿到中断栈上的 pt_regs 而不是系统调用那份。
+    // SAFETY: 系统调用上下文，稍后无条件 restore_flags 配对。
+    let flags = unsafe { crate::irq::local_irq_save() };
+    let result = (|| -> i64 {
+        // SAFETY: 已关中断，独占任务表。
+        unsafe {
+            // 查找空闲的 task slot。0 是 swapper，从 1 开始。
+            let mut free_slot = None;
             for i in 1..sched::NR_TASKS {
-                if sched::task(i).state == sched::task::TaskState::Unused {
-                    slot = Some(i);
+                if (*sched::task_ptr(i)).state == TaskState::Unused {
+                    free_slot = Some(i);
                     break;
                 }
             }
-            slot
-        };
-        
-        let Some(child_nr) = free_slot else {
-            crate::pr_warn!("sys_fork: no free task slots");
-            return -(EAGAIN as i64);
-        };
-        
-        let parent = sched::current();
-        let parent_nr = sched::current_nr();
-        
-        // 复制父进程
-        let child = sched::task(child_nr);
-        *child = (*parent).clone();
-        
-        // 设置子进程特有的字段
-        child.state = sched::task::TaskState::Running;
-        child.pid = sched::allocate_pid();
-        child.pgrp = parent.pgrp;
-        child.parent = parent_nr;
-        
-        // 复制寄存器上下文
-        child.tss.rsp = parent.tss.rsp;
-        child.tss.cr3 = parent.tss.cr3;
-        
-        // 分配新的内核栈
-        let stack_page = crate::mm::get_free_page();
-        if stack_page == 0 {
-            crate::pr_warn!("sys_fork: out of memory for stack");
-            child.state = sched::task::TaskState::Unused;
-            return -(EAGAIN as i64);
+            let Some(child_nr) = free_slot else {
+                crate::pr_warn!("sys_fork: no free task slots");
+                return -(EAGAIN as i64);
+            };
+
+            let parent_nr = sched::current_nr();
+
+            // 先把栈拿到手，失败了就不用回滚任务表。
+            let stack_page = crate::mm::get_free_page();
+            if stack_page == 0 {
+                crate::pr_warn!("sys_fork: out of memory for kernel stack");
+                return -(EAGAIN as i64);
+            }
+
+            // 复制父进程的 PCB。原版 copy_process 里的 `*p = *current`。
+            // 裸指针读写：parent_nr != child_nr（child_nr 是 Unused 槽位，
+            // 当前任务不可能是 Unused），所以不会自我别名。
+            let parent = sched::task_ptr(parent_nr);
+            let child = sched::task_ptr(child_nr);
+            *child = (*parent).clone();
+
+            // 子进程特有的字段。
+            (*child).state = TaskState::Running;
+            (*child).pid = sched::allocate_pid();
+            (*child).pgrp = (*parent).pgrp;
+            (*child).session = (*parent).session;
+            (*child).parent = parent_nr;
+            (*child).kernel_stack = stack_page as u64;
+            (*child).start_time = sched::jiffies();
+            // 时间统计从零开始（原版 `p->utime = p->stime = 0`）。
+            (*child).utime = 0;
+            (*child).stime = 0;
+            (*child).timeout = 0;
+            (*child).exit_code = 0;
+            // 待处理信号不继承，屏蔽字继承。原版 `p->signal = 0`。
+            (*child).signal = 0;
+            // 时间片对半分，父子都不能靠 fork 白拿一个整片
+            // （原版 1.0.9 直接给 `p->counter = p->priority`，
+            //  但那样 fork 循环能无限延长自己的份额）。
+            let half = (*parent).counter / 2;
+            (*parent).counter = half;
+            (*child).counter = (*parent).counter - half + half; // = half
+            if (*child).counter == 0 {
+                (*child).counter = 1;
+            }
+            // pml4：父进程是纯内核任务（pml4==0）则子进程也是；
+            // 有用户空间的进程走下面的 copy_page_tables 路径。
+            (*child).pml4 = (*parent).pml4;
+            (*child).tss.cr3 = (*child).pml4 as u64;
+
+            // sigaction 表随 PCB 一起继承（原版是内联数组，我们在旁路数组里）。
+            crate::signal::clone_sigactions(parent_nr, child_nr);
+
+            // ---- 布置子进程内核栈 ----
+            // 布局和 sched::kernel_thread 一致，只是 ret 地址上方放的不是
+            // fn/arg 而是一整份 pt_regs：
+            //   [tss.rsp + 0 .. +48]  switch_to 的 7 个保存槽
+            //   [tss.rsp + 56]        返回地址 = ret_from_fork
+            //   [tss.rsp + 64 ..]     pt_regs（ret_from_sys_call 要用）
+            let stack_top = stack_page as u64 + KERNEL_STACK_SIZE as u64;
+            // 栈底魔数，供 stack_ok() / die_if_kernel 检测溢出。
+            core::ptr::write_volatile(stack_page as *mut u64, STACK_MAGIC);
+
+            let mut sp = stack_top as *mut u64;
+            // pt_regs 从高地址往低地址写，写完 sp 正好落在 pt_regs 基址。
+            let src = regs as *const PtRegs as *const u64;
+            for i in (0..PTREGS_QWORDS).rev() {
+                sp = sp.sub(1);
+                core::ptr::write_volatile(sp, core::ptr::read(src.add(i)));
+            }
+            // fork 在子进程里返回 0（原版 `p->tss.eax = 0`）。
+            core::ptr::write_volatile(sp.add(PTREGS_RAX_IDX), 0u64);
+
+            // switch_to 的 `ret` 落到这里。
+            sp = sp.sub(1);
+            core::ptr::write_volatile(sp, ret_from_fork as *const () as u64);
+            // rflags 槽：IF=0，由 schedule_tail 里的 sti 开中断
+            // （与 kernel_thread 的处理一致）。
+            sp = sp.sub(1);
+            core::ptr::write_volatile(sp, 0x0002u64);
+            // 余下 6 个 callee-saved 槽清零。
+            for _ in 0..6 {
+                sp = sp.sub(1);
+                core::ptr::write_volatile(sp, 0u64);
+            }
+
+            (*child).tss.rsp = sp as u64;
+            (*child).tss.rsp0 = stack_top;
+
+            // 挂进调度环。和 sched::kernel_thread 里的 SET_LINKS 一样，
+            // 用裸指针写避免 nr/cur/old_next 相等时的 &mut 别名。
+            let old_next = (*sched::task_ptr(parent_nr)).next;
+            (*sched::task_ptr(child_nr)).next = old_next;
+            (*sched::task_ptr(child_nr)).prev = parent_nr;
+            (*sched::task_ptr(parent_nr)).next = child_nr;
+            (*sched::task_ptr(old_next)).prev = child_nr;
+
+            let child_pid = (*child).pid;
+            crate::pr_info!(
+                "sys_fork: parent pid={} -> child pid={} (slot {})",
+                (*parent).pid,
+                child_pid,
+                child_nr
+            );
+
+            // 父进程拿到子进程 pid。
+            child_pid as i64
         }
-        child.kernel_stack = stack_page as u64;
-        
-        // 复制 brk 值
-        child.brk = parent.brk;
-        
-        // 设置调度参数
-        child.counter = sched::task::HZ as i64;
-        child.priority = 15;
-        
-        crate::pr_info!("sys_fork: parent={}, child_pid={}, child_slot={}", 
-                        parent.pid, child.pid, child_nr);
-        
-        child.pid as i64
-    }
+    })();
+    // SAFETY: 与上面的 save 配对。
+    unsafe { crate::irq::restore_flags(flags) };
+    result
 }
 
 /// vfork syscall - 轻量级进程复制
@@ -1061,7 +1132,17 @@ pub fn vfork(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     fork(_args, _regs)
 }
 
-pub fn wait4(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// wait4 syscall - 等子进程退出并收尸
+///
+/// 对应原版 `kernel/exit.c:sys_wait4()`。参数：pid / stat_addr / options /
+/// rusage（rusage 尚未实现，非 0 时忽略）。
+pub fn wait4(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // a0 是 pid，按 C 的 `pid_t`（i32）符号扩展，否则 -1 会变成 2^64-1。
+    let pid = args.a0 as i32 as i64;
+    // SAFETY: 系统调用上下文；stat_addr 由 sys_wait4 内部判空，
+    // 页表恒等映射所以用户指针可直接写（还没有独立用户地址空间）。
+    unsafe { crate::exit::sys_wait4(pid, args.a1, args.a2) }
+}
 pub fn setitimer(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn getitimer(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 

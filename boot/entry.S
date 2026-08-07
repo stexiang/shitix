@@ -333,6 +333,34 @@ ret_check_resched:
 
     cmpl    $0, need_resched(%rip)
     jne     reschedule
+
+    /*
+     * 投递待处理信号。对应原版 ret_from_sys_call 里那段
+     *   movl _current,%eax; cmpl $0,signal(%eax); je 2f
+     *   ... pushl %esp; call _do_signal
+     *
+     * 原版直接在汇编里读 task_struct 的 signal/blocked 偏移；我们的
+     * `current` 是个下标（sched::CURRENT）而不是指针，且 Task 的字段偏移
+     * 由 Rust 布局决定，写死在汇编里会随 Task 改字段而静默错位。
+     * 所以先 call 一个 Rust 谓词（has_pending_signal），真有信号才进
+     * do_signal——常态路径多一次 call，换来偏移不会失同步。
+     */
+    movq    %rsp, %rbp
+    andq    $-16, %rsp
+    call    signal_pending_c
+    movq    %rbp, %rsp
+    testb   %al, %al
+    jz      restore_and_iret
+
+    /* 同 reschedule：call 之前 rsp 必须 16 对齐（见那里的注释）。
+       do_signal 的唯一参数是 pt_regs 指针，也就是对齐前的 rsp。 */
+    movq    %rsp, %rbp
+    movq    %rsp, %rdi
+    andq    $-16, %rsp
+    call    do_signal
+    movq    %rbp, %rsp
+    /* do_signal 可能把状态改成 Stopped 并 schedule 过，重新走一遍检查 */
+    jmp     ret_check_resched
 restore_and_iret:
     RESTORE_ALL
 

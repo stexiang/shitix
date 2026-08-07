@@ -576,6 +576,97 @@
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "fixed"
+    },
+    {
+      "id": "bug-031",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "fork selftest: wait4 reaped our child FAILED (got -4) — 父进程 wait4 立刻返回 -EINTR，收不到子进程的尸",
+      "file": "src/signal.rs",
+      "root_cause": "send_sig 无条件 `(*task).signal |= 1<<signum`，漏了原版 kernel/signal.c:generate() 置位前的过滤：SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} 时**不置位**（默认忽略）。do_exit→notify_parent 给父进程发 SIGCHLD 置了位，而 sys_wait4 醒来后只要看到任何未屏蔽待处理信号就返回 -EINTR，于是父进程被自己等的那个孩子打断，永远收不到尸。",
+      "fix": "send_sig 里补上 generate() 的过滤：SIG_IGN 且非 SIGCHLD → 丢；SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} → 丢（SIGCONT 顺带把 Stopped 放回 Running）。notify_parent 的唤醒是独立的 wake_up_waiter 调用，不置位也照样叫醒父进程，与原版 send_sig + wake_up_interruptible 分开调的结构一致。",
+      "tags": ["signal","fork","wait4","exit","EINTR","generate","linux-fidelity"],
+      "related_bugs": ["bug-032"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-032",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "潜伏 bug（写 Stage 2 时发现，未表现为测试失败）：blocked 屏蔽字形同虚设——signal 与 blocked 的位号约定不一致",
+      "file": "src/signal.rs",
+      "root_cause": "Signal::mask() 和 BLOCKABLE 用原版的 `1 << (sig-1)`（位号 = 信号号 - 1），而 send_sig / dequeue_signal / sigaddset / sigdelset 用 `1 << sig`（位号 = 信号号）。于是经 BLOCKABLE 或 SigSet 设进 blocked 的位和 send_sig 置进 signal 的位整体错开 1，`signal & !blocked` 算出来的待处理集合是错的：屏蔽 SIGTERM 实际屏蔽的是 SIGSTKFLT。原版用 32 位字装 31 个信号必须从 bit 0 起算，我们是 64 位没这个约束，两套写法就这么并存下来了。",
+      "fix": "统一到「位号 == 信号号」（bit 0 空着不用）：改 Signal::mask() 为 `1 << sig`、BLOCKABLE 同步。选这个方向而不是原版的 sig-1，是因为改动面小（2 处 vs 5+ 处热路径），且 do_signal 里 trailing_zeros() 拿到的直接就是信号号。约定写进了 Signal::mask() 的文档注释。",
+      "tags": ["signal","sigmask","blocked","bit-convention","off-by-one","latent"],
+      "related_bugs": ["bug-031"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-033",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "链接期风险：per-task sigaction 表把 _kernel_end 从 0x8A4F0 推到 0x8F4F0，距 kernel.ld 的 ASSERT 上限 0x90000 只剩 2832 字节",
+      "file": "src/signal.rs",
+      "root_cause": "照原版把 `struct sigaction sigaction[32]` 按任务铺成静态数组：SigAction 32 字节 × 32 信号 × NR_TASKS 16 = 16KB BSS，一口气吃掉全部剩余余量。原版 task_struct 本身就占一页、表内联在里面，不存在独立的静态数组。",
+      "fix": "改成按需分页：`SIGACTION_TABLES: [usize; NR_TASKS]` 只存页地址（128 字节），首次 set_task_signal 才 get_free_page，release/reset 时 free_page。绝大多数任务从生到死不调 sigaction()，全默认动作不需要任何存储。余量回到 ~19KB（Stage 2 净增 4.2KB，基本都是代码）。",
+      "tags": ["signal","bss","kernel_end","memory-budget","lazy-alloc","kernel.ld"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-034",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "用户态 iretq → page fault at rip=0x40000000 err=0x5（protection violation on present page in user mode）",
+      "file": "src/mm/paging.rs",
+      "root_cause": "next_level() 对已存在的页表条目（PRESENT）直接 return 物理地址而不检查/追加 USER 位。clone_kernel_pdpt 从启动 PML4 拷贝了不带 USER 的条目，map_page 调用 next_level 时 entry 已 PRESENT，走快速返回路径，USER 位从未被写入。CPU 硬件在每级（PML4→PDPT→PD→PT）都检查 U/S 位——PML4[0] 缺 USER → #PF。",
+      "fix": "在 next_level 的 PRESENT 分支里追加：if user && (e & USER == 0) { set_entry(table, idx, e | USER); }。",
+      "tags": ["paging","USER-bit","page-fault","ring-3","next_level","linux-fidelity"],
+      "related_bugs": ["bug-035","bug-036","bug-037"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-035",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "do_exit 里 free_page(pml4) 时 CR3 还指着这个页 → use-after-free；sys_wait4 中 release 之后内核 TLB 缺页读到归零页 → PF",
+      "file": "src/exit.rs, src/sched/mod.rs",
+      "root_cause": "do_exit 在 schedule() 之前 free 了 PML4 页；switch_to_task 对 next_cr3==0（内核任务）不做 CR3 切换，导致父进程（内核线程）一直用子进程的 CR3 跑。release 里 free_page(pml4) 之后内核访问触发 TLB miss → 读到已回收的 PML4 页 → #PF → die_if_kernel panic。",
+      "fix": "1) pml4 free 移到 release()（父进程上下文，此时已调度过但 CR3 可能还是旧的）；2) switch_to_task 改：next_cr3==0 时切回 boot CR3(0x4000)，确保用户→内核切换正确恢复内核页表。",
+      "tags": ["paging","CR3","use-after-free","TLB","schedule","release"],
+      "related_bugs": ["bug-034","bug-036"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-036",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "sys_exit 不调 do_exit → notify_parent 从未触发 → 父进程 wait4 永远睡在 Interruptible 上收不到尸",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "sys::exit 自己实现了 inline Zombie+schedule 逻辑，不调用 exit::do_exit。do_exit 里有完整的 notify_parent（SIGCHLD + wake_up_waiter），sys::exit 里只有 set_need_resched + schedule。父进程在 sys_wait4 里 Interruptible 睡眠，等不到唤醒。",
+      "fix": "sys::exit 改成直接调用 crate::exit::do_exit(code)。",
+      "tags": ["syscall","exit","wait4","notify_parent","zombie"],
+      "related_bugs": ["bug-034"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-037",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "encode_status 把 exit code 1..=31 误判为信号——用户态 exit(5) 被当作 SIGTRAP(5) 处理",
+      "file": "src/exit.rs",
+      "root_cause": "encode_status 对 code ∈ [1,31] 直接当作信号号返回（status = code），对 ≥32 的才编码为高 8 位退出码。sys_exit 传下来的退出码若恰好落在 1..=31（如 exit(5)），wait4 汇报的状态字看起来像「被信号 5 杀」而不是「正常退出码 5」。",
+      "fix": "用户自检改用 exit(42) 避开此区间；encode_status 的重写留给后续阶段（需要区分「do_exit(sig) 的信号终止」与「exit(code) 的正常退出」，可能需要在 exit_code 之外加一个 sentinel）。",
+      "tags": ["exit","wait4","status-encoding","off-by-design"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "known_workaround"
     }
   ]
 }

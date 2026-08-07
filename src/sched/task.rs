@@ -151,6 +151,11 @@ pub struct Task {
     /// 数据段结束地址（原版 `unsigned long brk`）。用于 brk() 系统调用。
     pub brk: usize,
 
+    /// 用户态页表根物理地址（原版 `tss.cr3`：`mm->pgd`）。
+    /// 0 表示共用内核页表（纯内核任务 / swapper）。
+    /// 非 0 时 `switch_to_task` 会在切任务时改写 CR3。
+    pub pml4: usize,
+
     /// 退出码。原版 `int exit_code`
     pub exit_code: i32,
 }
@@ -180,6 +185,7 @@ impl Task {
             kernel_stack: 0,
             tss: Tss::new(),
             brk: 0,
+            pml4: 0,
             exit_code: 0,
         }
     }

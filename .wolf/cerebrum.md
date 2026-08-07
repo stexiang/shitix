@@ -58,7 +58,29 @@
 
 - **selftest 里用 `serial::print`/`serial::print_dec` 而不是 `kprintln!`**（2026-08-07）：`kprintln!` 宏展开成 `println!` + `sprintln!`，每次调用生成**两份** `format_args!` 描述符（静态 `.rodata`：格式片段数组 + 参数类型数组）。opt-level=0 下 LLVM 不合并不同调用点的相同字面量，50 个 `kprintln!("ext4: {} -> ok", tag)` 产生 ~100 份描述符，把 selftest 对象从 8KB 涨到 43KB，直接撞 `_kernel_end <= 0x90000` 的 ASSERT。修法：selftest 里改用 `crate::serial::print(s: &str)` 和 `crate::serial::print_dec(v: u64)` 直接写串口，**零 `format_args!`**；失败才打印，成功静默；宏 `check!(tag, bool_expr)` 在检查宏里做分支。降到 8KB（减少 80%）。
 
+- **`next_level` 必须对已存在的 PRESENT 条目检查并追加 USER 位**（2026-08-07）：`next_level` 原来在条目已 PRESENT 时直接返回物理地址而不检查 USER。clone_kernel_pdpt 从启动 PML4 拷贝条目（无 USER），后续 map_page 调 next_level 时条目已 PRESENT → 走快速返回 → USER 从未写入 → CPU 在 ring-3 访问时发现某一级缺 U/S 位 → #PF(0x5)。修复：`if user && (e & USER == 0) { set_entry(table, idx, e | USER); }` 写在 PRESENT 分支里。见 bug-034。
+
+- **用户→内核切换时必须恢复 CR3**（2026-08-07）：`switch_to_task` 仅 `next_cr3 != 0` 时才写 CR3 → 用户进程(pml4≠0)切到内核线程(pml4==0)时 CR3 不切换 → 内核线程跑在用户 PML4 上。release() 里的 free_page(pml4) 之后 CR3 指向已回收页 → TLB 缺失读到零 → PF。修复：next_cr3==0 时切回启动页表(0x4000)；pml4 的 free 移到 release()（父进程上下文，不在 do_exit 里提前 free）。见 bug-035。
+
+- **`sys_exit` 必须走 `do_exit` 的完整路径**（2026-08-07）：sys_exit 自己 inline 了 Zombie+schedule，漏掉 notify_parent → 父进程 wait4 永远睡。任何想退出任务的地方都必须经过统一的 do_exit。见 bug-036。
+
+- **`get_page_flags` 只看叶子 PTE 的 flags，中间级（PML4/PDPT/PD）的 USER 位由 `next_level` 逐级保证**（2026-08-07）：不要用 get_page_flags 的返回值判定「全路径 USER 正确」，它只返回叶子标志。真正的全路径检查要逐级 `entry()` 读每个中间表的对应条目。见 bug-034 的诊断过程。
+
+- **用户态自检的退出码避开 1..=31**（2026-08-07）：encode_status 把 [1,31] 的 code 当信号号处理（exit(5) → status=0x5="SIGTRAP"），正常退出码 1..=31 会被误导。用户自检用 exit(42) 临时绕过，等「do_exit(signal) vs exit(code)」的区分解。见 bug-037。
+
 - **`block_bitmap_hi` 是 offset 32 的 little-endian u32，不是 offset 34 的字节**（2026-08-07）：`group_desc.rs::rd32(32)` 读 `u32::from_le_bytes([d[32],d[33],d[34],d[35]])`。要让 `hi=1`，必须 `d[32]=1`（LSB 在低地址），不是 `d[34]=1`（那会让 rd32(32)=0x00010000，hi 高 16 位为 1 而非低 16 位）。见 bug-030。规律：**构造 LE 字段的测试数据时，永远把期望值写进最低地址字节（小端序 LSB first）**。
+
+- **信号位号约定：位号 == 信号号，bit 0 空着**（2026-08-07）：原版 `signal`/`blocked` 是 32 位字装 31 个信号，必须 `1 << (sig-1)`；我们是 64 位，统一成 `1 << sig`，`do_signal` 里 `trailing_zeros()` 拿到的直接就是信号号。**新增任何碰 signal/blocked 的代码都照这个约定**，别按原版 C 抄 `sig-1`——两套并存过一次，`blocked` 整体错开 1 位、屏蔽字形同虚设（屏蔽 SIGTERM 实际屏蔽 SIGSTKFLT），见 bug-032。约定写在 `Signal::mask()` 的文档注释里。
+
+- **`send_sig` 必须照抄原版 `generate()` 的置位前过滤**（2026-08-07）：SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} → **不置位**；SIG_IGN 且非 SIGCHLD → 不置位。这不是优化而是语义前提：`sys_wait4` 睡在 Interruptible 上，醒来看到任何未屏蔽待处理信号就返回 `-EINTR`，而 `notify_parent` 发的正是 SIGCHLD——置了位父进程就被自己等的孩子打断，永远收不到尸。唤醒走独立的 `wake_up_waiter`，不置位照样叫醒（同原版 `send_sig` + `wake_up_interruptible` 分开调）。见 bug-031。
+
+- **`_kernel_end <= 0x90000` 是硬约束，别按任务铺静态数组**（2026-08-07）：`SigAction` 32 字节 × 32 信号 × `NR_TASKS` 16 = 16KB BSS，一口气吃掉全部余量（余量从 23KB 掉到 2.8KB）。原版 `task_struct` 本身占一页、表内联在里面，**没有**独立静态数组，照抄成 `[[T; N]; NR_TASKS]` 是误读。修法：只存页地址 `[usize; NR_TASKS]`（128 字节），首次写才 `get_free_page`，`release` 时 `free_page`——绝大多数任务从生到死不调 `sigaction()`。见 bug-033。**规律：任何 per-task 的大结构（sigaction/filp/rlim）都走按需分页，不进 BSS。**
+
+- **内核态 fork 出来的子进程不能照原样 iret 回去**（2026-08-07）：`sys_fork` 复制的 pt_regs 里 `rsp` 指向**父进程**的内核栈（`int 0x80` 时的 rsp）。用户态 fork 没这问题（父子各有自己的用户栈，页表 COW 分开），内核态 fork 则会让父子在同一个栈上跑同一段代码，必然互踩。所以内核上下文测 fork 必须换掉子进程的返回现场（改 pt_regs 的 `rip`/`rsp`），这正是 execve 之后要做的事。见 `exit::fork_selftest`。
+
+- **`ret_from_sys_call` 的 do_signal 钩子对内核态返回是故意跳过的**：钩子放在 `cmpw $KERNEL_CS, PT_CS(%rsp); je restore_and_iret` **之后**（同原版），所以 `PT_CS == KERNEL_CS` 的返回不投递信号。推论：**内核上下文的自检永远走不到 entry.S 那个钩子**，只能直接调 `signal::do_signal` 测决策逻辑；钩子本身要等 execve/用户态落地才能端到端验证。
+
+- **汇编里不要写死 Rust 结构体的字段偏移**：`ret_from_sys_call` 判「有没有待处理信号」时，原版直接在汇编里读 `task_struct` 的 `signal`/`blocked` 偏移。我们不能照抄——`current` 是个**下标**（`sched::CURRENT`）不是指针，且 `Task` 的字段偏移由 Rust 布局决定，写死会随字段增删静默错位。改成 `call signal_pending_c`（`#[unsafe(no_mangle)] extern "C" -> u8`），常态路径多一次 call，换来偏移不会失同步。
 
 ## Do-Not-Repeat
 

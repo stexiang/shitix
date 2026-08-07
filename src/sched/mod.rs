@@ -285,7 +285,7 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
             core::ptr::addr_of_mut!(tasks[prev].tss.rsp),
             tasks[next].tss.rsp,
             tasks[next].tss.rsp0,
-            tasks[next].tss.cr3,
+            tasks[next].pml4 as u64,
         )
     };
 
@@ -302,20 +302,20 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
         unsafe { desc::set_rsp0(next_rsp0) }
     }
 
-    // 切页表。目前所有任务共用内核页表（cr3 相同），所以实际上是 noop；
-    // 等 fork 真正复制页表后这里才会生效。原版对应 `tss.cr3`。
-    if next_cr3 != 0 {
-        // SAFETY: 读 cr3 合法；只在值不同时才写，避免无谓的 TLB 全刷。
-        unsafe {
-            let cur_cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
-                             options(nomem, nostack, preserves_flags));
-            if cur_cr3 != next_cr3 {
-                // 见 mm::paging::flush_tlb：换页表影响之后所有内存访问，
-                // 不能声明 nostack。
-                core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                                 options(preserves_flags));
-            }
+    // 切页表。next_cr3==0 表示共用内核页表（启动 PML4=0x4000），
+    // cur 可能是用户进程的 PML4，必须切回去——否则用户 PML4 被 release
+    // free 掉之后内核侧 TLB 缺失会导致 #PF 读到已回收的页。
+    // SAFETY: 读 cr3 合法；只在值不同时才写，避免无谓的 TLB 全刷。
+    let kernel_cr3: u64 = 0x4000;
+    let target_cr3 = if next_cr3 != 0 { next_cr3 } else { kernel_cr3 };
+    unsafe {
+        let cur_cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                         options(nomem, nostack, preserves_flags));
+        if cur_cr3 != target_cr3 {
+            // 换页表影响之后所有内存访问，不能声明 nostack。
+            core::arch::asm!("mov cr3, {}", in(reg) target_cr3,
+                             options(preserves_flags));
         }
     }
 
@@ -858,8 +858,8 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
             t.kernel_stack = stack;
             t.tss.rsp = rsp;
             t.tss.rsp0 = stack_top;
-            // 共用内核页表（原版 fork 会 copy_page_tables 出一份新的）
-            t.tss.cr3 = 0;
+            // 共用内核页表（pml4=0；原版 fork 会 copy_page_tables 出一份新的）
+            t.pml4 = 0;
 
             // 挂进调度环。原版 `SET_LINKS(p)` 操作 next_task/prev_task 指针，
             // 我们操作下标，语义相同。

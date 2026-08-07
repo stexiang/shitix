@@ -1,66 +1,15 @@
 {
-  "at": "2026-08-06T17:22:47.223Z",
+  "at": "2026-08-06T18:26:07.894Z",
   "trigger": "auto",
   "session": {
-    "session_id": "session-2026-08-06-0037",
-    "started": "2026-08-06T16:37:27.814Z",
-    "files_read": {
-      "/root/shitix/src/fs/ext4/inode.rs": {
-        "count": 2,
-        "tokens": 2440,
-        "first_read": "2026-08-06T16:53:06.340Z"
-      },
-      "/root/shitix/src/lib.rs": {
-        "count": 1,
-        "tokens": 11062,
-        "first_read": "2026-08-06T16:53:37.276Z"
-      },
-      "/root/shitix/src/fs/ext4/selftest.rs": {
-        "count": 1,
-        "tokens": 0,
-        "first_read": "2026-08-06T17:06:20.925Z"
-      },
-      "/root/shitix/src/fs/ext4/extent.rs": {
-        "count": 1,
-        "tokens": 1613,
-        "first_read": "2026-08-06T17:06:21.388Z"
-      },
-      "/root/shitix/src/fs/ext4": {
-        "count": 1,
-        "tokens": 0,
-        "first_read": "2026-08-06T17:06:44.120Z"
-      },
-      "/root/shitix/src/fs/ext4/super_block.rs": {
-        "count": 1,
-        "tokens": 4300,
-        "first_read": "2026-08-06T17:06:55.967Z"
-      },
-      "/root/shitix/src/fs/ext4/group_desc.rs": {
-        "count": 1,
-        "tokens": 0,
-        "first_read": "2026-08-06T17:09:03.170Z"
-      },
-      "/root/shitix/src/fs/ext4/dir.rs": {
-        "count": 1,
-        "tokens": 0,
-        "first_read": "2026-08-06T17:09:03.186Z"
-      },
-      "/root/shitix/src/serial.rs": {
-        "count": 3,
-        "tokens": 723,
-        "first_read": "2026-08-06T17:14:31.019Z"
-      },
-      "/root/shitix/src/console.rs": {
-        "count": 1,
-        "tokens": 2187,
-        "first_read": "2026-08-06T17:15:18.429Z"
-      }
-    },
+    "session_id": "session-2026-08-06-0221",
+    "started": "2026-08-06T18:21:04.887Z",
+    "files_read": {},
     "files_written": [],
     "edit_counts": {},
-    "anatomy_hits": 6,
-    "anatomy_misses": 4,
-    "repeated_reads_warned": 3,
+    "anatomy_hits": 0,
+    "anatomy_misses": 0,
+    "repeated_reads_warned": 0,
     "cerebrum_warnings": 0,
     "stop_count": 0
   }

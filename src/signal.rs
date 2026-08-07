@@ -137,9 +137,18 @@ impl Signal {
         self as u32
     }
 
-    /// 获取信号对应的位掩码
+    /// 获取信号对应的位掩码。
+    ///
+    /// **位号 == 信号号**（bit 0 空着不用），而不是原版的 `1 << (sig-1)`。
+    /// 原版的 `signal`/`blocked` 是 32 位，31 个信号刚好铺满，只能从 bit 0
+    /// 起算；我们是 64 位，让位号直接等于信号号能省掉满地的 ±1，
+    /// `do_signal` 里 `trailing_zeros()` 拿到的就是信号号。
+    ///
+    /// 这个约定必须和 [`send_sig`]、[`dequeue_signal`]、[`sigaddset`]、
+    /// [`BLOCKABLE`] 保持一致——曾经 `mask()` 用 `sig-1` 而 `send_sig` 用
+    /// `sig`，导致 `blocked` 和 `signal` 对不上、屏蔽字形同虚设。
     pub fn mask(self) -> u64 {
-        1u64 << (self as u8 - 1)
+        1u64 << (self as u8)
     }
 }
 
@@ -288,8 +297,10 @@ impl SigSet {
     }
 }
 
-/// 可阻塞信号掩码（SIGKILL 和 SIGSTOP 不能被阻塞）
-pub const BLOCKABLE: u64 = !(1u64 << (Signal::SIGKILL as u8 - 1) | 1u64 << (Signal::SIGSTOP as u8 - 1));
+/// 可阻塞信号掩码（SIGKILL 和 SIGSTOP 不能被阻塞）。
+/// 位号约定见 [`Signal::mask`]：位号 == 信号号。
+pub const BLOCKABLE: u64 =
+    !((1u64 << (Signal::SIGKILL as u8)) | (1u64 << (Signal::SIGSTOP as u8)));
 
 // =============================================================================
 // Signal Sending
@@ -331,7 +342,44 @@ pub fn send_sig(signum: u32, task_idx: usize, _priv: i32) -> i32 {
         // 权限检查：非特权只能向自己的进程组发送信号
         // TODO: 实现完整的权限检查
 
-        // 设置信号位
+        // ---- 原版 generate() 的过滤，别省 ----
+        // `kernel/signal.c:generate()` 在置位**之前**会先把「反正不会有动作」
+        // 的信号丢掉：
+        //   - SIG_IGN 且不是 SIGCHLD          → 直接丢
+        //   - SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} → 直接丢（默认忽略）
+        //
+        // 这不是优化而是语义：`sys_wait4` 睡在 Interruptible 上，醒来只要看到
+        // 任何未屏蔽的待处理信号就返回 -EINTR。notify_parent 给父进程发的正是
+        // SIGCHLD，如果这里置了位，父进程的 wait4 会被自己等的那个孩子打断，
+        // 永远收不到尸。
+        let action = get_task_signal(task_idx, signum as usize);
+        let is_chld = signum == Signal::SIGCHLD as u32;
+        match action.handler {
+            Some(h) => {
+                let ign: extern "C" fn(u32) = ignore_handler;
+                if h as usize == ign as usize && !is_chld {
+                    return 0;
+                }
+            }
+            None => {
+                // SIG_DFL：默认忽略的那三个不置位。
+                if is_chld
+                    || signum == Signal::SIGCONT as u32
+                    || signum == Signal::SIGWINCH as u32
+                {
+                    // SIGCONT 还有个副作用：原版在 send_sig 里就把 STOPPED
+                    // 的任务放回运行态（不经过 do_signal）。
+                    if signum == Signal::SIGCONT as u32
+                        && (*task).state == TaskState::Stopped
+                    {
+                        (*task).state = TaskState::Running;
+                    }
+                    return 0;
+                }
+            }
+        }
+
+        // 设置信号位。位号 == 信号号（见模块里 sigmask 约定的说明）。
         (*task).signal |= 1u64 << signum;
 
         // 如果任务处于可中断睡眠状态，唤醒它
@@ -435,6 +483,19 @@ pub fn sigfillset() {
 // Signal Pending Check
 // =============================================================================
 
+/// [`signal_pending`] 的 C ABI 包装，供 `entry.S:ret_from_sys_call` 调用。
+///
+/// 返回 1 表示当前任务有未屏蔽的待处理信号，需要走 [`do_signal`]。
+/// 汇编侧只 `testb %al,%al`，所以用 u8 而不是 bool（bool 的 ABI 保证
+/// 只有 0/1，但显式写成 u8 更贴合汇编的读法）。
+///
+/// # Safety
+/// 只能在有当前任务、且 pt_regs 完整的返回路径上调用。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn signal_pending_c() -> u8 {
+    if signal_pending() { 1 } else { 0 }
+}
+
 /// 检查是否有待处理信号（考虑阻塞）
 pub fn signal_pending() -> bool {
     // SAFETY: 只读当前任务
@@ -473,47 +534,257 @@ pub fn dequeue_signal() -> Option<Signal> {
 // =============================================================================
 
 /// 每个任务的信号处理动作表
-/// 对应原版 `current->sigaction[64]`
+/// 对应原版 `current->sigaction[32]`
 const NR_SIGACTIONS: usize = 32;
 
-static mut SIG_ACTIONS: [SigAction; NR_SIGACTIONS] = [const { SigAction::default() }; NR_SIGACTIONS];
+/// 每任务的 sigaction 表指针，0 表示「这个任务还没装过任何 handler」。
+///
+/// 原版把 `struct sigaction sigaction[32]` 内联在 `task_struct` 里（整个
+/// task_struct 本身占一页）。我们不能照抄：`SigAction` 32 字节 × 32 信号
+/// × `NR_TASKS` = 16KB **静态** BSS，而 `_kernel_end` 必须 < 0x90000
+/// （见 `boot/kernel.ld` 的 ASSERT），16KB 一口气吃掉全部余量。
+///
+/// 所以改成**按需分页**：绝大多数任务从生到死都不调 sigaction()，
+/// 全默认动作不需要任何存储。真装了 handler 才分配一页（1KB 表放得下），
+/// 在 [`reset_sigactions`] 里还回去。代价是 128 字节指针数组。
+static mut SIGACTION_TABLES: [usize; crate::sched::NR_TASKS] = [0; crate::sched::NR_TASKS];
 
-/// 获取信号处理动作
-pub fn get_signal(signum: usize) -> SigAction {
-    if signum >= NR_SIGACTIONS {
-        return SigAction::default();
-    }
-    // SAFETY: 只读
+/// 一张 sigaction 表的字节数。必须 <= 一页，否则 get_free_page 不够用。
+const SIGACTION_TABLE_BYTES: usize = NR_SIGACTIONS * core::mem::size_of::<SigAction>();
+const _: () = assert!(SIGACTION_TABLE_BYTES <= 4096, "sigaction 表超过一页");
+
+/// 取某个任务的 sigaction 表首指针，没分配过就返回 null。
+///
+/// # Safety
+/// 调用者必须独占任务表（关中断或单核不抢占）。
+unsafe fn table_ptr(task_idx: usize) -> *mut SigAction {
+    // SAFETY: 契约转交；下标由调用方查界。
+    unsafe { SIGACTION_TABLES[task_idx] as *mut SigAction }
+}
+
+/// 取某个任务的 sigaction 表，没有就分配并全部初始化成 SIG_DFL。
+/// 分配失败返回 null（调用方退化成「保持默认动作」）。
+///
+/// # Safety
+/// 同 [`table_ptr`]。
+unsafe fn table_ptr_or_alloc(task_idx: usize) -> *mut SigAction {
+    // SAFETY: 契约转交。
     unsafe {
-        SIG_ACTIONS[signum]
+        let existing = table_ptr(task_idx);
+        if !existing.is_null() {
+            return existing;
+        }
+        let page = crate::mm::get_free_page();
+        if page == 0 {
+            crate::pr_warn!("signal: no page for task {}'s sigaction table", task_idx);
+            return core::ptr::null_mut();
+        }
+        let p = page as *mut SigAction;
+        for i in 0..NR_SIGACTIONS {
+            core::ptr::write(p.add(i), SigAction::default());
+        }
+        SIGACTION_TABLES[task_idx] = page;
+        p
     }
 }
 
-/// 设置信号处理动作
+/// 获取当前任务的信号处理动作
+pub fn get_signal(signum: usize) -> SigAction {
+    get_task_signal(sched::current_index(), signum)
+}
+
+/// 获取指定任务的信号处理动作。没装过 handler 的任务一律 SIG_DFL。
+pub fn get_task_signal(task_idx: usize, signum: usize) -> SigAction {
+    if signum >= NR_SIGACTIONS || task_idx >= sched::NR_TASKS {
+        return SigAction::default();
+    }
+    // SAFETY: 下标已查界；单核不抢占，这段没有并发写。
+    unsafe {
+        let p = table_ptr(task_idx);
+        if p.is_null() {
+            return SigAction::default();
+        }
+        core::ptr::read(p.add(signum))
+    }
+}
+
+/// 设置当前任务的信号处理动作
 pub fn set_signal(signum: usize, action: SigAction) {
-    if signum >= NR_SIGACTIONS {
+    set_task_signal(sched::current_index(), signum, action);
+}
+
+/// 设置指定任务的信号处理动作。首次调用会为该任务分配一页表。
+pub fn set_task_signal(task_idx: usize, signum: usize, action: SigAction) {
+    if signum >= NR_SIGACTIONS || task_idx >= sched::NR_TASKS {
         return;
     }
-    // SAFETY: 修改信号处理表
+    // SAFETY: 下标已查界。调用者在系统调用上下文里（单核不抢占）。
     unsafe {
-        SIG_ACTIONS[signum] = action;
+        let p = table_ptr_or_alloc(task_idx);
+        if p.is_null() {
+            return; // 分配失败：保持默认动作
+        }
+        core::ptr::write(p.add(signum), action);
+    }
+}
+
+/// 把某个任务的 sigaction 表全部复位成 SIG_DFL，并把页还给分配器。
+/// 对应原版 `exec` 里那段「非 SIG_IGN 的 handler 全部清成 SIG_DFL」，
+/// 以及 `release()` 之后槽位复用前的清理。
+pub fn reset_sigactions(task_idx: usize) {
+    if task_idx >= sched::NR_TASKS {
+        return;
+    }
+    // SAFETY: 下标已查界。
+    unsafe {
+        let page = SIGACTION_TABLES[task_idx];
+        if page != 0 {
+            SIGACTION_TABLES[task_idx] = 0;
+            crate::mm::free_page(page);
+        }
+    }
+}
+
+/// fork 时把父进程的 sigaction 表整份复制给子进程。
+/// 对应原版 `copy_process` 里 `*p = *current`（sigaction 是内联数组，随之复制）。
+///
+/// 父进程没装过 handler 就什么都不用做——子进程同样全默认。
+pub fn clone_sigactions(from: usize, to: usize) {
+    if from >= sched::NR_TASKS || to >= sched::NR_TASKS || from == to {
+        return;
+    }
+    // SAFETY: 两个下标已查界且互不相同，两张表是分开的页，不重叠。
+    unsafe {
+        let src = table_ptr(from);
+        if src.is_null() {
+            // 子进程可能继承了父进程 clone 前的旧表指针（*child = parent.clone()
+            // 只复制 Task，不碰这个旁路数组），但槽位在 release 时已清 0，
+            // 这里再确认一次，避免子进程误用别人的表。
+            SIGACTION_TABLES[to] = 0;
+            return;
+        }
+        let dst = table_ptr_or_alloc(to);
+        if dst.is_null() {
+            return; // 分配失败：子进程退化成全默认动作
+        }
+        core::ptr::copy_nonoverlapping(src, dst, NR_SIGACTIONS);
+    }
+}
+
+// =============================================================================
+// Signal Delivery
+// =============================================================================
+
+/// 投递待处理信号。由 `entry.S:ret_from_sys_call` 在返回用户态前调用，
+/// 对应原版 `ret_from_sys_call` 里那句 `call _do_signal`。
+///
+/// 原版签名是 `do_signal(unsigned long oldmask, struct pt_regs *regs)`，
+/// 会在用户栈上搭一个信号帧让用户 handler 跑起来、再靠 `sa_restorer`
+/// 调 `sigreturn` 回来。我们还没有用户态进程（execve 未移植），所以
+/// **自定义 handler 暂时按默认动作处理**——一旦有了用户栈就在这里补
+/// `setup_frame`。SIG_DFL / SIG_IGN 的语义是完整的。
+///
+/// # Safety
+/// 只能由 entry.S 在「即将返回用户态、pt_regs 完整、intr_count == 0」
+/// 的位置调用。`regs` 必须指向当前内核栈顶那份 pt_regs。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn do_signal(regs: *mut crate::traps::PtRegs) {
+    let _ = regs; // 有了用户态信号帧之后要用它改 rip/rsp
+    let nr = sched::current_index();
+
+    // SAFETY: nr 来自 current_index()，槽位必然有效。
+    let task = unsafe { sched::task_ptr(nr) };
+
+    loop {
+        // SAFETY: task 指向有效槽位；单核不抢占，这段没有并发写。
+        let signum = unsafe {
+            let pending = (*task).signal & !(*task).blocked;
+            if pending == 0 {
+                return;
+            }
+            // 取最低位的待处理信号。信号 n 用 bit n（见 send_sig），bit 0 不用。
+            let signum = pending.trailing_zeros();
+            // 摘掉这一位再处理，避免默认动作里再进来死循环。
+            (*task).signal &= !(1u64 << signum);
+            signum
+        };
+
+        if signum == 0 || signum > 31 {
+            continue;
+        }
+
+        let action = get_task_signal(nr, signum as usize);
+
+        // SIG_IGN：丢弃，继续看下一个。
+        if let Some(h) = action.handler {
+            // 先转 fn 指针再转整数：直接 `ignore_handler as usize` 是把
+            // 函数**项**塞进整数，rustc 会警告（拿到的是单态化后的地址，
+            // 与 SIG_IGN 里存的那个不保证同一个）。
+            let ign: extern "C" fn(u32) = ignore_handler;
+            if h as usize == ign as usize {
+                continue;
+            }
+            // 自定义 handler。缺用户态信号帧，先按「终止」处理（见函数文档）。
+            crate::pr_warn!(
+                "do_signal: pid {} sig {} has a handler but user frames are not implemented; terminating",
+                // SAFETY: 只读。
+                unsafe { (*task).pid },
+                signum
+            );
+            crate::exit::do_exit(signum as i32);
+        }
+
+        // SIG_DFL：按原版 do_signal 的 default 分支分类。
+        match signum {
+            // 忽略类：SIGCHLD / SIGURG / SIGWINCH
+            s if s == Signal::SIGCHLD as u32
+                || s == Signal::SIGURG as u32
+                || s == Signal::SIGWINCH as u32 =>
+            {
+                continue;
+            }
+            // SIGCONT：把被 SIGSTOP 停住的任务放回运行态。
+            s if s == Signal::SIGCONT as u32 => {
+                // SAFETY: task 有效。
+                unsafe {
+                    if (*task).state == TaskState::Stopped {
+                        (*task).state = TaskState::Running;
+                    }
+                }
+                continue;
+            }
+            // 停止类：SIGSTOP / SIGTSTP / SIGTTIN / SIGTTOU
+            s if s == Signal::SIGSTOP as u32
+                || s == Signal::SIGTSTP as u32
+                || s == Signal::SIGTTIN as u32
+                || s == Signal::SIGTTOU as u32 =>
+            {
+                // SAFETY: task 有效；随后 schedule() 让出 CPU。
+                unsafe {
+                    (*task).state = TaskState::Stopped;
+                    (*task).exit_code = signum as i32;
+                    sched::schedule();
+                }
+                continue;
+            }
+            // 其余全部终止。原版对 SIGQUIT/SIGILL/... 还会 dump core，我们没有 core。
+            _ => crate::exit::do_exit(signum as i32),
+        }
     }
 }
 
 /// 初始化信号处理
 pub fn init() {
-    // 设置默认的 SIG_DFL 和 SIG_IGN
-    // 大部分信号默认动作是终止进程
-    for i in 0..NR_SIGACTIONS {
-        unsafe {
-            SIG_ACTIONS[i] = SigAction::default();
-        }
+    // 所有任务的所有信号都从 SIG_DFL 开始（大部分默认动作是终止进程）。
+    for t in 0..sched::NR_TASKS {
+        reset_sigactions(t);
     }
 
-    // SIGCHLD 默认识别（不产生僵尸）
-    // TODO: 实现 SIGCHLD 的特殊处理
-
-    crate::sprintln!("signal: {} signal handlers initialized", NR_SIGACTIONS);
+    crate::sprintln!(
+        "signal: {} handlers x {} tasks initialized",
+        NR_SIGACTIONS,
+        sched::NR_TASKS
+    );
 }
 
 

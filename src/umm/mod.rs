@@ -660,6 +660,129 @@ pub fn cow_release_vmas(um: &ProcessUm, pml4: usize) {
     }
 }
 
+// =============================================================================
+// Stage 3: 用户进程创建
+// =============================================================================
+
+/// 用户进程的页表与地址空间布局。
+pub struct UserSpace {
+    pub pml4: usize,
+    pub code_start: u64,
+    pub code_size: usize,
+    pub stack_top: u64,
+    pub stack_size: usize,
+    /// 进程本身的虚存管理器（VMA 表，等 execve 后才真正使用）。
+    pub um: ProcessUm,
+}
+
+/// 创建一个最小的用户态进程。
+///
+/// 分配 PML4、代码页、栈页，设置页表映射，把 `code` 拷贝进代码页。
+/// 返回 `UserSpace` 结构（物理 PML4 地址、虚地址、大小等）。
+///
+/// 代码段始于 `USERSPACE_START`（0x4000_0000），栈底在下一个 4KB 页。
+pub fn create_user_process(code: &[u8]) -> Result<UserSpace, i32> {
+    use crate::mm::get_free_page;
+    use crate::klib::errno::ENOMEM;
+
+    let code_size = code.len();
+    if code_size > crate::mm::PAGE_SIZE {
+        crate::pr_warn!("create_user_process: code too large ({} > {})", code_size, crate::mm::PAGE_SIZE);
+        return Err(-(ENOMEM as i32));
+    }
+
+    // 1. 分配 PML4
+    let pml4 = crate::mm::paging::alloc_pml4();
+    if pml4 == 0 {
+        crate::pr_warn!("create_user_process: OOM for PML4");
+        return Err(-(ENOMEM as i32));
+    }
+    // SAFETY: 刚分配的页，在恒等映射内。
+    unsafe { core::ptr::write_bytes(pml4 as *mut u8, 0, crate::mm::PAGE_SIZE) }
+
+    // 2. 共享内核 PDPT[0]，这样内核代码仍然可访问
+    if !crate::mm::paging::clone_kernel_pdpt(pml4) {
+        crate::mm::free_page(pml4);
+        crate::pr_warn!("create_user_process: clone_kernel_pdpt failed");
+        return Err(-(ENOMEM as i32));
+    }
+
+    // 3. 分配代码页与栈页
+    let code_page = get_free_page();
+    let stack_page = get_free_page();
+    if code_page == 0 || stack_page == 0 {
+        if code_page != 0 { crate::mm::free_page(code_page); }
+        if stack_page != 0 { crate::mm::free_page(stack_page); }
+        crate::mm::free_page(pml4);
+        crate::pr_warn!("create_user_process: OOM for code/stack pages");
+        return Err(-(ENOMEM as i32));
+    }
+
+    let code_start: u64 = USERSPACE_START;   // 0x4000_0000
+    let stack_top: u64 = USERSPACE_START + crate::mm::PAGE_SIZE as u64 * 2; // 0x4000_2000
+    let stack_vaddr: u64 = USERSPACE_START + crate::mm::PAGE_SIZE as u64;    // 0x4000_1000
+
+    // 4. 映射代码页（可读可执行，暂时 rwx；等 NX 落地后去掉 exec 对数据页）
+    // SAFETY: 页表、虚地址、物理地址都有效。
+    unsafe {
+        if !crate::mm::paging::map_page(pml4, code_start as usize, code_page, crate::mm::paging::flags::SHARED) {
+            crate::mm::free_page(code_page);
+            crate::mm::free_page(stack_page);
+            crate::mm::free_page(pml4);
+            return Err(-(ENOMEM as i32));
+        }
+        // 映射栈页
+        if !crate::mm::paging::map_page(pml4, stack_vaddr as usize, stack_page, crate::mm::paging::flags::SHARED) {
+            crate::mm::paging::unmap_page(pml4, code_start as usize);
+            crate::mm::free_page(code_page);
+            crate::mm::free_page(stack_page);
+            crate::mm::free_page(pml4);
+            return Err(-(ENOMEM as i32));
+        }
+    }
+
+    // 5. 拷贝代码到代码页（恒等映射下 phys == virt）
+    // SAFETY: code_page 在恒等映射低 1GB 内，我们独占它。
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), code_page as *mut u8, code_size);
+    }
+
+    // 6. 验证：通过用户页表能 translate 且 USER 位全路径有效。
+    {
+        let t = unsafe { crate::mm::paging::translate(pml4, code_start as usize) };
+        if t != Some(code_page) {
+            crate::pr_warn!("create_user_process: translate failed");
+            crate::mm::free_page(code_page);
+            crate::mm::free_page(stack_page);
+            crate::mm::free_page(pml4);
+            return Err(-(ENOMEM as i32));
+        }
+    }
+
+    let mut um = ProcessUm::new();
+    um.add_vma(UmVma::new(
+        code_start,
+        code_start + crate::mm::PAGE_SIZE as u64,
+        UmRegionType::Code,
+        UmVmaFlags::read_only(), // COW fork 时会变成只读
+    ));
+    um.add_vma(UmVma::new(
+        stack_vaddr,
+        stack_top,
+        UmRegionType::Stack,
+        UmVmaFlags::read_write(),
+    ));
+
+    Ok(UserSpace {
+        pml4,
+        code_start,
+        code_size,
+        stack_top,
+        stack_size: crate::mm::PAGE_SIZE,
+        um,
+    })
+}
+
 /// 打印 VMA 列表
 pub fn print_vmas(um: &ProcessUm) {
     crate::pr_info!("UMM: VMA list (count={}):", um.vma_count);

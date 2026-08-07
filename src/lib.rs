@@ -712,6 +712,14 @@ fn fs_init_thread(_arg: u64) {
     // 自检放一起，实际上在 task[0] 里跑也行）。
     fs::ext4::selftest::ext4_selftest();
 
+    // fork/exit/wait4 端到端。必须在内核线程里跑：wait4 会睡。
+    // SAFETY: IDT 与调度器就绪，且我们不是 task[0]。
+    unsafe { exit::fork_selftest() };
+
+    // 用户态 ring-3 往返：fork → iretq → int 0x80 → exit → wait4 收尸。
+    // SAFETY: 同上；用户页表由 get_free_page 分配，不影响内核 BSS。
+    unsafe { user_mode_selftest() };
+
     // 栈底魔数还在吗？内核线程只有一页栈，fs 的调用链又深，溢出是
     // 真实风险（踩过一次）。这里显式查一次，比事后从 page fault 的
     // CR2 反推快得多。
@@ -1237,4 +1245,153 @@ fn syscall_fs_selftest() {
     } else {
         "syscall-fs: selftest FAILED\n"
     });
+}
+
+// =============================================================================
+// Stage 3: 用户态 ring-3 往返自检
+// =============================================================================
+
+/// 把任务 `task_idx` 改造成「下次被调度时直接 iretq 到用户态」。
+///
+/// 修改内核栈顶的 pt_regs，把 CS/SS/RFLAGS/RSP/RIP 换成用户态的值，
+/// 并设置任务专属的 PML4。
+///
+/// # Safety
+/// `task_idx` 必须是一个未在运行中的任务（刚 fork 完还没被 schedule 选到）；
+/// `us` 的 PML4 必须有效且包含已映射的代码页（`us.code_start` 处）。
+unsafe fn launch_user_task(task_idx: usize, us: &umm::UserSpace) {
+    use sched::task::KERNEL_STACK_SIZE;
+    use desc::selector::{USER_CS, USER_DS};
+
+    // SAFETY: 调用者保证 task_idx 有效且任务未运行。
+    unsafe {
+        let t = sched::task_ptr(task_idx);
+        // 换上用户页表
+        (*t).pml4 = us.pml4;
+        (*t).tss.cr3 = us.pml4 as u64;
+
+        // pt_regs 在 kernel_stack 的顶部往下 0xa8 字节（fork 刚写的）。
+        // 结构：栈顶有 switch_to 帧（7×8=56B → ret addr → pt_regs(21×8=168B)）
+        let stack_top = (*t).kernel_stack + KERNEL_STACK_SIZE as u64;
+        let ptregs = (stack_top - core::mem::size_of::<crate::traps::PtRegs>() as u64)
+            as *mut crate::traps::PtRegs;
+
+        // 只改返回用户态相关的字段；通用寄存器保持 fork 的（rax=0 等）。
+        (*ptregs).rip = us.code_start;
+        (*ptregs).cs = USER_CS as u64;
+        (*ptregs).rflags = 0x202; // IF=1
+        (*ptregs).rsp = us.stack_top;
+        (*ptregs).ss = USER_DS as u64;
+    }
+}
+
+/// 用户态 ring-3 往返自检。
+///
+/// 用 fork 生一个子进程→把子进程的返回现场改成用户态→调度→iretq→
+/// 用户代码跑 int 0x80(getpid + exit)→do_exit→父进程 wait4 收尸。
+///
+/// # Safety
+/// IDT 与调度器就绪，当前不是 task[0]（wait4 会睡）。
+unsafe fn user_mode_selftest() {
+    use syscall::nr;
+    use sched::task::TaskState;
+
+    crate::sprintln!("--- ring-3 selftest ---");
+
+    // 最小用户程序：
+    //   mov $39, %eax   ; __NR_getpid
+    //   int $0x80
+    //   mov $42, %edi   ; arg0 = 42 (避开 1..=31，那些被 encode_status 当成信号)
+    //   mov $60, %eax   ; __NR_exit
+    //   int $0x80
+    //   jmp .           ; 不该到这里
+    let user_code: [u8; 21] = [
+        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39
+        0xcd, 0x80,                     // int 0x80
+        0xbf, 0x2a, 0x00, 0x00, 0x00, // mov edi, 42
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60
+        0xcd, 0x80,                     // int 0x80
+        0xeb, 0xfe,                     // jmp . (dead)
+    ];
+
+    let us = match umm::create_user_process(&user_code) {
+        Ok(u) => u,
+        Err(e) => {
+            crate::sprintln!("ring-3: create_user_process FAILED ({})", e);
+            return;
+        }
+    };
+
+    // fork：父进程收到子进程 pid，子进程会在被调度后从 rax=0 返回。
+    // SAFETY: IDT 就绪。
+    let child_pid = unsafe { syscall::syscall0(nr::FORK) };
+    if child_pid < 0 {
+        crate::sprintln!("ring-3: fork FAILED ({})", child_pid);
+        return;
+    }
+    // 父进程这边 child_pid > 0；子进程（rax==0）不会跑到这里——
+    // 因为它会在被调度前就被我们改掉 pt_regs 的 rip。
+    assert!(child_pid > 0, "ring-3: fork should return >0 to parent");
+
+    // 找到子进程槽位，把它变成用户态任务。
+    // SAFETY: 子进程还没被调度过（没调过 schedule），改它的栈是安全的。
+    let child_nr = unsafe {
+        let mut found = sched::NR_TASKS;
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state != TaskState::Unused && (*t).pid as i64 == child_pid {
+                found = i;
+                break;
+            }
+        }
+        found
+    };
+    if child_nr >= sched::NR_TASKS {
+        crate::sprintln!("ring-3: child slot not found");
+        return;
+    }
+
+    // SAFETY: child_nr 有效，子进程未运行。
+    unsafe { launch_user_task(child_nr, &us) };
+
+    // 等子进程退出。
+    // SAFETY: IDT 就绪。子进程会 exit(getpid_result)，exit_code 非零。
+    let mut status: i32 = -1;
+    let reaped = unsafe {
+        syscall::syscall3(nr::WAIT4, (-1i64) as u64,
+                          &raw mut status as u64, 0)
+    };
+    if reaped != child_pid {
+        crate::sprintln!("ring-3: wait4 FAILED (expected {}, got {})", child_pid, reaped);
+        return;
+    }
+
+    // exit(42) — 正常退出，status 高 8 位是退出码
+    if (status & 0xFF) != 0 {
+        crate::sprintln!(
+            "ring-3: child killed by signal {} (status={:#x})",
+            status & 0x7F, status
+        );
+        return;
+    }
+    let ex = (status >> 8) & 0xFF;
+    if ex == 42 {
+        crate::sprintln!("ring-3: getpid()->exit(42) roundtrip -> ok");
+    } else {
+        crate::sprintln!("ring-3: unexpected exit code {} (status={:#x})", ex, status);
+        return;
+    }
+
+    // 验证子进程槽位已释放、页表已回收。
+    // SAFETY: 收尸完毕。
+    unsafe {
+        let c = sched::task_ptr(child_nr);
+        if (*c).state == TaskState::Unused && (*c).pml4 == 0 {
+            crate::sprintln!("ring-3: slot + PML4 freed -> ok");
+        } else {
+            crate::sprintln!("ring-3: cleanup check FAILED (state={:?}, pml4={:#x})",
+                             (*c).state, (*c).pml4);
+        }
+    }
+    crate::sprintln!("ring-3: selftest done");
 }
