@@ -1,9 +1,11 @@
 //! SMP (Symmetric Multiprocessing) 支持模块
-//! 
+//!
 //! 提供多核 CPU 支持，包括：
 //! - APIC (Advanced Programmable Interrupt Controller) 管理
 //! - 多核启动和同步
 //! - CPU 热插拔支持
+
+pub mod tests;
 
 /// APIC 寄存器偏移
 #[derive(Debug, Clone, Copy)]
@@ -55,16 +57,22 @@ pub enum DeliveryMode {
 
 /// 读取 32 位端口
 #[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let result: u32;
-    core::arch::asm!("inl %dx, %eax", in("dx") port, out("eax") result, options(nostack));
-    result
+/// 读取 LAPIC MMIO 寄存器（内存映射 I/O，非端口 I/O）
+#[inline]
+unsafe fn lapic_mmio_read(offset: u32) -> u32 {
+    let base = unsafe { LAPIC_BASE };
+    if base == 0 { return 0; }
+    // SAFETY: LAPIC_BASE 由 smp_init 映射为恒等映射可访问
+    unsafe { core::ptr::read_volatile((base + offset as u64) as *const u32) }
 }
 
-/// 写入 32 位端口
+/// 写入 LAPIC MMIO 寄存器
 #[inline]
-unsafe fn outl(port: u16, val: u32) {
-    core::arch::asm!("outl %eax, %dx", in("dx") port, in("eax") val, options(nomem, nostack));
+unsafe fn lapic_mmio_write(offset: u32, val: u32) {
+    let base = unsafe { LAPIC_BASE };
+    if base == 0 { return; }
+    // SAFETY: LAPIC_BASE 由 smp_init 映射
+    unsafe { core::ptr::write_volatile((base + offset as u64) as *mut u32, val) }
 }
 
 /// CPU 状态
@@ -123,20 +131,12 @@ pub fn set_lapic_base(base: u64) {
 
 /// 读取 APIC 寄存器
 pub fn lapic_read(reg: ApicReg) -> u32 {
-    let base = unsafe { LAPIC_BASE };
-    if base == 0 {
-        return 0;
-    }
-    unsafe { inl((base + reg as u64) as u16) }
+    unsafe { lapic_mmio_read(reg as u32) }
 }
 
 /// 写入 APIC 寄存器
 pub fn lapic_write(reg: ApicReg, value: u32) {
-    let base = unsafe { LAPIC_BASE };
-    if base == 0 {
-        return;
-    }
-    unsafe { outl((base + reg as u64) as u16, value) };
+    unsafe { lapic_mmio_write(reg as u32, value) };
 }
 
 /// 获取本地 APIC ID
@@ -293,29 +293,18 @@ fn delay_us(us: u64) {
     }
 }
 
-/// SMP 初始化
-/// 
-/// 初始化多核支持。需要在物理内存映射完成后调用。
+/// SMP 初始化。
+///
+/// 映射 LAPIC MMIO 区域并初始化本地 APIC。需要在页表就绪后调用。
 pub fn smp_init() {
-    crate::pr_info!("SMP: Initializing...");
-    
-    // 获取 BSP 的 APIC ID
-    let bsp_apic_id = lapic_id();
-    crate::pr_info!("SMP: BSP APIC ID = {}", bsp_apic_id);
-    
-    unsafe {
-        BSP_CPU_ID = 0;  // BSP is always CPU 0
-        CPU_COUNT = 1;
-    }
-    
-    // 启用 APIC
-    lapic_enable();
-    crate::pr_info!("SMP: Local APIC enabled");
-    
-    // 配置 LINT1 为 NMI
-    lapic_configure_lint1(true, true, DeliveryMode::Nmi);
-    
-    crate::pr_info!("SMP: Initialization complete, running on {} CPU(s)", get_cpu_count());
+    // 记录 LAPIC MMIO 基地址。该地址在 0xFEE00000，超出
+    // setup.S 的 1GB 恒等映射范围。实际 MMIO 访问需要先通过
+    // map_page 建立页表映射，此处仅记录基址供后续使用。
+    unsafe { set_lapic_base(0xFEE0_0000u64); }
+
+    // 暂时不访问 LAPIC MMIO：缺少页面映射会导致 #PF。
+    // 等页表层支持在 2MB 大页区间内插入 4KB 映射后再启用。
+    crate::sprintln!("SMP: LAPIC base set to 0xFEE00000 (MMIO not yet mapped)");
 }
 
 /// 启动应用处理器 (AP)
@@ -325,7 +314,7 @@ pub fn smp_init() {
 /// # Safety
 /// 需要在适当的上下文中调用，有严格的内存和同步要求。
 pub unsafe fn smp_start_cpu(apic_id: u8, start_vector: u64, _stack: u64) {
-    crate::pr_info!("SMP: Starting CPU with APIC ID {}", apic_id);
+    crate::sprintln!("SMP: Starting CPU with APIC ID {}", apic_id);
     
     // 发送 INIT IPI
     lapic_send_init(apic_id);
@@ -343,7 +332,7 @@ pub unsafe fn smp_start_cpu(apic_id: u8, start_vector: u64, _stack: u64) {
     // 再次发送 Startup (根据 Intel 规范)
     lapic_send_startup(apic_id, vector);
     
-    crate::pr_info!("SMP: Startup IPI sent to CPU {}", apic_id);
+    crate::sprintln!("SMP: Startup IPI sent to CPU {}", apic_id);
 }
 
 /// 获取当前 CPU 的 APIC ID

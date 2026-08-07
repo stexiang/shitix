@@ -28,7 +28,7 @@
       "first_read": "2026-08-07T10:13:08.099Z"
     },
     "/root/shitix/src/lib.rs": {
-      "count": 5,
+      "count": 7,
       "tokens": 11062,
       "first_read": "2026-08-07T10:23:14.503Z"
     },
@@ -81,13 +81,28 @@
       "count": 1,
       "tokens": 999,
       "first_read": "2026-08-07T13:19:59.906Z"
+    },
+    "/root/shitix/src/smp/mod.rs": {
+      "count": 6,
+      "tokens": 2364,
+      "first_read": "2026-08-07T13:24:50.823Z"
+    },
+    "/root/shitix/src/mm/page.rs": {
+      "count": 1,
+      "tokens": 287,
+      "first_read": "2026-08-07T13:33:47.894Z"
+    },
+    "/root/shitix/src/smp/tests.rs": {
+      "count": 2,
+      "tokens": 0,
+      "first_read": "2026-08-07T13:37:34.631Z"
     }
   },
   "files_written": [],
   "edit_counts": {},
-  "anatomy_hits": 13,
-  "anatomy_misses": 3,
-  "repeated_reads_warned": 79,
+  "anatomy_hits": 15,
+  "anatomy_misses": 4,
+  "repeated_reads_warned": 87,
   "cerebrum_warnings": 0,
-  "stop_count": 9
+  "stop_count": 10
 }

@@ -128,6 +128,10 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     trap_selftest();
     syscall_selftest();
     sched_selftest();
+    // SAFETY: 启动早期、中断仍关闭，LAPIC 读不涉及中断
+    sprintln!("--- smp selftest ---");
+    let smp_ok = unsafe { smp::tests::selftest() };
+    sprintln!("smp: done ({})", if smp_ok { "ok" } else { "FAIL" });
 
     // ---- 模块 5：文件系统与设备驱动 ----
     // 顺序对应原版 start_kernel()：buffer_init/inode_init/file_table_init
