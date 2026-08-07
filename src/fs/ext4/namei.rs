@@ -411,8 +411,7 @@ pub unsafe fn rmdir(dir: usize, name: &[u8]) -> i32 {
         }
         remove_entry(dir, name)?;
         i.i_nlink = 0; i.i_dirt = true;
-        inode::iput(ip); // release ref from lookup
-        inode::iput(ip); // mark for deletion
+        inode::iput(ip);
         Ok(())
     })();
     match result { Ok(()) => 0, Err(e) => -e }
@@ -427,7 +426,7 @@ pub unsafe fn unlink(dir: usize, name: &[u8]) -> i32 {
         remove_entry(dir, name)?;
         i.i_nlink -= 1; i.i_dirt = true;
         if i.i_nlink == 0 { crate::fs::ext4::ops::full::truncate(ip); }
-        inode::iput(ip); inode::iput(ip);
+        inode::iput(ip);
         Ok(())
     })();
     match result { Ok(()) => 0, Err(e) => -e }

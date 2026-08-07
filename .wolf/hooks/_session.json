@@ -43,7 +43,7 @@
       "first_read": "2026-08-07T10:30:19.699Z"
     },
     "/root/shitix/src/fs/ext4/namei.rs": {
-      "count": 33,
+      "count": 35,
       "tokens": 0,
       "first_read": "2026-08-07T10:34:38.105Z"
     },
@@ -82,7 +82,7 @@
   "edit_counts": {},
   "anatomy_hits": 12,
   "anatomy_misses": 3,
-  "repeated_reads_warned": 77,
+  "repeated_reads_warned": 79,
   "cerebrum_warnings": 0,
-  "stop_count": 7
+  "stop_count": 8
 }
