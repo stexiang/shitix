@@ -18,6 +18,7 @@
 
 pub mod block;
 pub mod char_dev;
+pub mod net;
 #[cfg(feature = "extra-drivers")]
 pub mod sound;
 

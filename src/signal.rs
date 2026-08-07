@@ -648,6 +648,15 @@ pub fn reset_sigactions(task_idx: usize) {
 /// fork 时把父进程的 sigaction 表整份复制给子进程。
 /// 对应原版 `copy_process` 里 `*p = *current`（sigaction 是内联数组，随之复制）。
 ///
+/// 共享信号处理器表（CLONE_SIGHAND）。子进程直接使用父进程的表指针。
+pub fn share_sigactions(from: usize, to: usize) {
+    if from >= sched::NR_TASKS || to >= sched::NR_TASKS || from == to { return; }
+    unsafe {
+        let src = table_ptr(from);
+        SIGACTION_TABLES[to] = if src.is_null() { 0 } else { src as usize };
+    }
+}
+
 /// 父进程没装过 handler 就什么都不用做——子进程同样全默认。
 pub fn clone_sigactions(from: usize, to: usize) {
     if from >= sched::NR_TASKS || to >= sched::NR_TASKS || from == to {
@@ -688,40 +697,107 @@ pub fn clone_sigactions(from: usize, to: usize) {
 ///
 /// # Safety
 /// `regs` 必须指向当前任务内核栈顶的 pt_regs。
-unsafe fn setup_frame(regs: *mut crate::traps::PtRegs, signum: u32, handler: extern "C" fn(u32)) {
+/// x86_64 signal frame layout pushed onto the user stack.
+/// Grows downward:
+///   [higher addresses]
+///   trampoline code (12 bytes: mov $15,%rax; syscall)
+///   saved rip     (8 bytes)
+///   saved cs      (8 bytes)
+///   saved rflags  (8 bytes)
+///   saved rsp     (8 bytes)
+///   saved ss      (8 bytes)
+///   [rsp →] return address = &trampoline
+///   [lower addresses]
+#[repr(C)]
+struct SigFrame {
+    ret_addr: u64,       // points to trampoline below saved regs
+    saved_ss: u64,
+    saved_rsp: u64,
+    saved_rflags: u64,
+    saved_cs: u64,
+    saved_rip: u64,
+    trampoline: [u8; 12], // mov $15,%rax; syscall (12 bytes on x86_64 with REX prefix)
+}
+
+/// siginfo_t for SA_SIGINFO handlers
+#[repr(C)]
+struct SigInfo {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    _pad: [u8; 116], // pad to 128 bytes
+}
+
+/// Extended signal frame with siginfo for SA_SIGINFO handlers.
+/// Layout: [ret_addr][saved regs][trampoline][siginfo_t(128)]
+#[repr(C)]
+struct SigFrameExt {
+    ret_addr: u64,
+    saved_ss: u64,
+    saved_rsp: u64,
+    saved_rflags: u64,
+    saved_cs: u64,
+    saved_rip: u64,
+    trampoline: [u8; 12],
+    info: SigInfo,      // siginfo_t for SA_SIGINFO
+}
+
+unsafe fn setup_frame(regs: *mut crate::traps::PtRegs, signum: u32,
+                      handler: extern "C" fn(u32), flags: u64) {
     use crate::desc::selector::{USER_CS, USER_DS};
 
-    // SAFETY: 契约转交。
     unsafe {
         let r = &mut *regs;
 
-        // 计算信号帧在用户栈上的位置（rsp 往下放 64 字节）
-        let frame_sp = (r.rsp - 64) & !0xF; // 16 字节对齐
+        let has_siginfo = flags & SigActionFlags::SA_SIGINFO != 0;
+        let frame_size = if has_siginfo {
+            core::mem::size_of::<SigFrameExt>() as u64
+        } else {
+            core::mem::size_of::<SigFrame>() as u64
+        };
 
-        // 1. 写 sigreturn 蹦床到用户栈
-        let trampoline: [u8; 8] = [0xb8, 0x0f, 0x00, 0x00, 0x00, // mov eax, 15
-                                   0xcd, 0x80,                     // int 0x80
-                                   0xc3];                          // ret
-        // 蹦床在上，saved regs 在下
-        let tramp_addr = frame_sp + 40; // 5 个 saved qwords = 40 字节后
-        // SAFETY: 恒等映射可写；用户页表映射了这些页。
-        core::ptr::copy_nonoverlapping(trampoline.as_ptr(), tramp_addr as *mut u8, 8);
+        let frame_addr = (r.rsp - frame_size - 16) & !0xF;
 
-        // 2. 保存当前 pt_regs 的关键字段到用户栈
-        let save = frame_sp as *mut u64;
-        core::ptr::write_volatile(save.add(0), r.ss);     // [frame_sp +  0] saved ss
-        core::ptr::write_volatile(save.add(1), r.rsp);    // [frame_sp +  8] saved rsp
-        core::ptr::write_volatile(save.add(2), r.rflags); // [frame_sp + 16] saved rflags
-        core::ptr::write_volatile(save.add(3), r.cs);     // [frame_sp + 24] saved cs
-        core::ptr::write_volatile(save.add(4), r.rip);    // [frame_sp + 32] saved rip
+        // Trampoline: mov $15, %rax; syscall
+        let tramp: [u8; 12] = [
+            0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00,
+            0x0f, 0x05,
+            0xcc, 0xcc, 0xcc,
+        ];
 
-        // 3. 改写 pt_regs：下一次 iretq 会跳到 handler
+        if has_siginfo {
+            let frame = frame_addr as *mut SigFrameExt;
+            (*frame).trampoline = tramp;
+            (*frame).saved_rip = r.rip;
+            (*frame).saved_cs = r.cs;
+            (*frame).saved_rflags = r.rflags;
+            (*frame).saved_rsp = r.rsp;
+            (*frame).saved_ss = r.ss;
+            (*frame).ret_addr = frame_addr + 48; // &trampoline
+            // Fill siginfo
+            (*frame).info = SigInfo { si_signo: signum as i32, si_errno: 0,
+                                      si_code: 0, _pad: [0; 116] };
+            // SA_SIGINFO: rdi=signum, rsi=&siginfo, rdx=&ucontext (we pass info as both)
+            r.rdi = signum as u64;
+            r.rsi = &raw const (*frame).info as u64;
+            r.rdx = 0; // no ucontext for now
+        } else {
+            let frame = frame_addr as *mut SigFrame;
+            (*frame).trampoline = tramp;
+            (*frame).saved_rip = r.rip;
+            (*frame).saved_cs = r.cs;
+            (*frame).saved_rflags = r.rflags;
+            (*frame).saved_rsp = r.rsp;
+            (*frame).saved_ss = r.ss;
+            (*frame).ret_addr = frame_addr + 48;
+            r.rdi = signum as u64;
+        }
+
         r.rip = handler as u64;
         r.cs = USER_CS as u64;
-        r.rflags = 0x202;  // IF=1
-        r.rsp = frame_sp;
+        r.rflags = 0x202;
+        r.rsp = frame_addr;
         r.ss = USER_DS as u64;
-        r.rdi = signum as u64; // 第一个参数 = 信号号
     }
 }
 
@@ -775,7 +851,7 @@ pub unsafe extern "C" fn do_signal(regs: *mut crate::traps::PtRegs) {
             }
             // 自定义 handler：在用户栈上搭信号帧
             // SAFETY: regs 指向当前内核栈上的 pt_regs。
-            unsafe { setup_frame(regs, signum, h) };
+            unsafe { setup_frame(regs, signum, h, action.flags.0) };
             continue; // 已设好帧，返回用户态后 handler 会跑
         }
 

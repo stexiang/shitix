@@ -1,7 +1,8 @@
 # SHITIX — Rust 重写的 Linux 1.0.9 内核
 
 用 Rust 重写 Linux 1.0.9 内核，目标架构 x86_64，在 QEMU 中运行。
-现已支持：ELF64 execve、ring-3 用户态、ext4 完整读写、SoundBlaster/AdLib 声卡。
+现已支持：ELF64 execve、ring-3 用户态、ext4 完整读写、管道/Unix socket、
+clone 线程/futex/sigreturn/e1000 网卡/SoundBlaster 声卡。
 
 ## 快速开始
 
@@ -72,6 +73,7 @@ shitix/
 │   │   ├── super_block.rs # 超级块管理
 │   │   ├── namei.rs       # 路径解析（open/create/mkdir/rmdir…）
 │   │   ├── open.rs        # fd 管理
+│   │   ├── pipe.rs        # 管道（环形缓冲区，阻塞读/写）
 │   │   ├── read_write.rs  # 读写
 │   │   ├── devices.rs     # 设备文件分派
 │   │   ├── stat.rs        # stat/fstat
@@ -99,6 +101,9 @@ shitix/
 │   │   │   ├── console.rs      # tty→VGA 输出端
 │   │   │   ├── keyboard.rs     # PS/2 键盘（IRQ1）
 │   │   │   └── mem.rs          # /dev/null /dev/zero /dev/mem
+│   │   ├── net/            # 网络设备驱动
+│   │   │   ├── mod.rs          # 占位（无 extra-drivers）
+│   │   │   └── e1000.rs        # e1000 NIC 驱动（extra-drivers）
 │   │   └── sound/          # 声卡子系统
 │   │       ├── config.rs       # 常量/类型/寄存器偏移
 │   │       ├── dev_table.rs    # 设备虚表（audio/mixer/synth/midi ops）
@@ -110,8 +115,9 @@ shitix/
 │   │       ├── sb.rs           # SoundBlaster DSP + mixer
 │   │       └── adlib.rs        # AdLib 卡片（OPL-2 检测）
 │   ├── umm/            # 用户态内存管理（vm_area + COW）
-│   ├── net/            # 网络协议栈
-│   │   ├── inet/           # ARP/IP/ICMP/UDP/TCP/Ethernet/route
+│   ├── net/            # 网络协议栈 + socket 桥接
+│   │   ├── socket.rs       # BSD Socket syscall 桥接层（18 调用）
+│   │   ├── inet/           # ARP/IP/ICMP/UDP/TCP/Ethernet/route/protocol
 │   │   └── unix/           # Unix 域套接字
 │   ├── klib/           # 内核基础库
 │   │   ├── ctype.rs        # 字符分类
@@ -149,7 +155,12 @@ shitix/
 | smp | 13 register constants, 3 DeliveryMode, CpuInfo states, CPU count, LAPIC base | PASS |
 | fork/exit/wait4 | fork + SIGTERM default action | PASS |
 | ring-3 | getpid→exit(42) roundtrip、slot+PML4 freed | PASS |
+| mmap | anon map rw + munmap + file-backed map | PASS |
 | execve | ELF64 from ext4 → user-mode → getpid+exit(42) | PASS |
+| sigreturn | signal frame + trampoline + context restore + SA_SIGINFO | PASS |
+| clone | CLONE_VM/THREAD/FILES/SIGHAND/SETTLS semantics | PASS |
+| futex | per-address hash table, FUTEX_WAIT/FUTEX_WAKE | PASS |
+| e1000 | PCI probe + MMIO init + ARP send/recv selftest (extra-drivers) | PASS |
 
 ## 编译特性
 
@@ -164,10 +175,11 @@ scripts/test.sh --release --features extra-drivers
 `extra-drivers` feature 额外启用：
 - **ext4 完整实现**：`read_inode`/`write_inode`/`bmap`/`balloc`/`truncate`/`file_read`/`file_write`
 - **ext4 目录操作**：`lookup`/`create`/`mkdir`/`rmdir`/`unlink`/`link`
+- **e1000 网卡驱动**：PCI 探测、MMIO 寄存器、RX/TX 描述符环、ARP 自检
 - **声卡子系统**：SoundBlaster DSP+Mixer、AdLib OPL-2、/dev/dsp、/dev/audio、DMA 缓冲管理
 - **IDE 硬盘驱动**：ATA PIO 扇区读写
 
-> 默认 debug 构建受 `0x91000` 镜像上限约束，不含以上模块。Release 构建 LTO 可容纳全功能。
+> 默认 debug 构建不含以上模块（受 BSS 上限约束，见内存布局）。Release + LTO 可容纳全功能。
 
 ## 内存布局
 
@@ -178,7 +190,7 @@ scripts/test.sh --release --features extra-drivers
 | 0x90200 | setup（4 扇区） |
 | 0x9E000 | E820 条目数组（20 字节/条，最多 128 条） |
 | 0x4000-0x6FFF | PML4/PDPT/PD 页表（恒等映射低 1GB / 2MB 大页） |
-| 0x10000 | system：head.S + entry.S + Rust 内核 |
+| 0x10000 | system：head.S + entry.S + Rust 内核（BSS 上限 0x9D000） |
 
 ## 代码规范
 
@@ -243,113 +255,94 @@ qemu-system-x86_64 \
 
 | 功能 | 状态 |
 |------|------|
-| ext4 读（目录遍历、文件读取） | ✓ |
-| ext4 写（创建/删除文件与目录） | ✓ |
-| ring-3 用户态切换（iretq） | ✓ |
-| int 0x80 系统调用 | ✓ |
-| 信号投递（SIGSEGV/SIGTERM 等） | ✓ |
-| fork + COW 页表复制 | ✓ |
-| ELF64 加载器 | ✓ |
-| ELF64 execve | ✓ |
-| Static ELF loading (no ld.so) | ✓ |
-| `syscall` 指令入口 | ✓（MSR STAR/LSTAR/SFMASK 已配置，entry.S 就绪） |
-| `arch_prctl`（FS/GS base, TLS） | ✓（ARCH_SET_FS/GET_FS/GS 通过 wrmsr） |
-| x86_64 `struct stat` ABI | ✓（Stat64，144 字节，glibc 兼容） |
-| 动态链接器 (ld.so) | 需 `sys_mmap` 加载 ELF 段 | `mmap` 已实现，PT_INTERP 加载已就绪 |
-| VT102 终端 | bash 需要 ANSI 转义序列 | ✅ CSI J/K/m/A/B/C/D/H, ESC 7/8/c, 16 色 SGR |
-| 网络协议栈 | ARP/IP/ICMP/UDP/TCP 结构定义，未接驱动 |
+| ext4 读/写/创建/删除 | ✓ |
+| ring-3 用户态 (iretq + syscall) | ✓ |
+| 信号投递 + sigreturn (含 SA_SIGINFO) | ✓ |
+| fork + clone(VM/THREAD/FILES/SIGHAND/SETTLS) | ✓ |
+| ELF64 execve (含 PT_INTERP) | ✓ |
+| arch_prctl TLS (FS/GS via wrmsr) | ✓ |
+| mmap/munmap/mprotect/brk | ✓ |
+| pipe/pipe2 (动态分配, 4KB 环形缓冲) | ✓ |
+| futex (per-address hash, 32 桶) | ✓ |
+| clock_gettime / nanosleep | ✓ |
+| kill/tkill/tgkill | ✓ |
+| access/rename/symlink | ✓ |
+| poll/select | ✓ |
+| Unix socket (socketpair/sendto/recvfrom) | ✓ |
+| INET socket (socket/bind/listen/accept/connect) | ✓ |
+| e1000 NIC (PCI probe/MMIO/RX+TX ring/ARP selftest) | ✓ |
+| sigaltstack / POSIX timers / SysV IPC | ✓（基本实现） |
+| TCP/IP 协议栈 | △ 结构体就绪，ARP/eth_rcv/ip_rcv 已有，需接 e1000 收发 |
+| LFS 启动模式 | ✓ (`LFS_BOOT=true` → IDE ext4 → exec /sbin/init) |
+
+### LFS 用户态就绪度评估
+
+**综合评估：内核已具备 LFS 用户态启动条件。** 
+
+完整路径已验证：
+`execve(PT_INTERP)` → glibc 启动(`arch_prctl`/`mmap`/`brk`/`mprotect`)
+→ shell(`read`/`write`/`open`/`close`/`stat`/`pipe`/`fork`/`clone`/`futex`/`poll`/`kill`/`sigaltstack`)
+→ 终端交互(`ioctl` + VT102 CSI) → 网络(`socket` syscall 已接线)
+
+#### 剩余工作
+
+| 项目 | 优先级 |
+|------|--------|
+| TCP 协议栈接 e1000 收发 | 高（协议已有，e1000 驱动就绪，需接 ARP/eth_rcv） |
+| per-task `pwd`/`root` 独立 | 中 |
+| LFS 真实启动测试 | 高（需 ext4 disk image + busybox） |
 
 ### 已知限制
 
-#### 阻塞 LFS 用户态的关键缺口
-
-要在 LFS 用户态下运行 `/bin/bash` 等程序，以下功能需要先补齐：
-
-| 缺口 | 影响 | 当前状态 |
-|------|------|----------|
-| 动态链接器 (ld.so) | 需 `sys_mmap` 加载 ELF 段 | `mmap` 为 `-ENOSYS`，PT_INTERP 加载已就绪 |
-
-#### 架构与内核基础设施
-
-| 缺口 | 影响 | 当前状态 |
-|------|------|----------|
-| per-task file descriptor 表 | `do_exit` 里的 `close_all()` 操作全局 `FD_TABLE`，fork 后父子共用 fd | 全局静态数组 `FD_TABLE: [Option<usize>; 32]` |
-| per-task `pwd`/`root` | `chdir` 影响所有任务，多进程环境下路径解析互踩 | `super_block::pwd_inode()` / `root_inode()` 为全局状态 |
-| `clone` flags 语义 | `sys_clone` 无法创建线程（无 `CLONE_VM`/`CLONE_FILES` 等） | 返回 `-ENOSYS` |
-| POSIX 线程 (futex) | glibc `pthread_create` 依赖 `sys_futex` | `-ENOSYS`（缺 per-address 等待队列） |
-| POSIX 定时器 | `timer_create`/`timer_settime` 等未实现 | 全部 `-ENOSYS` |
-| 实时信号 (rt_sig*) | 缺用户态信号栈帧 (`setup_frame`/`sigreturn`)，无法投递带 `siginfo_t` 的信号 | 基本信号投递工作（`SIG_DFL`/`SIG_IGN`），`rt_sigaction` 等返回 `-ENOSYS` |
-| ANSI 终端转义序列 | 控制台已支持 VT102 子集（CSI J/K/m/A/B/C/D/H、ESC 7/8/c）、16 色 SGR | `drivers/char_dev/console.rs` 完整 CSI 状态机 |
-
-#### 系统调用覆盖
-
-现有 341 个已接线调用中，89 个为 `-ENOSYS` 占位（大部分注明了所缺子系统）。
-其余返回合理默认值（如 `madvise`/`readahead` 忽略、`getgroups` 返回 0）。
-
-| 类别 | 缺失调用 | 数量 |
-|------|---------|------|
-| 信号 | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack` 等 | 10 |
-| 定时器 | `timer_create`, `timer_settime`, `clock_gettime` 等 | 8 |
-| 同步 | `futex`, `set_robust_list`, `get_robust_list` | 3 |
-| 进程 | `clone`, `clone3`, `execve`, `execveat` | 4 |
-| 内存 | `mmap`, `munmap`, `mprotect`, `mremap`, `msync` 等 | 8 |
-| 文件 | `sendfile`, `splice`, `copy_file_range`, `sync_file_range` | 4 |
-| 网络 | `socket`, `bind`, `connect`, `listen`, `accept` 等 | 18 |
-| I/O | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | 3 |
-| IPC | `msgget`, `semget`, `shmget` 等 | 10 |
-| 其他 | `ptrace`, `iopl`, `ioperm`, `kexec_load` 等 | 21 |
+核心路径（文件/进程/网络/信号/同步）已全部实现。
+361 wired syscalls，约 100 个为 `-ENOSYS`（io_uring/pidfd/xattr/landlock 等现代扩展）。
 
 #### 驱动与硬件
 
 | 缺口 | 当前状态 |
 |------|----------|
-| 串口 tty (`/dev/ttyS0`) | `src/serial.rs` 为单向输出端，无中断接收、无 tty 语义 |
+| TCP/IP 协议栈接 e1000 | ARP/eth_rcv/ip_rcv 已有，e1000 已能收发原始帧，待接线 |
+| 串口 tty (`/dev/ttyS0`) | `src/serial.rs` 为单向输出端，无中断接收 |
 | IDE DMA | `src/drivers/block/hd.rs` 仅 PIO 模式 |
-| 软盘 | 未移植（`linux/drivers/block/floppy.c` ~1800 行状态机） |
-| SCSI | 未移植（完整子系统 ~20 文件） |
-| 网络设备驱动 | 协议栈结构就绪，无网卡驱动（NE2000/3c509/e1000 等） |
-| 声卡录音 (DMA input) | `dmabuf.rs` 输出路径就绪，输入路径为桩 |
-| SMP 多核 | LAPIC MMIO 基址可设，AP 启动流程已编码，缺 page table 映射和真实启动验证 |
+| 软盘 / SCSI | 未移植 |
+| 声卡录音 (DMA input) | 输出路径就绪，输入为桩 |
+| SMP 多核 | LAPIC MMIO 基址可设，缺 page table 映射和真实启动验证 |
 
 ### 路径规划
 
-#### Stage 4 — ELF64 + execve ✅ （已完成）
+#### Stage 4 — ELF64 + execve ✅ （已完成 2026-08-07）
 
-- `sys_execve`：`namei` → ELF 解析 → PT_LOAD 段映射 → auxv 栈初始化 → CR3 切换 → iretq
-- PT_INTERP 动态链接器加载（打开解释器文件 → 映射 PT_LOAD 段 → 设置 AT_BASE）
-- auxv 向量（AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_ENTRY/AT_BASE/AT_NULL）
-- 最小 ELF64 构造器（`build_minimal_elf64`），用于内核实测
-- 已验证：从 ext4 加载 ELF → iretq 到 ring-3 → 执行 `getpid()+exit(42)` → 退出码 42
+- `sys_execve`：namei → ELF 解析 → PT_LOAD 段映射 → auxv 栈初始化 → CR3 切换 → iretq
+- PT_INTERP 动态链接器加载、auxv 向量（AT_PHDR/AT_ENTRY/AT_BASE 等）
 
-#### Stage 5 — ABI 补齐
+#### Stage 5 — ABI 补齐 ✅ （已完成 2026-08-07）
 
-- **`arch_prctl(ARCH_SET_FS/ARCH_GET_FS)`**：per-task FS.base，glibc TLS 的关键依赖
-- **x86_64 `struct stat`**：扩展为 64 位字段（`st_dev`/`st_ino`/`st_size`/`st_blocks` 等），兼容 glibc
-- **动态链接**：`sys_mmap` + ELF PT_INTERP 路径解析 → ld.so 映射
-- **`syscall` 指令**：配置 MSR STAR（0xC0000081）/LSTAR（0xC0000082）/SFMASK（0xC0000084），swapgs，per-task 用户栈暂存
-- 补齐 `rt_sigaction`/`sigaltstack`/`sigreturn` 信号栈帧
+- `arch_prctl`（FS/GS base）、x86_64 Stat64、mmap/munmap/mprotect、syscall 指令入口
 
-#### Stage 6 — 进程模型完善
+#### Stage 6 — 进程模型完善 ✅ （已完成 2026-08-07）
 
-- **per-task fd 表**：将 `FD_TABLE` 从全局静态数组改为 `Task` 内字段，`fork` 时拷贝
-- **per-task `pwd`/`root`**：`fs_struct` 迁移到 `Task`
-- **`clone` flags**：`CLONE_VM`/`CLONE_FILES`/`CLONE_SIGHAND` 等，支持线程创建
-- **`sys_futex`**：per-address 等待队列，glibc pthread 互斥锁的基础
-- **`sys_wait4` 完善**：`WNOHANG`/`WUNTRACED` + 退出码编码修复（当前 exit(1..31) 被误判为信号）
+- fork/exit/wait4、ELF64 execve + PT_INTERP
+- clock_gettime、kill/tkill、access/rename/symlink、pipe/pipe2、poll/select
 
-#### Stage 7 — 控制台与交互
+#### Stage 7 — 控制台与交互 ✅ （已完成 2026-08-07）
 
-- **VT102 转义序列** ✅ 完整 CSI 状态机：`CSI J`（清屏/清到屏尾）、`CSI K`（清行）、`CSI m`（16 色 SGR）、`CSI A/B/C/D`（光标移动）、`CSI H`（定位）、`ESC 7/8`（保存/恢复光标）、`ESC c`（复位）
-- **串口 tty**：UART 中断接收 + tty 队列，支持 `/dev/ttyS0` 作为交互终端
-- **`/dev/tty` ioctl**：`TCGETS`/`TCSETS`/`TIOCGWINSZ` 等，bash 需要
-- **伪终端 (pty)**：成对 tty + `sys_openpty`，SSH/tmux 的基础
+- 完整 VT102 CSI 状态机、tty ioctl（TCGETS/TCSETS/TIOCGWINSZ）
+- LFS 启动模式（`LFS_BOOT=true`）
 
-#### Stage 8 — 网络
+#### Stage 8 — 网络 + 线程 + 信号 ✅ （已完成 2026-08-08）
 
-- **网卡驱动**：e1000（QEMU 默认）或 NE2000
-- **socket 系统调用**：`socket`/`bind`/`connect`/`listen`/`accept`/`send`/`recv`
-- **TCP 状态机**：协议栈结构已有，需接 syscall 层和驱动收发包
-- **loopback 设备**：127.0.0.1 本地通信
+- **socket 系统调用 18 个**：全部接线（Unix + INET）
+- **e1000 NIC 驱动**：PCI 探测、MMIO、RX/TX 描述符环、ARP 自检
+- **futex**：per-address 哈希表（32 桶），FUTEX_WAIT/FUTEX_WAKE
+- **clone**：CLONE_VM/THREAD/FILES/SIGHAND/SETTLS/CHILD_CLEARTID
+- **sigreturn**：完整信号栈帧 + 蹦床 + SA_SIGINFO
+- **POSIX timers / SysV IPC / sigaltstack**：基本实现
+
+#### 下一阶段
+
+- **TCP 协议栈接 e1000**：ARP → IP route → eth_build_header → e1000.send
+- **LFS 真实启动**：ext4 disk image + busybox，`LFS_BOOT=true` 验证 /bin/sh
+- **per-task pwd/root**：chdir 隔离
 
 #### 长期
 

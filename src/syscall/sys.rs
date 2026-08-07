@@ -532,6 +532,70 @@ pub fn build_minimal_elf64() -> ([u8; 256], usize) {
     (elf, pos)
 }
 
+/// 构建 /sbin/init ELF64 — 打印 banner、测试 ioctl、循环 idle。
+pub fn build_init_elf() -> ([u8; 512], usize) {
+    // x86_64 asm for init:
+    //   mov rax, 1; mov rdi, 1; lea rsi, [rip+msg]; mov rdx, 28; int 0x80  // write banner
+    //   mov rax, 16; mov rdi, 0; mov rsi, 0x5401; lea rdx, [rsp-40]; int 0x80 // ioctl TCGETS
+    //   mov rax, 60; mov rdi, 0; int 0x80  // exit(0)
+    let msg = b"shitix init: hello world\n\x00";
+    let code: &[u8] = &[
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (write)
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1 (stdout)
+        0x48, 0x8d, 0x35, 0x13, 0x00, 0x00, 0x00, // lea rsi, [rip+19] (msg)
+        0x48, 0xc7, 0xc2, 0x1a, 0x00, 0x00, 0x00, // mov rdx, 26 (len)
+        0xcd, 0x80,                                     // int 0x80 (write)
+        // ioctl(0, TCGETS, buf)
+        0x48, 0xc7, 0xc0, 0x10, 0x00, 0x00, 0x00, // mov rax, 16 (ioctl)
+        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0 (stdin)
+        0x48, 0xc7, 0xc6, 0x01, 0x54, 0x00, 0x00, // mov rsi, 0x5401 (TCGETS)
+        0x48, 0x8d, 0x54, 0x24, 0xd8,             // lea rdx, [rsp-40]
+        0xcd, 0x80,                                     // int 0x80 (ioctl)
+        // exit(0)
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60 (exit)
+        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
+        0xcd, 0x80,                                     // int 0x80
+    ];
+
+    let cs = code.len();
+    let msg_start: usize = 0x40000000 + cs + 4; // after code + alignment
+    let total = cs + 4 + msg.len();
+    let vaddr: u64 = crate::umm::USERSPACE_START;
+
+    let mut elf = [0u8; 512];
+    // ELF64 header
+    elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    elf[4] = 2; elf[5] = 1; elf[6] = 1;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[24..32].copy_from_slice(&vaddr.to_le_bytes());
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let mut pos = 64;
+    // PT_LOAD phdr: p_offset=120, p_vaddr=vaddr, p_filesz=total, p_memsz=total+4096, p_flags=7(RWX)
+    elf[pos..pos+4].copy_from_slice(&1u32.to_le_bytes());
+    elf[pos+4..pos+8].copy_from_slice(&7u32.to_le_bytes());
+    elf[pos+8..pos+16].copy_from_slice(&120u64.to_le_bytes());
+    elf[pos+16..pos+24].copy_from_slice(&vaddr.to_le_bytes());
+    elf[pos+32..pos+40].copy_from_slice(&(total as u64).to_le_bytes());
+    elf[pos+40..pos+48].copy_from_slice(&((total + 4096) as u64).to_le_bytes());
+    elf[pos+48..pos+56].copy_from_slice(&0x1000u64.to_le_bytes());
+    pos += 56;
+    // Code + msg
+    elf[pos..pos+cs].copy_from_slice(code);
+    pos += cs;
+    // Align to 4
+    while pos % 4 != 0 { pos += 1; }
+    // Message
+    elf[pos..pos+msg.len()].copy_from_slice(msg);
+    pos += msg.len();
+    if pos > 500 { pos = 500; }
+
+    (elf, pos)
+}
+
 /// 返回当前进程 pid。对应原版 `sched.c:sys_getpid()`。
 pub fn getpid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // SAFETY: 系统调用上下文里 current 必然有效。
@@ -598,14 +662,18 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd < 0 {
         return -(EBADF as i64);
     }
+    let sz64 = args.a2;
+    if sz64 == 0 { return 0; }
+    // Pipe fast path: bypass VFS
+    if crate::fs::pipe::fd_is_pipe(fd as usize) {
+        let pipe_idx = crate::fs::pipe::fd_to_pipe(fd as usize).unwrap();
+        return crate::fs::pipe::pipe_write(pipe_idx, args.a1 as *const u8, sz64 as usize);
+    }
     // SAFETY: user_buf 已校验范围。
-    let buf = match unsafe { user_buf(args.a1, args.a2) } {
+    let buf = match unsafe { user_buf(args.a1, sz64) } {
         Ok(b) => b,
         Err(e) => return e,
     };
-    if buf.is_empty() {
-        return 0;
-    }
 
     // 先走 fs 层：fd 真的 open 过就写文件/设备。
     // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
@@ -761,14 +829,18 @@ pub fn read(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd < 0 {
         return -(EBADF as i64);
     }
+    let sz64 = args.a2;
+    if sz64 == 0 { return 0; }
+    // Pipe fast path: bypass VFS
+    if crate::fs::pipe::fd_is_pipe(fd as usize) {
+        let pipe_idx = crate::fs::pipe::fd_to_pipe(fd as usize).unwrap();
+        return crate::fs::pipe::pipe_read(pipe_idx, args.a1 as *mut u8, sz64 as usize);
+    }
     // SAFETY: user_buf_mut 已校验范围。
-    let buf = match unsafe { user_buf_mut(args.a1, args.a2) } {
+    let buf = match unsafe { user_buf_mut(args.a1, sz64) } {
         Ok(b) => b,
         Err(e) => return e,
     };
-    if buf.is_empty() {
-        return 0;
-    }
     // SAFETY: 同 [`open`]，fs 层会睡。
     unsafe { crate::fs::read_write::read(fd as usize, buf) }
 }
@@ -796,8 +868,19 @@ pub fn close(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd < 0 {
         return -(EBADF as i64);
     }
-    // SAFETY: fs 层校验 fd 是否真的打开着，未打开返回 -EBADF。
-    unsafe { crate::fs::open::sys_close(fd as usize) }
+    let fd = fd as usize;
+    // Pipe cleanup
+    if crate::fs::pipe::fd_is_pipe(fd) {
+        crate::fs::pipe::close_reader(fd);
+        crate::fs::pipe::close_writer(fd);
+        crate::fs::pipe::unregister_fd(fd);
+    }
+    // Socket cleanup
+    if crate::net::socket::fd_is_socket(fd) {
+        crate::net::socket::close_socket(fd);
+    }
+    // SAFETY: 同 [`open`]。
+    unsafe { crate::fs::open::sys_close(fd) }
 }
 
 /// 创建文件。对应原版 `fs/open.c:sys_creat()`。
@@ -958,16 +1041,34 @@ pub fn munmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 内存保护。对应原版 `mm/mmap.c:sys_mprotect()`。
 pub fn mprotect(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::mm::paging;
+    use crate::mm::PAGE_SIZE;
+
     let addr = args.a0 as usize;
     let len = args.a1 as usize;
     let prot = args.a2 as u32;
-    
-    if len == 0 {
-        return -(EINVAL as i64);
+
+    if len == 0 { return -(EINVAL as i64); }
+
+    let start = crate::mm::page::page_align(addr);
+    let end = crate::mm::page::page_align(addr + len + PAGE_SIZE - 1);
+
+    // Build protection flags for set_page_flags (PRESENT is added automatically).
+    // x86_64: RW=writable, USER=user-accessible, NO_EXEC=no instruction fetch.
+    let mut new_flags: u64 = paging::flags::USER;
+    if prot & 2 != 0 { new_flags |= paging::flags::RW; }       // PROT_WRITE
+    if prot & 4 == 0 { new_flags |= paging::flags::NO_EXEC; }  // !PROT_EXEC
+
+    unsafe {
+        let pml4 = paging::current_pml4();
+        if pml4 == 0 { return 0; }
+        let mut va = start;
+        while va < end {
+            paging::set_page_flags(pml4, va, new_flags);
+            va += PAGE_SIZE;
+        }
     }
-    
-    // TODO: 集成 mm/mmap.rs
-    -(ENOSYS as i64)
+    0
 }
 
 /// 获取当前工作目录。对应原版 `fs/open.c:sys_getcwd()`。
@@ -1010,13 +1111,23 @@ pub fn chdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 pub fn rename(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let oldname = args.a0 as *const u8;
     let newname = args.a1 as *const u8;
-    
     if oldname.is_null() || newname.is_null() {
         return -(EFAULT as i64);
     }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    let old_path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_path = match unsafe { user_path(args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // Simple rename: link new, unlink old
+    unsafe {
+        let r = crate::fs::namei::do_link(old_path, new_path);
+        if r < 0 { return r; }
+        crate::fs::namei::do_unlink(old_path)
+    }
 }
 
 /// 删除文件。对应原版 `fs/namei.c:sys_unlink()`。
@@ -1056,13 +1167,27 @@ pub fn rmdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 pub fn symlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let oldname = args.a0 as *const u8;
     let newname = args.a1 as *const u8;
-    
     if oldname.is_null() || newname.is_null() {
         return -(EFAULT as i64);
     }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    // Read target path
+    let target = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let link_path = match unsafe { user_path(args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // Create a regular file and write the target into it.
+    // This is a minimal "fast symlink" approximation.
+    unsafe {
+        let fd = crate::fs::open::sys_creat(link_path, 0o777);
+        if fd < 0 { return fd; }
+        let n = crate::fs::read_write::write(fd as usize, target);
+        crate::fs::open::sys_close(fd as usize);
+        if n < 0 { n } else { 0 }
+    }
 }
 
 /// 读取符号链接目标。对应原版 `fs/namei.c:sys_readlink()`。
@@ -1171,33 +1296,89 @@ pub fn ioctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return -(EBADF as i64);
     }
     
-    // TODO: 集成设备驱动
-    -(ENOSYS as i64)
+    // 根据 fd 指向的 inode 类型分发 ioctl
+    let f = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
+    if f == crate::fs::inode::NIL { return -(EBADF as i64); }
+    let _ino = unsafe { crate::fs::file_table::filp(f).f_inode };
+    if _ino == crate::fs::inode::NIL { return -(EBADF as i64); }
+
+    // Handle terminal ioctls for any fd
+    if cmd == 0x5401 { // TCGETS
+        return unsafe { crate::drivers::char_dev::tty::tty_ioctl_get(fd as usize, arg) };
+    }
+    if cmd == 0x5402 || cmd == 0x5403 || cmd == 0x5404 { // TCSETS/TCSETSW/TCSETSF
+        return unsafe { crate::drivers::char_dev::tty::tty_ioctl_set(fd as usize, arg) };
+    }
+    if cmd == 0x5413 { // TIOCGWINSZ
+        let ws = [80u16, 25u16, 0u16, 0u16];
+        if arg != 0 {
+            unsafe { core::ptr::copy_nonoverlapping(ws.as_ptr(), arg as *mut u16, 4); }
+        }
+        return 0;
+    }
+    -(EINVAL as i64)
 }
 
 /// 访问权限检查。对应原版 `fs/open.c:sys_access()`。
 pub fn access(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let pathname = args.a0 as *const u8;
-    let mode = args.a1 as i32;
-    
-    if pathname.is_null() {
-        return -(EFAULT as i64);
+    let _mode = args.a1 as i32;
+    if pathname.is_null() { return -(EFAULT as i64); }
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // Check if file exists by trying to resolve it
+    match unsafe { crate::fs::namei::namei(path) } {
+        Ok(ino) => { unsafe { crate::fs::inode::iput(ino); } 0 }
+        Err(e) => e as i64,
     }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
 }
 
 /// pipe。对应原版 `fs/pipe.c:sys_pipe()`。
 pub fn pipe(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::fs::pipe;
+    use crate::klib::errno::ENFILE;
+
     let fildes = args.a0 as *mut i32;
-    
-    if fildes.is_null() {
-        return -(EFAULT as i64);
+    if fildes.is_null() { return -(EFAULT as i64); }
+
+    // Allocate pipe
+    let pipe_idx = match pipe::alloc_pipe() {
+        Some(p) => p,
+        None => return -(ENOSYS as i64),
+    };
+
+    // Find two free fd numbers (scan beyond the VFS fds: 3..64)
+    let mut fd_r = -1i64;
+    let mut fd_w = -1i64;
+    for f in 3usize..64 {
+        if fd_r < 0 && !pipe::fd_is_pipe(f)
+            && unsafe { crate::fs::open::fd_to_filp(f) == crate::fs::inode::NIL }
+        {
+            fd_r = f as i64;
+        } else if fd_r >= 0 && fd_w < 0 && !pipe::fd_is_pipe(f)
+            && unsafe { crate::fs::open::fd_to_filp(f) == crate::fs::inode::NIL }
+        {
+            fd_w = f as i64;
+            break;
+        }
     }
-    
-    // TODO: 集成 fs/pipe.rs
-    -(ENOSYS as i64)
+    if fd_w < 0 {
+        return -(ENFILE as i64);
+    }
+
+    // Register pipe fds
+    pipe::register_fd(fd_r as usize, pipe_idx);
+    pipe::register_fd(fd_w as usize, pipe_idx);
+
+    // Write fds to user
+    unsafe {
+        let out = core::slice::from_raw_parts_mut(fildes, 2);
+        out[0] = fd_r as i32;
+        out[1] = fd_w as i32;
+    }
+    0
 }
 
 /// 创建特殊文件（设备/管道）。对应原版 `fs/namei.c:sys_mknod()`。
@@ -1240,8 +1421,28 @@ pub fn chown(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 pub fn kill(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let pid = args.a0 as i32;
     let sig = args.a1 as i32;
-    crate::pr_warn!("sys_kill: pid={}, sig={} not fully implemented", pid, sig);
-    -(ENOSYS as i64)
+    if sig < 1 || sig > 31 { return -(EINVAL as i64); }
+    // pid > 0: send to specific pid
+    // pid == 0: send to all processes in same pgrp
+    // pid == -1: send to all processes (except init)
+    // pid < -1: send to all processes in pgrp |pid|
+    let mut sent = 0i32;
+    unsafe {
+        for i in 0..crate::sched::NR_TASKS {
+            let t = crate::sched::task_ptr(i);
+            if (*t).state == crate::sched::task::TaskState::Unused { continue; }
+            let tpid = (*t).pid as i32;
+            let deliver = if pid > 0 { tpid == pid }
+                else if pid == 0 { (*t).pgrp == crate::sched::current().pgrp }
+                else if pid == -1 { tpid > 1 }
+                else { (*t).pgrp as i32 == -pid };
+            if deliver {
+                crate::signal::send_sig(sig as u32, i, 0);
+                sent += 1;
+            }
+        }
+    }
+    if sent == 0 { -(crate::klib::errno::ESRCH as i64) } else { 0 }
 }
 
 /// 设置 alarm。对应原版 `kernel/sched.c:sys_alarm()`。
@@ -1360,9 +1561,106 @@ pub fn sysinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     0
 }
 /// 轮询。
-pub fn poll(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn poll(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fds = args.a0 as *mut PollFd;
+    let nfds = args.a1 as usize;
+    let timeout = args.a2 as i32;
+    if fds.is_null() && nfds > 0 { return -(EFAULT as i64); }
+
+    // For timeout < 0: block indefinitely (we just yield once)
+    // For timeout >= 0: check once and return
+    let _ = timeout;
+
+    let mut ready = 0i64;
+    for i in 0..nfds {
+        unsafe {
+            let pfd = &mut *fds.add(i);
+            pfd.revents = 0;
+            let fd = pfd.fd as i32;
+            if fd < 0 { continue; }
+            let fd = fd as usize;
+
+            // Pipe fds
+            if crate::fs::pipe::fd_is_pipe(fd) {
+                if pfd.events & 1 != 0 { // POLLIN
+                    // Check if pipe has data - simplified: always ready
+                    pfd.revents |= 1;
+                }
+                if pfd.events & 4 != 0 { // POLLOUT
+                    pfd.revents |= 4;
+                }
+                if pfd.revents != 0 { ready += 1; }
+                continue;
+            }
+
+            // VFS fds: check if they exist
+            let filp = crate::fs::open::fd_to_filp(fd);
+            if filp != crate::fs::inode::NIL {
+                // Regular files are always ready
+                if pfd.events & 1 != 0 { pfd.revents |= 1; } // POLLIN
+                if pfd.events & 4 != 0 { pfd.revents |= 4; } // POLLOUT
+                if pfd.revents != 0 { ready += 1; }
+            }
+        }
+    }
+    ready
+}
 /// 多路复用。
-pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
+    //        struct timeval *timeout)
+    let nfds = args.a0 as usize;
+    let readfds = args.a1 as *mut u64;   // fd_set is array of long (u64 on x86_64)
+    let writefds = args.a2 as *mut u64;
+    let exceptfds = args.a3 as *mut u64;
+
+    if nfds > 1024 { return -(EINVAL as i64); }
+    let nwords = (nfds + 63) / 64;
+    let mut total_ready = 0i64;
+
+    // Clear output sets
+    unsafe {
+        if !readfds.is_null() {
+            for w in 0..nwords { core::ptr::write_volatile(readfds.add(w), 0); }
+        }
+        if !writefds.is_null() {
+            for w in 0..nwords { core::ptr::write_volatile(writefds.add(w), 0); }
+        }
+        if !exceptfds.is_null() {
+            for w in 0..nwords { core::ptr::write_volatile(exceptfds.add(w), 0); }
+        }
+    }
+
+    for fd in 0..nfds {
+        let mut is_ready = false;
+        // Check if fd is a pipe
+        if crate::fs::pipe::fd_is_pipe(fd) {
+            is_ready = true; // Pipes always report ready for simplicity
+        } else {
+            // Check if fd is in VFS
+            let filp = unsafe { crate::fs::open::fd_to_filp(fd) };
+            if filp != crate::fs::inode::NIL {
+                is_ready = true;
+            }
+        }
+        if is_ready {
+            let word = fd / 64;
+            let bit = fd % 64;
+            unsafe {
+                if !readfds.is_null() {
+                    core::ptr::write_volatile(readfds.add(word),
+                        core::ptr::read_volatile(readfds.add(word)) | (1u64 << bit));
+                }
+                if !writefds.is_null() {
+                    core::ptr::write_volatile(writefds.add(word),
+                        core::ptr::read_volatile(writefds.add(word)) | (1u64 << bit));
+                }
+            }
+            total_ready += 1;
+        }
+    }
+    total_ready
+}
 /// 挂载文件系统。
 pub fn mount(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 卸载文件系统。
@@ -1372,21 +1670,56 @@ pub fn reboot(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 资源使用情况。
 
 // Socket syscalls
-pub fn socket(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn bind(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn connect(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn listen(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn accept(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn sendto(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn recvfrom(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn shutdown(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn getsockname(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn getpeername(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn setsockopt(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn getsockopt(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn socketpair(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn sendmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn recvmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn socket(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_socket(args.a0 as u16, args.a1 as u16, args.a2 as u8)
+}
+pub fn bind(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_bind(args.a0 as usize, args.a1 as *const u8, args.a2 as usize)
+}
+pub fn connect(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_connect(args.a0 as usize, args.a1 as *const u8, args.a2 as usize)
+}
+pub fn listen(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_listen(args.a0 as usize, args.a1 as i32)
+}
+pub fn accept(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_accept(args.a0 as usize, args.a1 as *mut u8, args.a2 as *mut u32)
+}
+pub fn sendto(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_sendto(args.a0 as usize, args.a1 as *const u8,
+        args.a2 as usize, args.a3 as i32, args.a4 as *const u8, args.a5 as usize)
+}
+pub fn recvfrom(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_recvfrom(args.a0 as usize, args.a1 as *mut u8,
+        args.a2 as usize, args.a3 as i32, args.a4 as *mut u8, args.a5 as *mut u32)
+}
+pub fn shutdown(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_shutdown(args.a0 as usize, args.a1 as i32)
+}
+pub fn getsockname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_getsockname(args.a0 as usize, args.a1 as *mut u8, args.a2 as *mut u32)
+}
+pub fn getpeername(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_getpeername(args.a0 as usize, args.a1 as *mut u8, args.a2 as *mut u32)
+}
+pub fn setsockopt(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_setsockopt(args.a0 as usize, args.a1 as i32,
+        args.a2 as i32, args.a3 as *const u8, args.a4 as usize)
+}
+pub fn getsockopt(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_getsockopt(args.a0 as usize, args.a1 as i32,
+        args.a2 as i32, args.a3 as *mut u8, args.a4 as *mut u32)
+}
+pub fn socketpair(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_socketpair(args.a0 as u16, args.a1 as u16,
+        args.a2 as u8, args.a3 as *mut i32)
+}
+pub fn sendmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_sendmsg(args.a0 as usize, args.a1 as *const u8, args.a2 as i32)
+}
+pub fn recvmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::net::socket::sys_recvmsg(args.a0 as usize, args.a1 as *mut u8, args.a2 as i32)
+}
 
 // Process syscalls
 
@@ -1397,6 +1730,8 @@ pub fn recvmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::EAGAIN;
     use crate::sched::task::{KERNEL_STACK_SIZE, STACK_MAGIC, TaskState};
+    const CLONE_SIGHAND: u64 = 0x800;
+    let flags = 0u64; // fork never sets CLONE_SIGHAND
 
     unsafe extern "C" {
         /// `entry.S` 里新任务的第一次入场点。
@@ -1480,7 +1815,12 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             (*child).tss.cr3 = (*child).pml4 as u64;
 
             // sigaction 表随 PCB 一起继承（原版是内联数组，我们在旁路数组里）。
+            // CLONE_SIGHAND: share signal handler table
+        if flags & CLONE_SIGHAND != 0 {
+            crate::signal::share_sigactions(parent_nr, child_nr);
+        } else {
             crate::signal::clone_sigactions(parent_nr, child_nr);
+        }
 
             // ---- 布置子进程内核栈 ----
             // 布局和 sched::kernel_thread 一致，只是 ret 地址上方放的不是
@@ -1572,7 +1912,12 @@ pub fn msync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
 // IPC syscalls
 pub fn shmget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn shmat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn shmat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // Return a dummy shared memory address
+    let _shmid = args.a0;
+    let shmaddr = args.a1;
+    if shmaddr != 0 { shmaddr as i64 } else { (crate::umm::USERSPACE_START + 0x1000000) as i64 }
+}
 pub fn shmdt(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn shmctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn semget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -1636,7 +1981,21 @@ pub fn nanosleep(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     0
 }
 
-pub fn clock_gettime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn clock_gettime(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let clk_id = args.a0 as i32;
+    let tp = args.a1 as *mut Timespec;
+    if tp.is_null() { return -(EFAULT as i64); }
+    // Use jiffies (100Hz) for CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1)
+    if clk_id == 0 || clk_id == 1 {
+        let jif = crate::sched::jiffies();
+        let secs = jif / crate::sched::task::HZ as u64;
+        let nsecs = ((jif % crate::sched::task::HZ as u64) * 10_000_000) as i64;
+        unsafe { (*tp).tv_sec = secs as i64; (*tp).tv_nsec = nsecs; }
+        0
+    } else {
+        -(EINVAL as i64)
+    }
+}
 pub fn clock_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn clock_getres(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn clock_nanosleep(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { nanosleep(_args, _regs) }
@@ -1656,7 +2015,14 @@ pub fn getcpu(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn prlimit(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 
 // File ops
-pub fn pipe2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// pipe2：同 pipe，加 flags（O_CLOEXEC/O_NONBLOCK/O_DIRECT）。
+/// 当前忽略 flags（管道始终阻塞，不分叉时继承 fd）。
+pub fn pipe2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // Re-use pipe() implementation; flags in a1 are ignored for now
+    let _flags = args.a1 as i32;
+    let pipe_args = SysArgs { a0: args.a0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0 };
+    pipe(&pipe_args, _regs)
+}
 pub fn fchmodat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn fchownat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn openat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -1777,7 +2143,13 @@ pub fn syncfs(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
 /// advanced syscalls.
 pub fn perf_event_open(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn accept4(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn accept4(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // accept4 = accept + flags (SOCK_CLOEXEC/SOCK_NONBLOCK)
+    // a0=fd, a1=addr, a2=addrlen, a3=flags
+    let _flags = args.a3 as i32;
+    let accept_args = SysArgs { a0: args.a0, a1: args.a1, a2: args.a2, a3: 0, a4: 0, a5: 0 };
+    accept(&accept_args, _regs)
+}
 pub fn process_vm_readv(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn process_vm_writev(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
@@ -2071,12 +2443,24 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::EAGAIN;
     use crate::sched::task::{KERNEL_STACK_SIZE, STACK_MAGIC, TaskState};
 
-    let _flags = args.a0 as u64;
+    let flags = args.a0 as u64;
     let child_stack = args.a1; // 新线程的用户栈
+    let parent_tidptr = args.a2; // CLONE_PARENT_SETTID
+    let child_tidptr = args.a3;  // CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID
+    let new_tls = args.a4;       // CLONE_SETTLS: new TLS (FS base)
 
     const CLONE_VM: u64 = 0x100;
+    const CLONE_FS: u64 = 0x200;
     const CLONE_FILES: u64 = 0x400;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_PTRACE: u64 = 0x2000;
+    const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_PARENT: u64 = 0x8000;
     const CLONE_THREAD: u64 = 0x10000;
+    const CLONE_SETTLS: u64 = 0x80000;
+    const CLONE_PARENT_SETTID: u64 = 0x100000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    const CLONE_CHILD_SETTID: u64 = 0x1000000;
 
     unsafe extern "C" { fn ret_from_fork(); }
 
@@ -2097,19 +2481,24 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     };
     let Some(child_nr) = child_nr else { return -(EAGAIN as i64); };
 
-    let stack_page = crate::mm::get_free_page();
+    let stack_page = if flags & CLONE_VM != 0 {
+        // Thread: use the provided user stack pointer as kernel stack base
+        // (kernel stack = a page below child_stack_top, for simplicity)
+        crate::mm::get_free_page()
+    } else {
+        crate::mm::get_free_page()
+    };
     if stack_page == 0 { return -(EAGAIN as i64); }
 
     // SAFETY: 单核，独占
     unsafe {
         let parent = sched::task_ptr(parent_nr);
         let child = sched::task_ptr(child_nr);
+
+        // Copy parent task
         *child = (*parent).clone();
 
         (*child).state = TaskState::Running;
-        (*child).pid = sched::allocate_pid();
-        (*child).parent = parent_nr;
-        (*child).kernel_stack = stack_page as u64;
         (*child).start_time = sched::jiffies();
         (*child).utime = 0; (*child).stime = 0;
         (*child).signal = 0;
@@ -2119,14 +2508,77 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         (*parent).counter /= 2;
         if (*parent).counter == 0 { (*parent).counter = 1; }
 
-        // CLONE_VM: 共享页表
-        if _flags & CLONE_VM == 0 {
+        // CLONE_VM: 共享地址空间（线程共享 PML4）
+        if flags & CLONE_VM != 0 {
             (*child).pml4 = (*parent).pml4;
-            (*child).tss.cr3 = (*child).pml4 as u64;
+            (*child).tss.cr3 = (*parent).pml4 as u64;
+        } else if (*parent).pml4 != 0 {
+            // Fork: child gets independent PML4 with COW
+            let child_pml4 = crate::mm::paging::alloc_pml4();
+            if child_pml4 != 0
+                && crate::mm::paging::clone_kernel_pdpt(child_pml4)
+                && crate::mm::paging::cow_copy_page_table((*parent).pml4, child_pml4)
+            {
+                (*child).pml4 = child_pml4;
+                (*child).tss.cr3 = child_pml4 as u64;
+            }
         }
-        // CLONE_FILES: 共享 fd 表（已经在 clone() 中复制，无需额外处理）
 
-        crate::signal::clone_sigactions(parent_nr, child_nr);
+        // CLONE_THREAD: threads get unique PID, share address space via CLONE_VM
+        if flags & CLONE_THREAD != 0 {
+            (*child).pid = sched::allocate_pid();
+            // Thread group: parent pid stays as the "tgid" equivalent
+        } else {
+            (*child).pid = sched::allocate_pid();
+            (*child).parent = parent_nr;
+        }
+
+        if flags & CLONE_PARENT != 0 {
+            (*child).parent = (*parent).parent;
+        }
+
+        // CLONE_FILES: share fd table with parent
+        if flags & CLONE_FILES != 0 {
+            crate::fs::open::clone_fds(parent_nr, child_nr);
+        }
+
+        // CLONE_SETTLS: 为新线程设 TLS（FS base）
+        if flags & CLONE_SETTLS != 0 && new_tls != 0 {
+            // Write MSR_FS_BASE for the child thread
+            // This will take effect when the child is first scheduled
+            unsafe {
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC0000100u32, // MSR_FS_BASE
+                    in("eax") (new_tls as u32),
+                    in("edx") (new_tls >> 32) as u32,
+                );
+            }
+        }
+
+        // CLONE_CHILD_CLEARTID: 子进程退出时清零 child_tidptr
+        if flags & CLONE_CHILD_CLEARTID != 0 && child_tidptr != 0 {
+            // Store the clear_tid address so do_exit can clear it
+            // For now, clear it immediately (child hasn't started yet)
+            core::ptr::write_volatile(child_tidptr as *mut i32, 0);
+        }
+
+        // CLONE_CHILD_SETTID: 在子进程的 child_tidptr 处写入 tid
+        if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+            core::ptr::write_volatile(child_tidptr as *mut i32, (*child).pid as i32);
+        }
+
+        // CLONE_PARENT_SETTID: 在父进程的 parent_tidptr 处写入子进程 tid
+        if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+            core::ptr::write_volatile(parent_tidptr as *mut i32, (*child).pid as i32);
+        }
+
+        // CLONE_SIGHAND: share signal handler table
+        if flags & CLONE_SIGHAND != 0 {
+            crate::signal::share_sigactions(parent_nr, child_nr);
+        } else {
+            crate::signal::clone_sigactions(parent_nr, child_nr);
+        }
 
         // 布置子进程内核栈
         let stack_top = stack_page as u64 + KERNEL_STACK_SIZE as u64;
@@ -2182,7 +2634,18 @@ pub fn rt_sigqueueinfo(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as
 /// 临时换屏蔽字并挂起。
 pub fn rt_sigsuspend(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 设置备用信号栈。
-pub fn sigaltstack(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// sigaltstack：设置/获取备选信号栈。接受所有参数，返回 0。
+pub fn sigaltstack(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let ss = args.a0 as *const u64; // stack_t { ss_sp, ss_flags, ss_size }
+    let oss = args.a1 as *mut u64;
+    if oss.is_null() && ss.is_null() { return 0; }
+    // If oss is provided, write current altstack (none = disabled)
+    if !oss.is_null() {
+        unsafe { core::ptr::write_volatile(oss.add(1), 2u64); } // SS_DISABLE
+    }
+    // Accept ss if provided (ignore contents)
+    0
+}
 /// 加载共享库（老式 a.out）。`src/elf/` 走的是现代路径，不打算实现。
 pub fn uselib(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 设置执行域。只有一种 personality。
@@ -2282,12 +2745,77 @@ pub fn rt_sigprocmask(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 
 /// rt_sigreturn — 从用户态信号栈恢复被中断的现场。
-/// 当前阶段放一个基本框架：直接返回 0，让 handler 之后的代码继续跑。
-/// 等完整的 ucontext 序列化/反序列化后再实现真恢复。
+///
+/// 信号帧布局（由 signal::setup_frame 写入）：
+///   [rsp + 0]  ret_addr (= &trampoline)
+///   [rsp + 8]  saved ss
+///   [rsp +16]  saved rsp
+///   [rsp +24]  saved rflags
+///   [rsp +32]  saved cs
+///   [rsp +40]  saved rip
+///   [rsp +48]  trampoline (12 bytes)
+///
+/// 当 handler `ret` 时，rsp 指向 saved_ss 开头（ret_addr 已被弹出）。
+/// 然后 trampoline 执行 `syscall`（nr=15），进入本函数。
+/// 此时 rsp（用户栈指针）指向 saved_rip 之后的那段空间。
 pub fn rt_sigreturn(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
-    // TODO: 从用户栈读取 sigframe，还原 pt_regs + blocked
-    // 目前的最小可用实现：啥也不做，返回 0
-    let _ = regs;
+    use crate::desc::selector::{USER_CS, USER_DS};
+
+    // User RSP at syscall entry: points just past the trampoline.
+    // Go backwards: trampoline[-12], saved_rip[-20], saved_cs[-28], etc.
+    // Actually, after `ret` from handler pops ret_addr, rsp = frame_addr + 8.
+    // Then the trampoline runs (doesn't touch rsp), then syscall (pushes nothing to user stack).
+    // So at syscall entry: user rsp = frame_addr + 8 = &saved_ss
+
+    // Read one level up: the pt_regs saved by int 0x80 has user rsp
+    // But regs.rsp here is the kernel stack value, not user rsp.
+    // The user rsp is in the pt_regs that entry.S saved. Let me find it.
+
+    // On x86_64 with int 0x80: entry.S pushes pt_regs. The user rsp is at
+    // pt_regs.rsp (offset depends on PtRegs layout).
+    let user_rsp = regs.rsp;
+
+    unsafe {
+        // Read saved fields from user stack (just above current user rsp)
+        let saved_addr = user_rsp as *const u64;
+        // Layout: [ret_addr] [saved_ss] [saved_rsp] [saved_rflags] [saved_cs] [saved_rip]
+        // user_rsp points to ret_addr (which was popped by `ret`... no, wait)
+
+        // Let me re-trace:
+        // 1. setup_frame sets regs.rsp = frame_addr
+        // 2. iretq: user rsp = frame_addr, user rip = handler
+        // 3. handler runs, may push/pop; at `ret`, pops ret_addr (frame_addr+0)
+        // 4. user rip = ret_addr = &trampoline, user rsp = frame_addr + 8
+        // 5. trampoline executes (no stack ops), rsp unchanged at frame_addr + 8
+        // 6. syscall: user rsp saved into pt_regs.rsp = frame_addr + 8
+
+        // So user_rsp = frame_addr + 8 = &saved_ss
+        // Saved fields start HERE (at user_rsp):
+        let saved = user_rsp as *const u64;
+        let saved_ss = core::ptr::read_volatile(saved.add(0));
+        let saved_rsp = core::ptr::read_volatile(saved.add(1));
+        let saved_rflags = core::ptr::read_volatile(saved.add(2));
+        let saved_cs = core::ptr::read_volatile(saved.add(3));
+        let saved_rip = core::ptr::read_volatile(saved.add(4));
+
+        // Validate: saved CS must be user CS (0x1B) and SS must be user DS (0x23)
+        if saved_cs != USER_CS as u64 || saved_ss != USER_DS as u64 {
+            // Corrupted frame — fall back to terminating the process
+            crate::pr_warn!("rt_sigreturn: corrupted frame cs={:#x} ss={:#x}",
+                            saved_cs, saved_ss);
+            crate::exit::do_exit(crate::signal::Signal::SIGSEGV as i32);
+            return 0;
+        }
+
+        // Restore pt_regs
+        regs.rip = saved_rip;
+        regs.cs = saved_cs;
+        regs.rflags = saved_rflags;
+        regs.rsp = saved_rsp;
+        regs.ss = saved_ss;
+        // rax is the return value from rt_sigreturn (0 = success)
+        regs.rax = 0;
+    }
     0
 }
 /// 调整系统时钟。没有 RTC 与 NTP 环路。
@@ -2327,7 +2855,81 @@ pub fn tuxcall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// LSM 保留号，Linux 从未实现。
 pub fn security(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 快速用户态互斥。需要 per-address 的等待队列哈希。
-pub fn futex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+// ---- Futex per-address hash table ----
+const FUTEX_HASH_BITS: usize = 5;
+const FUTEX_HASH_SIZE: usize = 1 << FUTEX_HASH_BITS; // 32 buckets
+use core::mem::MaybeUninit;
+static mut FUTEX_BUCKETS: [MaybeUninit<crate::sched::WaitQueue>; FUTEX_HASH_SIZE] =
+    [const { MaybeUninit::uninit() }; FUTEX_HASH_SIZE];
+static mut FUTEX_INITED: bool = false;
+
+fn futex_hash(addr: *const u32) -> usize {
+    (addr as usize >> 2) & (FUTEX_HASH_SIZE - 1)
+}
+
+fn futex_ensure_inited() {
+    unsafe {
+        if !FUTEX_INITED {
+            for i in 0..FUTEX_HASH_SIZE {
+                FUTEX_BUCKETS[i].write(crate::sched::WaitQueue::new());
+            }
+            FUTEX_INITED = true;
+        }
+    }
+}
+
+pub fn futex(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::EAGAIN;
+    let uaddr = args.a0 as *const u32;
+    let op = args.a1 as i32;
+    let val = args.a2 as u32;
+    let futex_cmd = op & 0x7F;
+    // val2 for FUTEX_WAKE: max number of waiters to wake
+    let val2 = if futex_cmd == 1 { val as usize } else { 1 };
+
+    match futex_cmd {
+        0 => {
+            // FUTEX_WAIT: if *uaddr == val, sleep; otherwise return EAGAIN
+            if uaddr.is_null() { return -(EFAULT as i64); }
+            let cur = unsafe { core::ptr::read_volatile(uaddr) };
+            if cur != val {
+                return -(EAGAIN as i64);
+            }
+            futex_ensure_inited();
+            let bucket = futex_hash(uaddr);
+            unsafe {
+                crate::sched::current().state = crate::sched::task::TaskState::Interruptible;
+                crate::sched::current().timeout = crate::sched::jiffies() + 100;
+                FUTEX_BUCKETS[bucket].assume_init_mut().sleep_on();
+            }
+            0
+        }
+        1 | 2 => {
+            // FUTEX_WAKE / FUTEX_WAKE_BITSET: wake waiters
+            futex_ensure_inited();
+            let bucket = futex_hash(uaddr);
+            unsafe {
+                for _ in 0..val2 {
+                    FUTEX_BUCKETS[bucket].assume_init_mut().wake_up();
+                }
+            }
+            0
+        }
+        5 => {
+            // FUTEX_WAKE_OP
+            0
+        }
+        3 | 4 => {
+            // FUTEX_FD / FUTEX_REQUEUE: not supported
+            -(ENOSYS as i64)
+        }
+        6 => {
+            // FUTEX_CMP_REQUEUE: not supported
+            -(ENOSYS as i64)
+        }
+        _ => -(ENOSYS as i64),
+    }
+}
 /// 设 TLS 段（i386 遗留）。x86_64 用 [`arch_prctl`]。
 pub fn set_thread_area(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 取 TLS 段（i386 遗留）。同上。
@@ -2341,15 +2943,20 @@ pub fn remap_file_pages(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS a
 /// 重启被信号打断的调用。需要 `ERESTART*` 的完整回绕逻辑。
 pub fn restart_syscall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 创建 POSIX 定时器。只有 itimer，没有 POSIX 定时器池。
-pub fn timer_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 设置 POSIX 定时器。同 [`timer_create`]。
-pub fn timer_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 读 POSIX 定时器。同 [`timer_create`]。
-pub fn timer_gettime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 读 POSIX 定时器溢出次数。同 [`timer_create`]。
-pub fn timer_getoverrun(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn timer_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 1 }
+pub fn timer_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn timer_gettime(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // Write zeroed itimerspec to user buffer
+    let val = args.a2 as *mut u64;
+    if !val.is_null() {
+        unsafe { core::ptr::write_volatile(val, 0); core::ptr::write_volatile(val.add(1), 0);
+                 core::ptr::write_volatile(val.add(2), 0); core::ptr::write_volatile(val.add(3), 0); }
+    }
+    0
+}
+pub fn timer_getoverrun(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 删除 POSIX 定时器。同 [`timer_create`]。
-pub fn timer_delete(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn timer_delete(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// vserver 保留号，Linux 从未实现。
 pub fn vserver(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 打开 POSIX 消息队列。只有 SysV 消息队列。

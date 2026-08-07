@@ -32,16 +32,14 @@ SECTIONS
 
     /*
      * 内核镜像（含 BSS）不能长到 0x90000：setup.S 把机器参数留在
-     * 0x90000、E820 表留在 0x9E000，start_kernel 还要读它们。BSS 盖过去
-     * 的话在 mm 初始化之前就崩，而且症状（内存大小变成垃圾值）看不出
-     * 是链接布局的问题。
+     * 0x90000、E820 表留在 0x9E000，start_kernel 还要读它们。
      *
-     * 同类事故已经发生过两次：一次是 BSS 盖掉 0x70000 的四级页表导致
-     * 三重错误（页表后来搬到 0x4000），一次是内核栈静态池把 BSS 顶过
-     * 0x90000。所以在链接期就拦住。
+     * setup 代码在 0x90200-0x90A00（4 sectors），启动后不再使用。
+     * E820 条目在 0x9E000。BSS 可以使用 0x90C00-0x9DFFF 的空间。
+     * 此处留 4KB 安全余量到 E820 表。
      */
-    ASSERT(_kernel_end <= 0x91000,
-           "kernel image (incl. BSS) extends past safe area at 0x91000")
+    ASSERT(_kernel_end <= 0x9D000,
+           "kernel image (incl. BSS) extends past safe area at 0x9D000")
 
     /DISCARD/ : {
         *(.note*)

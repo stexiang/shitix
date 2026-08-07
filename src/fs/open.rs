@@ -62,7 +62,7 @@ pub fn clone_fds(from: usize, to: usize) {
 
 /// 找一个空闲 fd。对应原版 `sys_open` 里那个
 /// `for(fd = 0 ; fd < NR_OPEN ; fd++) if (!current->filp[fd]) break;`。
-fn get_unused_fd() -> usize {
+pub fn get_unused_fd() -> usize {
     unsafe {
         let nr = crate::sched::current_index();
         for fd in 0..NR_OPEN {
@@ -78,7 +78,7 @@ fn get_unused_fd() -> usize {
 ///
 /// # Safety
 /// `fd < NR_OPEN`；进程上下文调用。
-unsafe fn set_fd(fd: usize, f: usize) {
+pub unsafe fn set_fd(fd: usize, f: usize) {
     set_fd_to_filp(fd, f);
 }
 

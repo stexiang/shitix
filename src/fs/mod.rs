@@ -24,6 +24,7 @@ pub mod inode;
 pub mod minix;
 pub mod namei;
 pub mod open;
+pub mod pipe;
 pub mod read_write;
 pub mod stat;
 pub mod super_block;

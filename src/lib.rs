@@ -568,6 +568,9 @@ fn syscall_selftest() {
 /// 测试覆盖：SkBuff、IP 校验和、地址转换、Ethernet、ARP、路由、Socket。
 fn net_selftest() {
     net::tests::run_all();
+    // e1000 NIC selftest (only with extra-drivers)
+    #[cfg(feature = "extra-drivers")]
+    crate::drivers::net::e1000::E1000::selftest();
 }
 
 /// 调度器自检：开中断验证时钟计数，再造两个内核线程看它们是否轮转。
@@ -694,7 +697,41 @@ static mut FS_INIT_DONE: u8 = 0;
 ///
 /// 见 `start_kernel` 里创建它的地方那段注释：这些活都可能睡，不能在
 /// task[0] 里干。
+/// LFS boot mode: skip ramdisk mkfs, mount IDE ext4, exec /sbin/init.
+/// Set to true to boot a real LFS root filesystem.
+const LFS_BOOT: bool = false;
+
 fn fs_init_thread(_arg: u64) {
+    if LFS_BOOT {
+        // LFS mode: mount IDE drive ext4, exec /sbin/init
+        sprintln!("LFS: trying to mount root from IDE...");
+        // Primary IDE master = (HD_MAJOR=3, minor=0)
+        let root_dev = fs::mkdev(3, 0);
+        let mounted = unsafe { fs::mount_root(root_dev, 0) };
+        if !mounted {
+            // Fallback to ramdisk
+            sprintln!("LFS: IDE mount failed, falling back to ramdisk");
+            if !(unsafe { fs::ext4::mkfs::mkfs(drivers::block::ramdisk::RD_BLOCKS as u32, 512) }) {
+                panic!("mkfs.ext4 failed");
+            }
+            unsafe { fs::mount_root(drivers::block::ramdisk::RAMDISK_DEV, 0) };
+        }
+        // Try to exec /sbin/init, fallback to /bin/sh
+        sprintln!("LFS: exec /sbin/init...");
+        let ret = unsafe {
+            syscall::syscall3(syscall::nr::EXECVE,
+                b"/sbin/init\0".as_ptr() as u64, 0, 0)
+        };
+        // Fallback
+        sprintln!("LFS: /sbin/init returned {}, trying /bin/sh", ret);
+        let _ = unsafe {
+            syscall::syscall3(syscall::nr::EXECVE,
+                b"/bin/sh\0".as_ptr() as u64, 0, 0)
+        };
+        sprintln!("LFS: execve failed, halting");
+        return;
+    }
+
     // 造根文件系统。原版这一步是 rd_load() 从软驱读现成映像，
     // 我们在内存里现造（见 src/fs/minix/mkfs.rs 的模块文档）。
     // SAFETY: ramdisk 已 init，缓冲缓存里还没有本设备的块。

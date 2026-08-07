@@ -1,9 +1,8 @@
-<!-- Last updated: 2026-08-07 (Stage 3 完成——ring-3 往返成功；_kernel_end=0x8D570, 10.6KB 余量；bug-034~037 已修) -->
+<!-- Last updated: 2026-08-08 (e1000 driver complete with ARP selftest; CLONE_SIGHAND; SA_SIGINFO sigframe; POSIX timers/SysV IPC/sigaltstack; PCI port IO fix; all nonblocking gaps closed) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
 > Update this file at the end of every work phase so the next `/clear` resumes in 1 read.
-> Last updated (was): 2026-08-07 (ext4 selftest 51/51 all ok；_kernel_end=0x8A4F0；bug-030 已修)
 
 ---
 
@@ -170,8 +169,16 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
 
 ## 🚀 Next phase
 
-**Stage 2 + 3 完成**（signal/exit/fork + ring-3 往返，见上方 ✅ Done）。
-下一阶段：**Stage 4 — ELF64 + execve**。
+**Stage 2–8 + 所有非阻塞缺口已关闭。**
+下一阶段：**LFS 用户态真实启动 + TCP 协议栈接 e1000**。
+
+### Objective
+在 LFS 根文件系统上启动 /bin/bash，实现 TCP/IP 网络通信。
+
+### Scope
+1. **LFS 启动测试** — 构建静态 busybox 镜像，`LFS_BOOT=true`，验证 /bin/sh 运行
+2. **TCP 协议栈接 e1000** — ARP resolve → IP route → eth_build_header → e1000.send
+3. **per-task pwd/root** — chdir 影响隔离
 
 ### Objective
 把内核从「纯内核态运行」推到真正 iretq 到 ring-3、跑用户代码、再通过 int 0x80（以及 syscall 指令）回到内核。这是 LFS 集成的前提——当前内核从未执行过一条用户态指令。

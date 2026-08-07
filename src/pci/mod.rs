@@ -91,57 +91,64 @@ impl PciDevice {
     }
 }
 
-/// 读取 PCI 配置空间的 32 位值（地址直接传递）
+/// 读取 PCI 配置空间的 32 位值
 fn pci_config_read32(addr: u32) -> u32 {
     unsafe {
-        // 写入地址
         let addr_val = addr | 0x80000000u32;
+        // PCI config address port 0xCF8 > 255, needs dx
         core::arch::asm!(
-            "out 0xCF8, eax",
+            "mov dx, 0xCF8",
+            "out dx, eax",
             in("eax") addr_val,
+            out("dx") _,
             options(nostack, nomem, preserves_flags)
         );
-        // 读取数据
         let result: u32;
         core::arch::asm!(
-            "in eax, 0xCFC",
+            "mov dx, 0xCFC",
+            "in eax, dx",
             out("eax") result,
+            out("dx") _,
             options(nostack, nomem, preserves_flags)
         );
         result
     }
 }
 
-/// 写入 PCI 配置空间的 32 位值（地址直接传递）
+/// 写入 PCI 配置空间的 32 位值
 fn pci_config_write32(addr: u32, value: u32) {
     unsafe {
         core::arch::asm!(
-            "out 0xCF8, eax",
+            "mov dx, 0xCF8",
+            "out dx, eax",
             in("eax") addr | 0x80000000u32,
+            out("dx") _,
             options(nostack, nomem, preserves_flags)
         );
         core::arch::asm!(
-            "out 0xCFC, eax",
+            "mov dx, 0xCFC",
+            "out dx, eax",
             in("eax") value,
+            out("dx") _,
             options(nostack, nomem, preserves_flags)
         );
     }
 }
 
 /// 读取 PCI 配置空间的 16 位值
-fn pci_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+pub fn pci_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
     let addr = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
     (pci_config_read32(addr) >> ((offset & 2) * 8)) as u16
 }
 
 /// 读取 PCI 配置空间的 8 位值
-fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+pub fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
     let addr = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
     (pci_config_read32(addr) >> ((offset & 3) * 8)) as u8
 }
 
 /// 写入 16 位 PCI 配置值
-fn pci_write16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) {
+pub fn pci_write16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) {
     let addr = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
     let current = pci_config_read32(addr);
     let shift = ((offset & 2) * 8) as u32;

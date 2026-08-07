@@ -694,6 +694,31 @@ pub unsafe fn init() {
     pr_info!("tty: 1 console, {} byte queues", TTY_BUF_SIZE);
 }
 
+/// TCGETS: 将当前 tty 的 termios 复制到用户空间。
+///
+/// # Safety
+/// `arg` 必须指向用户态可写的 `struct termios`（36 字节）。
+pub unsafe fn tty_ioctl_get(_fd: usize, arg: usize) -> i64 {
+    // SAFETY: single core, process context
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(TTY) };
+    let src: *const Termios = &t.termios;
+    // SAFETY: Termios is 36 bytes, arg is user pointer in identity map
+    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, arg as *mut u8, 36); }
+    0
+}
+
+/// TCSETS: 从用户空间复制 termios 到当前 tty。
+///
+/// # Safety
+/// `arg` 必须指向用户态可读的 `struct termios`（36 字节）。
+pub unsafe fn tty_ioctl_set(_fd: usize, arg: usize) -> i64 {
+    // SAFETY: single core, process context
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(TTY) };
+    // SAFETY: copy 36 bytes from user space (identity mapped)
+    unsafe { core::ptr::copy_nonoverlapping(arg as *const u8, &mut t.termios as *mut Termios as *mut u8, 36); }
+    0
+}
+
 /// tty 状态。自检与 `show_state` 用。原版 `tty_io.c` 没有等价物。
 pub fn stats() -> (usize, usize, usize, usize) {
     // SAFETY: 关中断读四个 usize，防止键盘中断在中途改 read_q.head。
