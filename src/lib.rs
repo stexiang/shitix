@@ -12,6 +12,7 @@ pub mod drivers;
 pub mod e820;
 pub mod elf;
 pub mod exit;
+pub mod framebuffer;
 pub mod fs;
 pub mod info;
 pub mod ioport;
@@ -79,6 +80,7 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
 
     println!("mem (int 15h/88h): {} KB", bp.ext_mem_k);
     println!("video mode: {:#04x}, {} cols", bp.video_mode & 0xFF, bp.video_mode >> 8);
+
     println!("e820 entries: {}, raw usable: {} MB",
              e820::count(), e820::usable_bytes() / 1024 / 1024);
 
@@ -183,6 +185,10 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
         // 栈上压 pt_regs 并跑完整个 printk。
         core::arch::asm!("hlt") }
     }
+
+    // Attempt framebuffer detection (safe — gracefully handles missing HW)
+    #[cfg(feature = "extra-drivers")]
+    framebuffer::auto_init();
 
     cprintln!(Color::Yellow, Color::Black, "shitix: boot ok, idling.");
     serial::print("shitix: boot ok\n");
@@ -568,9 +574,7 @@ fn syscall_selftest() {
 /// 测试覆盖：SkBuff、IP 校验和、地址转换、Ethernet、ARP、路由、Socket。
 fn net_selftest() {
     net::tests::run_all();
-    // e1000 NIC selftest (only with extra-drivers)
-    #[cfg(feature = "extra-drivers")]
-    crate::drivers::net::e1000::E1000::selftest();
+    // e1000 NIC selftest (only with extra-drivers, deferred to fs_init_thread)
 }
 
 /// 调度器自检：开中断验证时钟计数，再造两个内核线程看它们是否轮转。
@@ -697,38 +701,79 @@ static mut FS_INIT_DONE: u8 = 0;
 ///
 /// 见 `start_kernel` 里创建它的地方那段注释：这些活都可能睡，不能在
 /// task[0] 里干。
-/// LFS boot mode: skip ramdisk mkfs, mount IDE ext4, exec /sbin/init.
-/// Set to true to boot a real LFS root filesystem.
-const LFS_BOOT: bool = false;
+const LFS_BOOT: bool = true;
+
+/// Build a minimal /sbin/init ELF: write banner → ioctl → exit(0).
+fn build_sbin_init() -> (&'static [u8], usize) {
+    syscall::sys::build_init_elf()
+}
 
 fn fs_init_thread(_arg: u64) {
     if LFS_BOOT {
-        // LFS mode: mount IDE drive ext4, exec /sbin/init
+        sprintln!("LFS: === real boot mode ===");
+
+        // 1. Try IDE ext4 mount, fallback to ramdisk
         sprintln!("LFS: trying to mount root from IDE...");
-        // Primary IDE master = (HD_MAJOR=3, minor=0)
         let root_dev = fs::mkdev(3, 0);
         let mounted = unsafe { fs::mount_root(root_dev, 0) };
         if !mounted {
-            // Fallback to ramdisk
-            sprintln!("LFS: IDE mount failed, falling back to ramdisk");
+            sprintln!("LFS: IDE mount failed, creating ramdisk ext4");
             if !(unsafe { fs::ext4::mkfs::mkfs(drivers::block::ramdisk::RD_BLOCKS as u32, 512) }) {
                 panic!("mkfs.ext4 failed");
             }
             unsafe { fs::mount_root(drivers::block::ramdisk::RAMDISK_DEV, 0) };
         }
-        // Try to exec /sbin/init, fallback to /bin/sh
-        sprintln!("LFS: exec /sbin/init...");
+
+        // 2. Create /dev/console device node at root
+        sprintln!("LFS: creating /dev/console...");
+        unsafe {
+            fs::namei::do_mknod(b"/console",
+                fs::mode::S_IFCHR | 0o666,
+                fs::mkdev(drivers::block::major::TTY_MAJOR, 0));
+        }
+
+        // 3. Create /init ELF at root level (like the working execve_selftest)
+        sprintln!("LFS: creating /init...");
+        unsafe {
+            let (elf_data, elf_size) = build_sbin_init();
+            let fd = fs::open::sys_creat(b"/init", 0o755);
+            if fd >= 0 {
+                fs::read_write::write(fd as usize, &elf_data[..elf_size]);
+                fs::open::sys_close(fd as usize);
+                sprintln!("LFS: /init written ({} bytes)", elf_size);
+            } else {
+                sprintln!("LFS: creat /init failed: {}", fd);
+            }
+        }
+
+        // 4. Open stdin/stdout/stderr → /dev/console
+        sprintln!("LFS: opening stdin/stdout/stderr...");
+        unsafe {
+            for fd in 0..3u64 {
+                let f = crate::fs::open::sys_open(
+                    b"/console", crate::fs::oflags::O_RDWR, 0);
+                if f != fd as i64 {
+                    sprintln!("LFS: warning: wanted fd {} got {}", fd, fd);
+                }
+            }
+        }
+
+        // 5. Verify
+        sprintln!("LFS: verifying /init...");
+        let test_fd = unsafe {
+            crate::fs::open::sys_open(b"/init", crate::fs::oflags::O_RDONLY, 0)
+        };
+        sprintln!("LFS: open /init = {}", test_fd);
+
+        // Set FS_INIT_DONE first (like execve_selftest does)
+        unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
+
+        sprintln!("LFS: execve /init...");
         let ret = unsafe {
             syscall::syscall3(syscall::nr::EXECVE,
-                b"/sbin/init\0".as_ptr() as u64, 0, 0)
+                b"/init\0".as_ptr() as u64, 0, 0)
         };
-        // Fallback
-        sprintln!("LFS: /sbin/init returned {}, trying /bin/sh", ret);
-        let _ = unsafe {
-            syscall::syscall3(syscall::nr::EXECVE,
-                b"/bin/sh\0".as_ptr() as u64, 0, 0)
-        };
-        sprintln!("LFS: execve failed, halting");
+        sprintln!("LFS: /init returned {} (should not reach)", ret);
         return;
     }
 

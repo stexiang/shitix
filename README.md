@@ -1,8 +1,8 @@
 # SHITIX — Rust 重写的 Linux 1.0.9 内核
 
 用 Rust 重写 Linux 1.0.9 内核，目标架构 x86_64，在 QEMU 中运行。
-现已支持：ELF64 execve、ring-3 用户态、ext4 完整读写、管道/Unix socket、
-clone 线程/futex/sigreturn/e1000 网卡/SoundBlaster 声卡。
+现已支持：ELF64 execve、ring-3 用户态、ext4 完整读写、TCP/IP 协议栈、
+per-task pwd/root、VESA 帧缓冲、管道/Unix socket/e1000 网卡/SoundBlaster 声卡。
 
 ## 快速开始
 
@@ -161,6 +161,8 @@ shitix/
 | clone | CLONE_VM/THREAD/FILES/SIGHAND/SETTLS semantics | PASS |
 | futex | per-address hash table, FUTEX_WAIT/FUTEX_WAKE | PASS |
 | e1000 | PCI probe + MMIO init + ARP send/recv selftest (extra-drivers) | PASS |
+| TCP/IP | ARP resolve, IP send, eth frame dispatch, TCP input (extra-drivers) | PASS |
+| per-task pwd/root | chdir per-task + refcount + fork inherit + exit release | PASS |
 
 ## 编译特性
 
@@ -272,7 +274,9 @@ qemu-system-x86_64 \
 | INET socket (socket/bind/listen/accept/connect) | ✓ |
 | e1000 NIC (PCI probe/MMIO/RX+TX ring/ARP selftest) | ✓ |
 | sigaltstack / POSIX timers / SysV IPC | ✓（基本实现） |
-| TCP/IP 协议栈 | △ 结构体就绪，ARP/eth_rcv/ip_rcv 已有，需接 e1000 收发 |
+| TCP/IP 协议栈 | ✓ ARP 解析/请求/回复、IP 发送(checksum)、TCP 输入、eth 帧分发 |
+| per-task pwd/root | ✓ chdir 隔离、fork 继承、exit 释放引用 |
+| VESA 帧缓冲 | △ 内核侧就绪（映射/像素/清屏），需 setup.S VBE 探测填入物理地址 |
 | LFS 启动模式 | ✓ (`LFS_BOOT=true` → IDE ext4 → exec /sbin/init) |
 
 ### LFS 用户态就绪度评估
@@ -288,9 +292,9 @@ qemu-system-x86_64 \
 
 | 项目 | 优先级 |
 |------|--------|
-| TCP 协议栈接 e1000 收发 | 高（协议已有，e1000 驱动就绪，需接 ARP/eth_rcv） |
-| per-task `pwd`/`root` 独立 | 中 |
 | LFS 真实启动测试 | 高（需 ext4 disk image + busybox） |
+| setup.S VBE 探测 | 中（帧缓冲内核侧就绪，需实模式 VBE 调用填入 LFB 地址） |
+| USB HID 键盘驱动 | 中（USB 子系统已有 skeleton） |
 
 ### 已知限制
 
@@ -333,16 +337,19 @@ qemu-system-x86_64 \
 
 - **socket 系统调用 18 个**：全部接线（Unix + INET）
 - **e1000 NIC 驱动**：PCI 探测、MMIO、RX/TX 描述符环、ARP 自检
+- **TCP/IP 协议栈接 e1000**：`src/net/inet/netif.rs` — ARP 解析/请求/回复、IP 发送(checksum)、TCP 输入处理、eth 帧分发
 - **futex**：per-address 哈希表（32 桶），FUTEX_WAIT/FUTEX_WAKE
 - **clone**：CLONE_VM/THREAD/FILES/SIGHAND/SETTLS/CHILD_CLEARTID
 - **sigreturn**：完整信号栈帧 + 蹦床 + SA_SIGINFO
+- **per-task pwd/root**：chdir 写入 per-task、fork 继承 + refcount、exit 释放
 - **POSIX timers / SysV IPC / sigaltstack**：基本实现
+- **VESA 帧缓冲**：内核侧映射/渲染就绪，待 setup.S VBE 探测
 
 #### 下一阶段
 
-- **TCP 协议栈接 e1000**：ARP → IP route → eth_build_header → e1000.send
 - **LFS 真实启动**：ext4 disk image + busybox，`LFS_BOOT=true` 验证 /bin/sh
-- **per-task pwd/root**：chdir 隔离
+- **setup.S VBE 探测**：实模式 VBE 4F00/4F01/4F02，填入 LFB 地址
+- **USB HID 键盘驱动**：UHCI 主机控制器 + HID report 解析
 
 #### 长期
 

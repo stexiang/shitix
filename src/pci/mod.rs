@@ -165,20 +165,27 @@ pub fn pci_device_exists(bus: u8, dev: u8, func: u8) -> bool {
 /// 获取 PCI BAR
 fn get_bar(bus: u8, dev: u8, func: u8, bar_index: usize) -> Option<PciBar> {
     let offset = PCI_VENDOR_ID + 4 + (bar_index as u8 * 4);
-    let base = pci_read16(bus, dev, func, offset) as u32;
-    
-    if base == 0 {
+    // Read full 32-bit BAR value (was incorrectly reading only 16 bits)
+    let addr = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
+    let base = pci_config_read32(addr);
+
+    if base == 0 || base == 0xFFFFFFFF {
         return None;
     }
-    
+
     let is_io = (base & 0x01) != 0;
-    
+
+    // Read upper 32 bits for 64-bit BAR
+    let is_64bit = !is_io && (base & 0x06) == 0x04 && bar_index < 5;
+    let base_hi = if is_64bit {
+        pci_config_read32(addr + 4)
+    } else { 0 };
+
     // 写入全 1 来获取大小
-    let addr = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
     pci_config_write32(addr, 0xFFFFFFFF);
     let size_raw = pci_config_read32(addr);
     pci_config_write32(addr, base);
-    
+
     if is_io {
         let size_mask = !0x03u32;
         Some(PciBar {
@@ -190,10 +197,15 @@ fn get_bar(bus: u8, dev: u8, func: u8, bar_index: usize) -> Option<PciBar> {
         })
     } else {
         let size_mask = !0x0Fu32;
-        let is_64bit = (base & 0x06) == 0x04 && bar_index < 5;
+        let full_base = if is_64bit {
+            ((base_hi as u64) << 32) | ((base & !0x0F) as u64)
+        } else {
+            (base & !0x0F) as u64
+        };
+        let size = (!(size_raw & size_mask) & size_mask) as u64 + 1;
         Some(PciBar {
-            base: (base & !0x0F) as u64,
-            size: (!(size_raw & size_mask) & size_mask) as u64 + 1,
+            base: full_base,
+            size,
             is_io: false,
             is_64bit,
             is_prefetchable: (base & 0x08) != 0,

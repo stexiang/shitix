@@ -1,6 +1,9 @@
 //! USB (Universal Serial Bus) 驱动栈
-//! 
+//!
 //! 提供 USB 主机控制器接口和设备支持。
+
+#[cfg(feature = "extra-drivers")]
+pub mod uhci;
 
 /// USB 端点类型
 #[derive(Debug, Clone, Copy, PartialEq)]

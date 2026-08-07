@@ -672,6 +672,9 @@ pub unsafe fn receive_char(c: u8) {
 /// # Safety
 /// 启动期调用一次。
 pub unsafe fn init() {
+    // Register TTY character device (major=4)
+    crate::fs::devices::register_chrdev(
+        crate::drivers::block::major::TTY_MAJOR, "tty", crate::fs::devices::CharDev::Tty);
     // SAFETY: 契约保证独占。
     unsafe {
         let t = tty();

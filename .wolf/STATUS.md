@@ -1,4 +1,4 @@
-<!-- Last updated: 2026-08-08 (e1000 driver complete with ARP selftest; CLONE_SIGHAND; SA_SIGINFO sigframe; POSIX timers/SysV IPC/sigaltstack; PCI port IO fix; all nonblocking gaps closed) -->
+<!-- Last updated: 2026-08-08 (TCP/IP netif bridge to e1000; per-task pwd/root with refcount; VESA framebuffer kernel side; all long-term module skeletons) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
@@ -169,16 +169,16 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
 
 ## 🚀 Next phase
 
-**Stage 2–8 + 所有非阻塞缺口已关闭。**
-下一阶段：**LFS 用户态真实启动 + TCP 协议栈接 e1000**。
+**Stage 2–8 + TCP/e1000 + per-task pwd/root + VESA 全部完成。**
+下一阶段：**LFS 真实启动验证**。
 
 ### Objective
-在 LFS 根文件系统上启动 /bin/bash，实现 TCP/IP 网络通信。
+在真实 ext4 磁盘镜像上启动 /bin/bash。
 
 ### Scope
-1. **LFS 启动测试** — 构建静态 busybox 镜像，`LFS_BOOT=true`，验证 /bin/sh 运行
-2. **TCP 协议栈接 e1000** — ARP resolve → IP route → eth_build_header → e1000.send
-3. **per-task pwd/root** — chdir 影响隔离
+1. **LFS 启动测试** — 构建静态 busybox 镜像，`LFS_BOOT=true`，验证 /bin/sh
+2. **setup.S VBE 探测** — 实模式 VBE 函数调用，填入 LFB 地址到 BootParams
+3. **USB HID 键盘** — UHCI 主机控制器初始化 + HID 键盘报告解析
 
 ### Objective
 把内核从「纯内核态运行」推到真正 iretq 到 ring-3、跑用户代码、再通过 int 0x80（以及 syscall 指令）回到内核。这是 LFS 集成的前提——当前内核从未执行过一条用户态指令。

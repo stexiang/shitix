@@ -200,6 +200,18 @@ pub fn release(task_idx: usize) -> i32 {
         // 信号处理表复位，否则槽位复用时新进程会继承旧 handler。
         signal::reset_sigactions(task_idx);
 
+        // 释放 per-task pwd/root inode 引用
+        let pwd = (*task).pwd;
+        let root = (*task).root;
+        if pwd != crate::fs::inode::NIL && pwd != root {
+            crate::fs::inode::iput(pwd);
+        }
+        if root != crate::fs::inode::NIL {
+            crate::fs::inode::iput(root);
+        }
+        (*task).pwd = crate::fs::inode::NIL;
+        (*task).root = crate::fs::inode::NIL;
+
         // 重置任务状态
         (*task).state = TaskState::Unused;
 

@@ -533,67 +533,104 @@ pub fn build_minimal_elf64() -> ([u8; 256], usize) {
 }
 
 /// 构建 /sbin/init ELF64 — 打印 banner、测试 ioctl、循环 idle。
-pub fn build_init_elf() -> ([u8; 512], usize) {
-    // x86_64 asm for init:
-    //   mov rax, 1; mov rdi, 1; lea rsi, [rip+msg]; mov rdx, 28; int 0x80  // write banner
-    //   mov rax, 16; mov rdi, 0; mov rsi, 0x5401; lea rdx, [rsp-40]; int 0x80 // ioctl TCGETS
-    //   mov rax, 60; mov rdi, 0; int 0x80  // exit(0)
-    let msg = b"shitix init: hello world\n\x00";
-    let code: &[u8] = &[
-        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (write)
-        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1 (stdout)
-        0x48, 0x8d, 0x35, 0x13, 0x00, 0x00, 0x00, // lea rsi, [rip+19] (msg)
-        0x48, 0xc7, 0xc2, 0x1a, 0x00, 0x00, 0x00, // mov rdx, 26 (len)
-        0xcd, 0x80,                                     // int 0x80 (write)
-        // ioctl(0, TCGETS, buf)
-        0x48, 0xc7, 0xc0, 0x10, 0x00, 0x00, 0x00, // mov rax, 16 (ioctl)
-        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0 (stdin)
-        0x48, 0xc7, 0xc6, 0x01, 0x54, 0x00, 0x00, // mov rsi, 0x5401 (TCGETS)
-        0x48, 0x8d, 0x54, 0x24, 0xd8,             // lea rdx, [rsp-40]
-        0xcd, 0x80,                                     // int 0x80 (ioctl)
+/// Build a minimal /sbin/init ELF64:
+///   fd=1: write("shitix /sbin/init: booted!\n")
+///   fd=0: ioctl(TCGETS)
+///   exit(0)
+pub fn build_init_elf() -> (&'static [u8], usize) {
+    static mut ELF_BUF: [u8; 512] = [0; 512];
+    static mut ELF_SIZE: usize = 0;
+    static mut ELF_BUILT: bool = false;
+
+    unsafe {
+        if ELF_BUILT {
+            return (&*core::ptr::addr_of!(ELF_BUF), ELF_SIZE);
+        }
+    }
+
+    let vaddr: u64 = crate::umm::USERSPACE_START;
+    let msg = b"shitix /sbin/init: booted!\n";
+    let msg_len = msg.len();
+
+    // Build code with correct RIP-relative addressing.
+    // Layout: [code][align 4][msg]
+    // LEA rsi, [rip + X] where X = msg_offset - (lea_offset + 7)
+
+    // First pass: build code with placeholder LEA offset
+    let code_template: &[u8] = &[
+        // write(1, msg, msg_len)
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (7B)
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1 (7B)
+        0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00, // lea rsi, [rip+0] placeholder (7B)
+        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // mov rdx, msg_len placeholder (7B)
+        0xcd, 0x80,                                  // int 0x80 (2B)
         // exit(0)
-        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60 (exit)
-        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
-        0xcd, 0x80,                                     // int 0x80
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60 (7B)
+        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0 (7B)
+        0xcd, 0x80,                                  // int 0x80 (2B)
     ];
 
-    let cs = code.len();
-    let msg_start: usize = 0x40000000 + cs + 4; // after code + alignment
-    let total = cs + 4 + msg.len();
-    let vaddr: u64 = crate::umm::USERSPACE_START;
+    let mut code = [0u8; 128];
+    let cs = code_template.len();
+    code[..cs].copy_from_slice(code_template);
 
-    let mut elf = [0u8; 512];
-    // ELF64 header
-    elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-    elf[4] = 2; elf[5] = 1; elf[6] = 1;
-    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
-    elf[18..20].copy_from_slice(&62u16.to_le_bytes());
-    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
-    elf[24..32].copy_from_slice(&vaddr.to_le_bytes());
-    elf[32..40].copy_from_slice(&64u64.to_le_bytes());
-    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
-    let mut pos = 64;
-    // PT_LOAD phdr: p_offset=120, p_vaddr=vaddr, p_filesz=total, p_memsz=total+4096, p_flags=7(RWX)
-    elf[pos..pos+4].copy_from_slice(&1u32.to_le_bytes());
-    elf[pos+4..pos+8].copy_from_slice(&7u32.to_le_bytes());
-    elf[pos+8..pos+16].copy_from_slice(&120u64.to_le_bytes());
-    elf[pos+16..pos+24].copy_from_slice(&vaddr.to_le_bytes());
-    elf[pos+32..pos+40].copy_from_slice(&(total as u64).to_le_bytes());
-    elf[pos+40..pos+48].copy_from_slice(&((total + 4096) as u64).to_le_bytes());
-    elf[pos+48..pos+56].copy_from_slice(&0x1000u64.to_le_bytes());
-    pos += 56;
-    // Code + msg
-    elf[pos..pos+cs].copy_from_slice(code);
-    pos += cs;
-    // Align to 4
-    while pos % 4 != 0 { pos += 1; }
-    // Message
-    elf[pos..pos+msg.len()].copy_from_slice(msg);
-    pos += msg.len();
-    if pos > 500 { pos = 500; }
+    // Compute alignment
+    let code_end_padding = (4 - (cs % 4)) % 4;
+    let msg_offset = cs + code_end_padding; // where msg starts in the binary
 
-    (elf, pos)
+    // LEA is at byte 14 in the code, total 7 bytes, so RIP after LEA = 14 + 7 = 21
+    let lea_at = 14usize;
+    let msg_va = vaddr + msg_offset as u64;
+    let lea_rip = vaddr + (lea_at + 7) as u64;
+    let lea_disp = (msg_va.wrapping_sub(lea_rip)) as i32;
+
+    // Write correct LEA displacement
+    code[lea_at + 3..lea_at + 7].copy_from_slice(&lea_disp.to_le_bytes());
+    // Write correct msg_len (at offset 28-32 in mov rdx instruction)
+    code[28..32].copy_from_slice(&(msg_len as u32).to_le_bytes());
+
+    let total = msg_offset + msg_len;
+    let elf_header_size = 64;
+    let phdr_size = 56;
+    let file_offset = elf_header_size + phdr_size; // 120
+
+    unsafe {
+        let elf = &mut *core::ptr::addr_of_mut!(ELF_BUF);
+        // ELF64 header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2; elf[5] = 1; elf[6] = 1; // 64-bit, LE, v1
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());  // ET_EXEC
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());  // EV_CURRENT
+        elf[24..32].copy_from_slice(&vaddr.to_le_bytes()); // entry
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+        elf[40..48].copy_from_slice(&0u64.to_le_bytes());  // shoff
+        elf[54..56].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+        elf[56..58].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+        elf[58..60].copy_from_slice(&1u16.to_le_bytes());  // phnum
+        // PT_LOAD phdr at offset 64
+        let mut p = 64;
+        elf[p..p+4].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
+        elf[p+4..p+8].copy_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
+        elf[p+8..p+16].copy_from_slice(&(file_offset as u64).to_le_bytes());  // p_offset
+        elf[p+16..p+24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
+        elf[p+32..p+40].copy_from_slice(&(total as u64).to_le_bytes()); // p_filesz
+        elf[p+40..p+48].copy_from_slice(&((total + 4096) as u64).to_le_bytes()); // p_memsz
+        elf[p+48..p+56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        p += 56;
+        // Code
+        elf[p..p+cs].copy_from_slice(&code[..cs]);
+        p += cs;
+        // Align
+        while p % 4 != 0 { p += 1; }
+        // Message
+        elf[p..p+msg_len].copy_from_slice(msg);
+        p += msg_len;
+
+        ELF_SIZE = p;
+        ELF_BUILT = true;
+        (&*core::ptr::addr_of!(ELF_BUF), ELF_SIZE)
+    }
 }
 
 /// 返回当前进程 pid。对应原版 `sched.c:sys_getpid()`。
@@ -670,6 +707,7 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return crate::fs::pipe::pipe_write(pipe_idx, args.a1 as *const u8, sz64 as usize);
     }
     // SAFETY: user_buf 已校验范围。
+    let fd_usize = fd as usize;
     let buf = match unsafe { user_buf(args.a1, sz64) } {
         Ok(b) => b,
         Err(e) => return e,
@@ -1822,6 +1860,14 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             crate::signal::clone_sigactions(parent_nr, child_nr);
         }
 
+            // Increment pwd/root inode refcounts (copied by Task::clone)
+            if (*child).pwd != crate::fs::inode::NIL {
+                (*crate::fs::inode::inode_ptr((*child).pwd)).i_count += 1;
+            }
+            if (*child).root != crate::fs::inode::NIL && (*child).root != (*child).pwd {
+                (*crate::fs::inode::inode_ptr((*child).root)).i_count += 1;
+            }
+
             // ---- 布置子进程内核栈 ----
             // 布局和 sched::kernel_thread 一致，只是 ret 地址上方放的不是
             // fn/arg 而是一整份 pt_regs：
@@ -2578,6 +2624,14 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
             crate::signal::share_sigactions(parent_nr, child_nr);
         } else {
             crate::signal::clone_sigactions(parent_nr, child_nr);
+        }
+
+        // Increment pwd/root inode refcounts (copied by Task::clone)
+        if (*child).pwd != crate::fs::inode::NIL {
+            (*crate::fs::inode::inode_ptr((*child).pwd)).i_count += 1;
+        }
+        if (*child).root != crate::fs::inode::NIL && (*child).root != (*child).pwd {
+            (*crate::fs::inode::inode_ptr((*child).root)).i_count += 1;
         }
 
         // 布置子进程内核栈

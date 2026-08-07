@@ -59,6 +59,12 @@ unsafe fn csi_par(i: usize, def: u32) -> u32 {
 }
 
 pub unsafe fn con_write(buf: &[u8]) {
+    // Mirror plain text to serial for headless debugging
+    for &b in buf {
+        if b >= 0x20 && b < 0x7f || b == b'\n' || b == b'\r' || b == b'\t' {
+            crate::serial::putc(b);
+        }
+    }
     unsafe {
         for &c in buf {
             let st = *core::ptr::addr_of!(ES_STATE);

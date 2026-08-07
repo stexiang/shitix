@@ -585,23 +585,31 @@ unsafe fn set_root_inode(n: usize) {
 
 /// 根 inode 的下标。
 pub fn root_inode() -> usize {
-    // SAFETY: 挂载后只读。
     unsafe { *core::ptr::addr_of!(ROOT_INODE) }
 }
 
-/// 当前工作目录的 inode 下标。
+/// 当前工作目录的 inode 下标。返回 per-task pwd（若设置过），否则全局。
 pub fn pwd_inode() -> usize {
-    // SAFETY: 只读一个 usize；单核，`sys_chdir` 也在进程上下文改它。
-    unsafe { *core::ptr::addr_of!(PWD_INODE) }
+    unsafe {
+        let t = crate::sched::task_ptr(crate::sched::current_index());
+        if (*t).pwd != NIL { return (*t).pwd; }
+        *core::ptr::addr_of!(PWD_INODE)
+    }
 }
 
-/// 换工作目录。对应原版 `sys_chdir` 里 `current->pwd = inode` 那一步。
-///
-/// # Safety
-/// 只能在进程上下文调用。`n` 必须是已 `iget` 过的目录 inode。
+/// 换工作目录。同时写入全局和 per-task。
 pub unsafe fn set_pwd(n: usize) {
-    // SAFETY: 契约转交；旧的 pwd 引用由调用方 iput。
-    unsafe { *core::ptr::addr_of_mut!(PWD_INODE) = n }
+    unsafe {
+        *core::ptr::addr_of_mut!(PWD_INODE) = n;
+        (*crate::sched::task_ptr(crate::sched::current_index())).pwd = n;
+    }
+}
+
+/// 换根目录。写入 per-task root 字段。
+pub unsafe fn set_root(n: usize) {
+    unsafe {
+        (*crate::sched::task_ptr(crate::sched::current_index())).root = n;
+    }
 }
 
 /// 挂载一个文件系统。对应原版 `sys_mount()` 的正常路径 + `do_mount()`。
