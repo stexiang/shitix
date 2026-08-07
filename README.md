@@ -187,6 +187,91 @@ scripts/test.sh --release --features extra-drivers
 - 引用 Linux 1.0.9 原始 C 代码位置
 - 每个模块末尾自检（启动期跑，事后可删）
 
+## LFS 集成
+
+shitix 可以在 QEMU 中启动 LFS (Linux From Scratch) 根文件系统。
+以下假设你已按 LFS 手册构建了 `$LFS` 目录树。
+
+### 制作 ext4 磁盘镜像
+
+```bash
+# 创建 128MB 镜像
+dd if=/dev/zero of=lfs.img bs=1M count=128
+
+# 格式化为 ext4（关闭 64bit/huge_file 等需要较新内核的特性）
+mkfs.ext4 -F -O ^64bit,^huge_file,^flex_bg,^metadata_csum lfs.img
+# 或更激进：只保留 extent + filetype
+mkfs.ext4 -F -O ^64bit,^huge_file,^flex_bg,^metadata_csum,^dir_index,^has_journal lfs.img
+
+# 挂载并拷贝 LFS 系统
+sudo mount lfs.img /mnt
+sudo cp -a $LFS/* /mnt/
+sudo umount /mnt
+```
+
+### 构建内核并启动
+
+```bash
+# 构建带完整 ext4 支持的内核
+bash scripts/build.sh --release --features extra-drivers
+
+# 将 ext4 镜像追加到内核镜像后面
+# shitix.img 是 1MB 对齐的，lfs.img 从下一个 1MB 边界开始
+cat target/boot/shitix.img lfs.img > bootable.img
+
+# QEMU 启动（使用 IDE 硬盘）
+qemu-system-x86_64 \
+    -drive format=raw,file=bootable.img,if=ide \
+    -m 512M \
+    -no-reboot \
+    -serial stdio
+```
+
+内核探测到 IDE 硬盘上第二个分区（lfs.img）并尝试将其挂载为根文件系统。
+也可以使用 `-hda` 加载内核镜像，`-hdb` 加载 ext4 镜像：
+
+```bash
+qemu-system-x86_64 \
+    -drive format=raw,file=target/boot/shitix.img,if=ide,index=0 \
+    -drive format=raw,file=lfs.img,if=ide,index=1 \
+    -m 512M -no-reboot -serial stdio
+```
+
+### 当前能力
+
+| 功能 | 状态 |
+|------|------|
+| ext4 读（目录遍历、文件读取） | ✓ |
+| ext4 写（创建/删除文件与目录） | ✓ |
+| ring-3 用户态切换（iretq） | ✓ |
+| int 0x80 系统调用 | ✓ |
+| 信号投递（SIGSEGV/SIGTERM 等） | ✓ |
+| fork + COW 页表复制 | ✓ |
+| ELF64 加载器 | ✓ |
+| ELF64 execve | 进行中（Stage 4） |
+| `syscall` 指令入口 | 桩（cli; hlt） |
+| `arch_prctl`（FS/GS base, TLS） | 未实现 |
+| x86_64 `struct stat` ABI | 当前为 i386 布局 |
+| 动态链接器 (ld.so) | 结构支持，ABI 待补 |
+| 网络协议栈 | ARP/IP/ICMP/UDP/TCP 结构定义，未接驱动 |
+
+### 已知限制
+
+要在 LFS 用户态下运行 `/bin/bash` 等程序，以下功能需要先补齐：
+
+1. **`sys_execve`** — 当前返回 `-ENOSYS`，init 进程无法执行用户态二进制
+2. **`arch_prctl(ARCH_SET_FS)`** — glibc 启动第一条系统调用，用于装 TLS 指针
+3. **x86_64 `struct stat`** — `fstat` 等返回的结构体是 i386 布局，glibc 会误解
+4. **动态链接器支持** — 需要 `sys_mmap` + ELF 解释器加载
+5. **`syscall` 指令入口** — LFS 的 x86_64 glibc 使用 `syscall` 指令而非 `int 0x80`
+
+### 路径规划
+
+1. **Stage 4** — ELF64 + execve：让内核能 `iretq` 到用户态运行 `/init`
+2. **Stage 5** — ABI 补齐：`arch_prctl`、`stat`、`mmap`、动态链接
+3. **Stage 6** — 设备驱动完善：串口 tty、IDE DMA
+4. **Stage 7** — `syscall` 指令启用 + `getdents64` 等系统调用补齐
+
 ## 许可证
 
 GPL-2.0（与 Linux 1.0.9 相同）。原始代码在 `linux/` 目录。
