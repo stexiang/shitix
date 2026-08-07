@@ -1,6 +1,8 @@
 //! 块设备层。对应 linux-1.0.9 的 `drivers/block/`。
 
 pub mod genhd;
+#[cfg(feature = "extra-drivers")]
+pub mod hd;
 pub mod ll_rw;
 pub mod ramdisk;
 

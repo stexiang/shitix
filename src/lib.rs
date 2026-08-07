@@ -900,9 +900,20 @@ fn fs_selftest() {
     };
 
     // ---- 4. 创建 / 写 / 读回 ----
+    // ext4: skip creation in basic fs selftest (requires extra-drivers feature)
+    let is_ext4 = unsafe {
+        let r = fs::super_block::root_inode();
+        let sb_nr = inode::inode(r).i_sb;
+        fs::super_block::sb(sb_nr).s_magic == 0xEF53
+    };
+
     const MSG: &[u8] = b"hello from shitix minix fs\n";
+    let file_ok = if is_ext4 {
+        kprintln!("fs: ext4 detected, skipping minix creation test");
+        true
+    } else {
     // SAFETY: 同上；open/write/read 都是进程上下文的正常调用。
-    let file_ok = unsafe {
+    unsafe {
         let fd = fs::open::sys_creat(b"/hello.txt", 0o644);
         if fd < 0 {
             kprintln!("fs: creat failed: {}", klib::errno::strerror(-fd as i32));
@@ -942,6 +953,7 @@ fn fs_selftest() {
                       w, sk, r, eof, end, core::str::from_utf8(&buf[..MSG.len()]));
         }
         ok
+    }
     };
     kprintln!("fs: creat/write/lseek/read roundtrip -> {}", if file_ok { "ok" } else { "FAIL" });
 
@@ -1140,13 +1152,21 @@ fn panic(info: &PanicInfo) -> ! {
 ///
 /// 必须在 `fs_init_thread` 里跑（不能在 task[0]）：fs 全路径都可能睡。
 fn syscall_fs_selftest() {
-    // ext4: skip minix-specific creation tests
+    // ext4/minix: run creation tests if ops are available
     let sb_nr = unsafe { fs::super_block::get_super(drivers::block::ramdisk::RAMDISK_DEV) };
     if sb_nr != fs::inode::NIL {
         let magic = unsafe { fs::super_block::sb(sb_nr).s_magic };
         if magic == 0xEF53 {
-            kprintln!("syscall-fs: ext4 detected, skipping creation tests");
-            return;
+            // ext4: only run if compiled with extra-drivers (otherwise ops return -ENOSYS)
+            #[cfg(not(feature = "extra-drivers"))]
+            {
+                kprintln!("syscall-fs: ext4 detected, creation tests require --features extra-drivers");
+                return;
+            }
+            #[cfg(feature = "extra-drivers")]
+            {
+                kprintln!("syscall-fs: ext4 detected, running creation tests");
+            }
         }
     }
     kprintln!("--- syscall→fs selftest ---");

@@ -49,6 +49,8 @@ pub mod selftest;
 pub mod bitmap;
 pub mod ops;
 pub mod mkfs;
+#[cfg(feature = "extra-drivers")]
+pub mod namei;
 
 // Re-exports
 pub use super_block::{Ext4SuperBlock, Ext4FeatureFlags};

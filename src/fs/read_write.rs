@@ -55,7 +55,15 @@ pub unsafe fn read(fd: usize, buf: &mut [u8]) -> i64 {
                 }
                 super::minix::file::read(n, pos, buf)
             }
-            FsType::Ext2 => -(ENOSYS as i64), // TODO: ext2 file read
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => {
+                if mode::is_dir(m) {
+                    return -(EISDIR as i64);
+                }
+                super::ext4::ops::full::ext4_file_read(n, pos, buf)
+            }
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => -(ENOSYS as i64),
             FsType::None => -(EINVAL as i64),
         };
         if r > 0 {
@@ -110,7 +118,15 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
                 }
                 super::minix::file::write(n, pos, buf)
             }
-            FsType::Ext2 => -(ENOSYS as i64), // TODO: ext2 file write
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => {
+                if mode::is_dir(m) {
+                    return -(EISDIR as i64);
+                }
+                super::ext4::ops::full::ext4_file_write(n, pos, buf)
+            }
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => -(ENOSYS as i64),
             FsType::None => -(EINVAL as i64),
         };
         if r > 0 {

@@ -3,25 +3,62 @@
 # 一键编译 + 在 QEMU 中启动 + 校验启动结果
 #
 # 用法:
-#   scripts/test.sh              构建并跑自动化启动测试（无窗口，检查串口输出）
-#   scripts/test.sh run          构建并交互式运行（显示 QEMU 窗口/曲线图形）
-#   scripts/test.sh debug        构建并挂起等待 GDB (localhost:1234)
-#   PROFILE=release scripts/test.sh   用 release 构建
-#   MEM=32M scripts/test.sh       改 QEMU 内存大小（默认 256M），用于跑内存矩阵
+#   scripts/test.sh                    构建并跑自动化启动测试（debug，无窗口）
+#   scripts/test.sh run                构建并交互式运行（显示 QEMU 窗口）
+#   scripts/test.sh debug              构建并挂起等待 GDB (localhost:1234)
+#   scripts/test.sh --release          用 release 构建并测试
+#   scripts/test.sh --release run      用 release 构建并交互运行
+#   scripts/test.sh --features extra-drivers --release   release + 完整驱动
+#
+# 旧用法兼容:
+#   PROFILE=release scripts/test.sh    等价于 --release
+#   MEM=32M scripts/test.sh            改 QEMU 内存大小（默认 256M）
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODE="${1:-test}"
+MEM="${MEM:-256M}"
 IMG="target/boot/shitix.img"
 LOG="target/boot/serial.log"
 TIMEOUT="${TIMEOUT:-20}"
-MEM="${MEM:-256M}"
 QEMU="qemu-system-x86_64"
-# 成功标记，由 src/lib.rs 在启动末尾写到串口
 OK_MARK="SHITIX_BOOT_OK"
+
+# ---- 分离 build 参数与 test.sh 模式 ----
+BUILD_ARGS=()
+MODE="test"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release|-r)
+            BUILD_ARGS+=("--release")
+            shift
+            ;;
+        --features|-f)
+            BUILD_ARGS+=("--features" "$2")
+            shift 2
+            ;;
+        --features=*)
+            BUILD_ARGS+=("${1}")
+            shift
+            ;;
+        test|run|debug)
+            MODE="$1"
+            shift
+            ;;
+        *)
+            echo "用法: $0 [--release|-r] [--features|-f <FEATURES>] [test|run|debug]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# 环境变量兜底
+if [[ -n "${PROFILE:-}" ]] && ! printf '%s\n' "${BUILD_ARGS[@]}" | grep -q '\--release'; then
+    [[ "$PROFILE" == "release" ]] && BUILD_ARGS+=("--release")
+fi
 
 info() { printf '\033[1;34m[test]\033[0m %s\n' "$*"; }
 pass() { printf '\033[1;32m[PASS]\033[0m %s\n' "$*"; }
@@ -30,7 +67,7 @@ fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 command -v "$QEMU" >/dev/null || fail "缺少 $QEMU"
 
 info "构建"
-bash scripts/build.sh
+bash scripts/build.sh "${BUILD_ARGS[@]}"
 
 QEMU_BASE=(
     -drive "format=raw,file=$IMG,if=ide"

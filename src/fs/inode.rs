@@ -407,8 +407,8 @@ unsafe fn read_inode(n: usize) {
         if sb_nr != NIL {
             let magic = super::super_block::sb(sb_nr).s_magic;
             if magic == 0xEF53 {
-                // ext4: 已在 ext4::ops::read_super 中预填，或后续从磁盘读取
-                // 当前阶段：root inode 已由 read_super 初始化
+                #[cfg(feature = "extra-drivers")]
+                crate::fs::ext4::ops::full::read_inode(n);
             } else {
                 super::minix::read_inode(n);
             }
@@ -432,7 +432,13 @@ pub unsafe fn write_inode(n: usize) {
         // 原版：只读挂载的文件系统上 write_inode 是 no-op
         let ip = inode_ptr(n);
         if !(*ip).is_rdonly() && (*ip).i_sb != NIL {
-            super::minix::write_inode(n);
+            let magic = super::super_block::sb((*ip).i_sb).s_magic;
+            if magic == 0xEF53 {
+                #[cfg(feature = "extra-drivers")]
+                crate::fs::ext4::ops::full::write_inode(n);
+            } else {
+                super::minix::write_inode(n);
+            }
         }
         inode(n).i_dirt = false;
         unlock_inode(n);

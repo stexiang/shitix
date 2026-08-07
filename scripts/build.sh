@@ -7,12 +7,55 @@
 #   LBA 1..4         : setup    (4 个扇区)
 #   LBA 5..          : system   (head.S + Rust 内核, 纯二进制)
 #
+# 用法:
+#   scripts/build.sh                        debug 构建（无额外 feature）
+#   scripts/build.sh --release              release 构建
+#   scripts/build.sh --features extra-drivers   debug + extra-drivers
+#   scripts/build.sh --release --features extra-drivers  release + extra-drivers
+#
+# 兼容旧环境变量:
+#   PROFILE=release scripts/build.sh          等价于 --release
+#   FEATURES=extra-drivers scripts/build.sh   等价于 --features extra-drivers
+#   如果同时传了参数和环境变量，参数优先。
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# ---- 解析命令行参数 ----
+RELEASE=false
+FEATURES=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release|-r)
+            RELEASE=true
+            shift
+            ;;
+        --features|-f)
+            FEATURES="$2"
+            shift 2
+            ;;
+        --features=*)
+            FEATURES="${1#*=}"
+            shift
+            ;;
+        *)
+            echo "用法: $0 [--release|-r] [--features|-f <FEATURES>]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# 环境变量兜底（参数优先）
 PROFILE="${PROFILE:-debug}"
+if $RELEASE; then
+    PROFILE="release"
+elif [[ "$PROFILE" != "release" ]]; then
+    PROFILE="debug"
+fi
+
 TARGET="x86_64-unknown-none"
 OUT="target/boot"
 CARGO_OUT="target/$TARGET/$PROFILE/libshitix.a"
@@ -20,6 +63,11 @@ SETUPSECS=4
 
 CARGO_FLAGS=(--target "$TARGET")
 [[ "$PROFILE" == "release" ]] && CARGO_FLAGS+=(--release)
+if [[ -n "$FEATURES" ]]; then
+    CARGO_FLAGS+=(--features "$FEATURES")
+    # 给用户一个明确提示：启用了哪些 feature
+    echo "[build] features: $FEATURES"
+fi
 
 step() { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }

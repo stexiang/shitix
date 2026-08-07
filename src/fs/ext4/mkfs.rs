@@ -131,19 +131,31 @@ pub unsafe fn mkfs(total_blocks: u32, _inode_ratio: u32) -> bool {
     ino_blk[ino2 + 4] = 0x00; ino_blk[ino2 + 5] = 0x04;
     // i_links_count = 2 (. and ..)
     ino_blk[ino2 + 26] = 2;
-    // i_flags: EXT4_EXTENTS_FL (0x80000)
-    ino_blk[ino2 + 32] = 0x00; ino_blk[ino2 + 33] = 0x08; ino_blk[ino2 + 34] = 0x00; ino_blk[ino2 + 35] = 0x00;
-    // i_block[0..11] = extent header at offset 40
-    // Extent header: magic=0xF30A, entries=1, max_entries=4, depth=0
+    // i_flags: EXT4_EXTENTS_FL (0x00080000, LE bytes [0x00,0x00,0x08,0x00])
+    ino_blk[ino2 + 32] = 0x00; ino_blk[ino2 + 33] = 0x00; ino_blk[ino2 + 34] = 0x08; ino_blk[ino2 + 35] = 0x00;
+    // i_block[0..11] = extent header at offset 40 (12 bytes)
+    // ExtentHeader layout (small-endian):
+    //   byte 0-1: eh_magic = 0xF30A
+    //   byte 2-3: eh_entries = 1
+    //   byte 4-5: eh_max = 4
+    //   byte 6-7: eh_depth = 0
+    //   byte 8-11: eh_generation = 0
     let ext_off = ino2 + 40;
     ino_blk[ext_off] = 0x0A; ino_blk[ext_off + 1] = 0xF3; // magic
-    ino_blk[ext_off + 2] = 1;   // entries
-    ino_blk[ext_off + 3] = 4;   // max_entries
-    ino_blk[ext_off + 4] = 0; ino_blk[ext_off + 5] = 0; // depth=0
-    // Extent: block=13 (data blocks start at block 13), len=1, start=13
+    ino_blk[ext_off + 2] = 1; ino_blk[ext_off + 3] = 0;    // entries = 1
+    ino_blk[ext_off + 4] = 4; ino_blk[ext_off + 5] = 0;    // max_entries = 4
+    ino_blk[ext_off + 6] = 0; ino_blk[ext_off + 7] = 0;    // depth = 0
+    for k in 8..12 { ino_blk[ext_off + k] = 0; }            // generation = 0
+    // Extent entry at ext_off + 12 (12 bytes):
+    //   byte 0-3: ee_block (logical block 0)
+    //   byte 4-5: ee_len (1)
+    //   byte 6-7: ee_start_hi (0)
+    //   byte 8-11: ee_start_lo (physical block 13)
     let ext_dat = ext_off + 12;
-    ino_blk[ext_dat..ext_dat + 4].copy_from_slice(&13u32.to_le_bytes()); // ee_block
-    ino_blk[ext_dat + 4..ext_dat + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len
+    ino_blk[ext_dat..ext_dat + 4].copy_from_slice(&0u32.to_le_bytes());     // ee_block = 0
+    ino_blk[ext_dat + 4..ext_dat + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len = 1
+    ino_blk[ext_dat + 6..ext_dat + 8].copy_from_slice(&0u16.to_le_bytes()); // ee_start_hi = 0
+    ino_blk[ext_dat + 8..ext_dat + 12].copy_from_slice(&13u32.to_le_bytes()); // ee_start_lo = 13
     ino_blk[ext_dat + 6..ext_dat + 8].copy_from_slice(&0u16.to_le_bytes()); // ee_start_hi
     ino_blk[ext_dat + 8..ext_dat + 12].copy_from_slice(&13u32.to_le_bytes()); // ee_start_lo
     // i_extra_isize = 28

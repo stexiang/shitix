@@ -192,7 +192,10 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         match dir_op {
             FsType::Minix => super::minix::namei::lookup(dir, name),
-            FsType::Ext2 => super::minix::namei::lookup(dir, name), // ext4 delegates to minix ops
+                        #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::lookup(dir, name),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::lookup(dir, name),
             _ => Err(ENOTDIR),
         }
     }
@@ -279,7 +282,10 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
                 }
                 let r = match inode::inode(dir).i_op {
                     FsType::Minix => super::minix::namei::create(dir, last, m),
-                    FsType::Ext2 => super::minix::namei::create(dir, last, m), // ext4 -> minix
+                    #[cfg(feature = "extra-drivers")]
+                    FsType::Ext2 => super::ext4::namei::create(dir, last, m),
+                    #[cfg(not(feature = "extra-drivers"))]
+                    FsType::Ext2 => super::minix::namei::create(dir, last, m),
                     _ => Err(ENOTDIR),
                 };
                 inode::iput(dir);
@@ -343,7 +349,10 @@ pub unsafe fn do_mknod(path: &[u8], m: u16, rdev: u16) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::mknod(dir, last, m, rdev),
-            FsType::Ext2 => super::minix::namei::mknod(dir, last, m, rdev), // ext4 -> minix
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::mknod(dir, last, m, rdev),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::mknod(dir, last, m, rdev),
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -379,7 +388,10 @@ pub unsafe fn do_mkdir(path: &[u8], m: u16) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::mkdir(dir, last, m),
-            FsType::Ext2 => super::minix::namei::mkdir(dir, last, m), // ext4 -> minix
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::mkdir(dir, last, m),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::mkdir(dir, last, m),
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -415,7 +427,10 @@ pub unsafe fn do_rmdir(path: &[u8]) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::rmdir(dir, last),
-            FsType::Ext2 => super::minix::namei::rmdir(dir, last), // ext4 -> minix
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::rmdir(dir, last),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::rmdir(dir, last),
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -445,7 +460,10 @@ pub unsafe fn do_unlink(path: &[u8]) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::unlink(dir, last),
-            FsType::Ext2 => super::minix::namei::unlink(dir, last), // ext4 -> minix
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::unlink(dir, last),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::unlink(dir, last),
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -497,7 +515,10 @@ pub unsafe fn do_link(oldpath: &[u8], newpath: &[u8]) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::link(target, dir, last),
-            FsType::Ext2 => super::minix::namei::link(target, dir, last), // ext4 -> minix
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::link(target, dir, last),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::link(target, dir, last),
             _ => ENOTDIR,
         };
         inode::iput(target);

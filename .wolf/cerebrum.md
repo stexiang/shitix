@@ -82,6 +82,12 @@
 
 - **汇编里不要写死 Rust 结构体的字段偏移**：`ret_from_sys_call` 判「有没有待处理信号」时，原版直接在汇编里读 `task_struct` 的 `signal`/`blocked` 偏移。我们不能照抄——`current` 是个**下标**（`sched::CURRENT`）不是指针，且 `Task` 的字段偏移由 Rust 布局决定，写死会随字段增删静默错位。改成 `call signal_pending_c`（`#[unsafe(no_mangle)] extern "C" -> u8`），常态路径多一次 call，换来偏移不会失同步。
 
+- **声卡子系统移植完成但 debug 构建偏大**（2026-08-07）：新增 ~2700 行代码导致 debug 镜像超 0x91000。将 sound + hd 模块放到 `extra-drivers` feature gate 后，release 构建 LTO 可容纳全部功能。大型可选子系统应走 feature gate 而非默认编译。
+
+- **不要在内核代码中放大静态查找表**（2026-08-07）：`ULAW_DSP`(512B) + `DSP_ULAW`(256B) + `MIDI_NOTE_FREQ`(512B) = 1280B rodata，对内核镜像的 0x91000 上限是昂贵的。μ-law 编解码和 MIDI 频率计算可用 G.711 标准算法和整数近似代替。
+
+- **edition 2024 注意事项**（2026-08-07）：`asm!("outb %al, $0x80")` 报 "unknown token"，改用 `PortWriteOnly::new(0x80).write(0u8)`。`#[no_mangle]` 需改为 `#[unsafe(no_mangle)]`。`f64::powf` 在 `#![no_std]` 中不可用。
+
 ## Do-Not-Repeat
 
 <!-- Mistakes made and corrected. Each entry prevents the same mistake recurring. -->

@@ -1,7 +1,11 @@
-# Memory
-
-> Chronological action log. Hooks and AI append to this file automatically.
-> Old sessions are consolidated by the daemon weekly.
+| 2026-08-07 23:50 | 移植声卡子系统：创建 `src/drivers/sound/` 含 config.rs, dev_table.rs, soundcard.rs, sound_switch.rs, dmabuf.rs, audio.rs, opl3.rs, sb.rs, adlib.rs, mod.rs | ~2700 行新 Rust 代码 |
+| 2026-08-07 23:50 | 移植 IDE 硬盘驱动 `src/drivers/block/hd.rs` | ~480 行 |
+| 2026-08-07 23:50 | debug 构建镜像偏大（超 0x91000），将 sound + hd 移到 `extra-drivers` feature gate；release 构建全功能正常 | Cargo.toml, drivers/mod.rs |
+| 2026-08-07 23:50 | 移植声卡子系统 + IDE 硬盘驱动 见上方 | ~3200 行新 Rust 代码 |
+| 2026-08-08 | ext4 完整 VFS 实现：新增 `ext4/namei.rs`（~400行，lookup/create/mkdir/rmdir/unlink/link），重写 `ext4/ops.rs` 增加 `ops::full` 模块（bmap/extend_inode/truncate/file_read/file_write/read_super_full，~400行） | ext4/namei.rs, ext4/ops.rs |
+| 2026-08-08 | ext4 全功能编译条件：`#[cfg(feature = "extra-drivers")]` 围栏——默认 debug 构建用轻量 ops 免超 0x91000；`release --features extra-drivers` 启用完整 ext4 读写 | ops.rs, namei.rs, namei dispatch, read_write dispatch |
+| 2026-08-08 | 更新 fs selftest：ext4 上跳过 minix 创建测试 + syscall-fs 提示 `--features extra-drivers`；debug 构建全 PASS、release+features 编译成功 | lib.rs |
+| 2026-08-08 | 关键教训：ext4 ops.rs 全功能版 debug 构建超 0x91000 → 用 `pub mod full` + `#[cfg(feature)]` 把大实现隔离在主路径之外；VFS dispatch 函数签名需与 minix 一致（返回 `i32` 而非 `Result`）| cerebrum |
 
 ## Session: 2026-08-01 03:00
 
@@ -321,6 +325,21 @@
 |------|--------|---------|---------|--------|
 
 ## Session: 2026-08-07 16:28
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 17:17
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 18:06
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 18:07
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|

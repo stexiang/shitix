@@ -860,53 +860,51 @@ pub unsafe fn sync_buffers(dev: u16, wait: bool) -> bool {
     let mut pass = 0;
     // SAFETY: 契约转交。
     unsafe {
+        let used = *core::ptr::addr_of!(NR_BUFFERS_USED);
         loop {
             let mut retry = false;
-            let mut p = *core::ptr::addr_of!(FREE_LIST);
-            for _ in 0..*core::ptr::addr_of!(NR_BUFFERS_USED) {
-                if p == NIL {
-                    break;
-                }
-                let next = (*buf_ptr(p)).b_next_free;
-                let this = p;
-                p = next;
-
-                if dev != 0 && (*buf_ptr(this)).b_dev != dev {
+            // 遍历所有已分配的缓冲槽位（而非仅 free list）。
+            // free list 里只有 b_count==0 的缓冲，而调用方可能在
+            // brelse 之前就持有引用（b_count>=1），这些缓冲不在 free
+            // list 上，旧代码扫不到——脏数据永远写不回磁盘。
+            for slot in 0..NR_BUFFERS {
+                let bp = buf_ptr(slot);
+                // 跳过未初始化的槽位
+                if (*bp).b_size == 0 {
                     continue;
                 }
-                if (*buf_ptr(this)).b_lock {
-                    // 原版：不等就跳过并要求重来；等的话只在 pass>0 时真等
+                if used > 0 && slot >= used {
+                    break;
+                }
+                if dev != 0 && (*bp).b_dev != dev {
+                    continue;
+                }
+                if (*bp).b_lock {
                     if !wait || pass == 0 {
                         retry = true;
                         continue;
                     }
-                    wait_on_buffer(this);
+                    wait_on_buffer(slot);
                 }
-                // 解锁却不 uptodate 且不脏 = 发生过 I/O 错误。
-                // 用裸指针读这几个标志：`bh()` 的 `&mut` 在下面 `ll_rw_block`
-                // 里还会被再取一次（同一个缓冲），两条 `&mut` 重叠时
-                // `b_count += 1` / `-= 1` 这对读—改—写有可能各自读到过期值，
-                // 结果是计数不平衡（观察到 `b_count` 减到下溢 panic）。
                 {
-                    let bp = buf_ptr(this);
+                    let bp2 = buf_ptr(slot);
                     if wait
-                        && (*bp).b_req
-                        && !(*bp).b_lock
-                        && !(*bp).b_dirt
-                        && !(*bp).b_uptodate
+                        && (*bp2).b_req
+                        && !(*bp2).b_lock
+                        && !(*bp2).b_dirt
+                        && !(*bp2).b_uptodate
                     {
                         err = true;
                         continue;
                     }
-                    // 第三趟只等，不写
-                    if !(*bp).b_dirt || pass >= 2 {
+                    if !(*bp2).b_dirt || pass >= 2 {
                         continue;
                     }
                 }
-                // 原版在 ll_rw_block 前后 b_count++/-- 保护缓冲不被复用
-                (*buf_ptr(this)).b_count += 1;
-                ll_rw_block(WRITE, &mut [this]);
-                (*buf_ptr(this)).b_count -= 1;
+                // b_count++ 防止缓冲在 I/O 期间被复用
+                (*buf_ptr(slot)).b_count += 1;
+                ll_rw_block(WRITE, &mut [slot]);
+                (*buf_ptr(slot)).b_count -= 1;
                 retry = true;
             }
             if !(wait && retry && pass < 2) {
@@ -952,21 +950,16 @@ pub unsafe fn fsync_dev(dev: u16) -> bool {
 /// # Safety
 /// 不能在中断上下文调用。调用前应先 `sync_dev`，否则脏数据丢失。
 pub unsafe fn invalidate_buffers(dev: u16) {
-    // SAFETY: 契约转交。
+    // SAFETY: 契约转交。遍历所有缓冲槽位（同 sync_buffers 的修复）。
     unsafe {
-        let mut p = *core::ptr::addr_of!(FREE_LIST);
-        for _ in 0..*core::ptr::addr_of!(NR_BUFFERS_USED) {
-            if p == NIL {
-                break;
-            }
-            let this = p;
-            p = bh(this).b_next_free;
-            if (*buf_ptr(this)).b_dev != dev {
-                continue;
-            }
-            wait_on_buffer(this);
-            let b = bh(this);
-            // 原版这里再确认一次 b_dev（睡眠期间可能已被复用）
+        let used = *core::ptr::addr_of!(NR_BUFFERS_USED);
+        for slot in 0..NR_BUFFERS {
+            let bp = buf_ptr(slot);
+            if (*bp).b_size == 0 { continue; }
+            if used > 0 && slot >= used { break; }
+            if (*bp).b_dev != dev { continue; }
+            wait_on_buffer(slot);
+            let b = bh(slot);
             if b.b_dev == dev {
                 b.b_uptodate = false;
                 b.b_dirt = false;

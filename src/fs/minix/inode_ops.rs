@@ -503,11 +503,11 @@ pub unsafe fn write_inode(n: usize) {
 
         let raw = {
             let i = inode::inode(n);
-            let mut zone = i.data;
-            // 设备文件把 rdev 写回 i_zone[0]（与 read_inode 对称）
+            let mut zone = [0u16; 9];
             if mode::is_chr(i.i_mode) || mode::is_blk(i.i_mode) {
-                zone = [0; 9];
                 zone[0] = i.i_rdev;
+            } else {
+                zone = i.data;
             }
             MinixInode {
                 i_mode: i.i_mode,
