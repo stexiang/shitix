@@ -216,6 +216,7 @@ pub mod full {
             if block_off + info.inode_size as usize <= data.len() {
                 let raw = &data[block_off..block_off + info.inode_size as usize];
                 if let Some(ei) = Ext4Inode::from_bytes(raw) {
+                    i.i_op = FsType::Ext2;
                     i.i_mode = ei.i_mode;
                     i.i_uid = ei.uid() as u16;
                     i.i_gid = ei.gid() as u16;

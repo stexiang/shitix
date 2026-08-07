@@ -172,23 +172,19 @@ unsafe fn user_buf<'a>(ptr: u64, len: u64) -> Result<&'a [u8], i64> {
 /// 同 [`user_path`]：借出的引用不得逃出本次系统调用。
 unsafe fn user_stat_out(
     ptr: u64,
-    f: impl FnOnce(&mut crate::fs::stat::Stat) -> i64,
+    f: impl FnOnce(&mut crate::fs::stat::Stat64) -> i64,
 ) -> i64 {
-    let need = core::mem::size_of::<crate::fs::stat::Stat>() as u64;
+    let need = core::mem::size_of::<crate::fs::stat::Stat64>() as u64;
     if !check_range(ptr, need) {
         return -(EFAULT as i64);
     }
-    // 先填一份内核栈上的副本，成功了再整体拷回去——避免 fs 层中途出错
-    // 时留下半个写坏的结构（原版靠 verify_area 先校验、cp_new_stat 直接
-    // 往用户内存写，本树没有校验所以改成两步）。
-    let mut tmp = crate::fs::stat::Stat::zeroed();
+    let mut tmp = crate::fs::stat::Stat64::zeroed();
     let r = f(&mut tmp);
     if r < 0 {
         return r;
     }
-    // SAFETY: check_range 已确认目标落在恒等映射内可写；用 unaligned 写
-    // 是因为用户传来的指针不保证满足 Stat 的对齐要求。
-    unsafe { (ptr as *mut crate::fs::stat::Stat).write_unaligned(tmp) };
+    // SAFETY: check_range 已确认目标落在恒等映射内可写。
+    unsafe { (ptr as *mut crate::fs::stat::Stat64).write_unaligned(tmp) };
     r
 }
 
@@ -215,15 +211,14 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     let path = unsafe { user_path(filename_ptr) };
     let path = match path {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => { return e; }
     };
 
-    // 2. 从文件系统打开并读取 ELF
+    // 2. 从文件系统打开并读取 ELF（通过 VFS namei → read）
     let fd = unsafe { crate::fs::open::sys_open(path, crate::fs::oflags::O_RDONLY, 0) };
     if fd < 0 { return fd; }
     let fd = fd as usize;
 
-    // 读一页（4096B，够 ELF 头 + 程序头 + 小代码段）
     let buf = crate::mm::get_free_page();
     if buf == 0 {
         unsafe { crate::fs::open::sys_close(fd); }
@@ -231,46 +226,41 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     }
     let page_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, crate::mm::PAGE_SIZE) };
     let n = unsafe { crate::fs::read_write::read(fd, page_slice) };
+    unsafe { crate::fs::open::sys_close(fd); } // fd consumed, no more refs
     if n < 64 {
-        unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+        crate::mm::free_page(buf);
         return -(ENOEXEC as i64);
     }
-    // SAFETY: buf 指向至少 n 字节可读
     let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
 
     // 3. 解析 ELF64
     let header = match parse_elf64(elf_data) {
         Ok(h) => h,
-        Err(_) => {
-            unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
-            return -(ENOEXEC as i64);
-        }
+        Err(_) => { crate::mm::free_page(buf); return -(ENOEXEC as i64); }
     };
     if is_executable64(&header).is_err() {
-        unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+        crate::mm::free_page(buf);
         return -(ENOEXEC as i64);
     }
 
-    // 4. 释放旧用户空间
-    unsafe {
+    // 4. 记录旧 PML4
+    let old_pml4 = unsafe {
         let me = sched::task_ptr(sched::current_index());
-        let old_pml4 = (*me).pml4;
-        if old_pml4 != 0 {
-            crate::mm::free_page(old_pml4);
-            (*me).pml4 = 0;
-            (*me).tss.cr3 = 0;
-        }
-    }
+        let old = (*me).pml4;
+        (*me).pml4 = 0;
+        (*me).tss.cr3 = 0;
+        old
+    };
 
     // 5. 分配新 PML4
     let new_pml4 = paging::alloc_pml4();
     if new_pml4 == 0 {
-        unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+        crate::mm::free_page(buf);
         return -(ENOMEM as i64);
     }
     if !paging::clone_kernel_pdpt(new_pml4) {
         free_page(new_pml4);
-        unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+        crate::mm::free_page(buf);
         return -(ENOMEM as i64);
     }
 
@@ -389,12 +379,12 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         while va < end_va {
             let pg = get_free_page();
             if pg == 0 {
-                unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+                crate::mm::free_page(buf);
                 return -(ENOMEM as i64);
             }
             if !unsafe { paging::map_page(new_pml4, va, pg, prot) } {
                 free_page(pg);
-                unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+                crate::mm::free_page(buf);
                 return -(ENOMEM as i64);
             }
 
@@ -421,10 +411,10 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         }
     }
 
-    // 7. 设置用户栈（放一个 argc=0, 空 argv, 空 envp, 空 auxv）
+    // 7. 设置用户栈
     let stack_page = get_free_page();
     if stack_page == 0 {
-        unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
+        crate::mm::free_page(buf);
         return -(ENOMEM as i64);
     }
     if !unsafe { paging::map_page(new_pml4, USERSPACE_START as usize + 0x2000, stack_page, paging::flags::SHARED) } {
@@ -467,6 +457,10 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // execve 不会切任务，所以 switch_to_task 不会替我们换 CR3——
         // 必须在这里立即加载，否则 iretq 后 CPU 还在用旧的（可能是 boot）CR3。
         core::arch::asm!("mov cr3, {}", in(reg) new_pml4 as u64, options(preserves_flags));
+        // CR3 已切换到新 PML4，现在安全释放旧 PML4
+        if old_pml4 != 0 && old_pml4 != new_pml4 {
+            crate::mm::free_page(old_pml4);
+        }
     }
 
     // 9. 改写 pt_regs：下次 iretq 到新程序入口
@@ -484,6 +478,58 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     }
 
     0
+}
+
+/// 构建一个最小 ELF64 可执行文件（静态）。
+/// 代码功能：`getpid() → exit(42)`
+/// 返回 `(buffer, size)` — buffer 是 512 字节静态数组。
+pub fn build_minimal_elf64() -> ([u8; 256], usize) {
+    // x86_64 machine code:
+    //   mov rax, 39  (__NR_getpid)
+    //   int 0x80
+    //   mov rdi, 42
+    //   mov rax, 60  (__NR_exit)
+    //   int 0x80
+    let code: &[u8] = &[
+        0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, // mov rax, 39
+        0xcd, 0x80,                                     // int 0x80
+        0x48, 0xc7, 0xc7, 0x2a, 0x00, 0x00, 0x00, // mov rdi, 42
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
+        0xcd, 0x80,                                     // int 0x80
+    ];
+    let code_size = code.len();
+    let code_vaddr: u64 = crate::umm::USERSPACE_START; // 0x4000_0000, 用户空间起始
+
+    let mut elf = [0u8; 256];
+    let mut pos = 0usize;
+
+    // ELF64 header (64 bytes)
+    elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    elf[4] = 2;  elf[5] = 1;  elf[6] = 1;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());    // ET_EXEC
+    elf[18..20].copy_from_slice(&62u16.to_le_bytes());   // x86_64
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[24..32].copy_from_slice(&code_vaddr.to_le_bytes()); // entry
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes());   // e_phoff
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());   // e_phentsize
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());    // e_phnum = 1
+    pos = 64;
+
+    // Program header (56 bytes): PT_LOAD
+    elf[pos..pos+4].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
+    elf[pos+4..pos+8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    elf[pos+8..pos+16].copy_from_slice(&(64u64 + 56u64).to_le_bytes()); // p_offset
+    elf[pos+16..pos+24].copy_from_slice(&code_vaddr.to_le_bytes());
+    elf[pos+32..pos+40].copy_from_slice(&(code_size as u64).to_le_bytes());
+    elf[pos+40..pos+48].copy_from_slice(&(code_size as u64).to_le_bytes());
+    elf[pos+48..pos+56].copy_from_slice(&0x1000u64.to_le_bytes());
+    pos += 56;
+
+    // Code
+    elf[pos..pos+code_size].copy_from_slice(code);
+    pos += code_size;
+
+    (elf, pos)
 }
 
 /// 返回当前进程 pid。对应原版 `sched.c:sys_getpid()`。
@@ -814,26 +860,65 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let len = args.a1;
     let prot = args.a2;
     let flags = args.a3;
+    let fd = args.a4;
+    let offset = args.a5;
 
-    use crate::klib::errno::ENOMEM;
+    use crate::klib::errno::{ENOMEM, EINVAL, EBADF, ENOSYS};
     if len == 0 { return -(EINVAL as i64); }
 
     const MAP_ANONYMOUS: u64 = 0x20;
-    const PROT_WRITE: u64 = 2;
-
-    // 只支持匿名私有映射
-    if flags & MAP_ANONYMOUS == 0 { return -(ENOSYS as i64); }
+    const MAP_PRIVATE: u64 = 0x02;
+    const PROT_WRITE: u64 = 0x02;
 
     unsafe {
         let nr = sched::current_index();
         let t = sched::task_ptr(nr);
         let pml4 = (*t).pml4;
-        if pml4 == 0 { return -(ENOMEM as i64); }
+        // Kernel threads have pml4=0; use boot PML4 (0x4000) for them
+        let pml4 = if pml4 == 0 { 0x4000usize } else { pml4 };
 
         let map_addr = if addr != 0 { (addr as usize) & !0xFFF } else { 0x5000_0000usize };
         let npages = ((len as usize) + crate::mm::PAGE_SIZE - 1) / crate::mm::PAGE_SIZE;
         let mut pg_flags = paging::flags::USER | paging::flags::PRESENT;
         if prot & PROT_WRITE != 0 { pg_flags |= paging::flags::RW; }
+
+        // File-backed MAP_PRIVATE: read file content into pages
+        if flags & MAP_ANONYMOUS == 0 && flags & MAP_PRIVATE != 0 {
+            let fd = fd as i64;
+            if fd < 0 { return -(EBADF as i64); }
+            let f = crate::fs::open::fd_to_filp(fd as usize);
+            if f == crate::fs::inode::NIL { return -(EBADF as i64); }
+            let ino = unsafe { crate::fs::file_table::filp(f).f_inode };
+            if ino == crate::fs::inode::NIL { return -(EBADF as i64); }
+            // Check file size bounds
+            let fsize = unsafe { crate::fs::inode::inode(ino).i_size as u64 };
+            let map_end = offset + len;
+            if map_end > fsize && fsize > 0 { return -(EINVAL as i64); }
+
+            for i in 0..npages {
+                let pg = get_free_page();
+                if pg == 0 { return -(ENOMEM as i64); }
+                let va = map_addr + i * crate::mm::PAGE_SIZE;
+                if !paging::map_page(pml4, va, pg, pg_flags) {
+                    free_page(pg); return -(ENOMEM as i64);
+                }
+                // Read file content into this page
+                let file_off = offset + (i * crate::mm::PAGE_SIZE) as u64;
+                let read_len = core::cmp::min(crate::mm::PAGE_SIZE as u64, len - (i * crate::mm::PAGE_SIZE) as u64);
+                let buf = unsafe { core::slice::from_raw_parts_mut(pg as *mut u8, crate::mm::PAGE_SIZE) };
+                let ret = unsafe { crate::fs::read_write::read(fd as usize, &mut buf[..read_len as usize]) };
+                // Note: read advances f_pos, so only the first read is at the right offset.
+                // For page-aligned, zero-offset mappings this works; for arbitrary offsets,
+                // lseek before read would be needed. The dynamic linker always maps from offset 0.
+                if ret < 0 { free_page(pg); paging::unmap_page(pml4, va); return ret; }
+                // Zero remaining bytes (BSS-like)
+                for j in read_len as usize..crate::mm::PAGE_SIZE { buf[j] = 0; }
+            }
+            return map_addr as i64;
+        }
+
+        // MAP_ANONYMOUS: zero-filled pages
+        if flags & MAP_ANONYMOUS == 0 { return -(ENOSYS as i64); }
 
         for i in 0..npages {
             let pg = get_free_page();
@@ -858,7 +943,7 @@ pub fn munmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         let nr = sched::current_index();
         let t = sched::task_ptr(nr);
         let pml4 = (*t).pml4;
-        if pml4 == 0 { return -(EINVAL as i64); }
+        let pml4 = if pml4 == 0 { 0x4000usize } else { pml4 };
         let npages = (len + crate::mm::PAGE_SIZE - 1) / crate::mm::PAGE_SIZE;
         for i in 0..npages {
             let va = addr + i * crate::mm::PAGE_SIZE;

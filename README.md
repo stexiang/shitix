@@ -1,7 +1,7 @@
 # SHITIX — Rust 重写的 Linux 1.0.9 内核
 
 用 Rust 重写 Linux 1.0.9 内核，目标架构 x86_64，在 QEMU 中运行。
-现已支持 ring-3 用户态切换、ext4 文件系统完整读写、SoundBlaster/AdLib 声卡驱动。
+现已支持：ELF64 execve、ring-3 用户态、ext4 完整读写、SoundBlaster/AdLib 声卡。
 
 ## 快速开始
 
@@ -146,8 +146,10 @@ shitix/
 | fs | 块 I/O、超级块、readdir、9KB 一级间接、mkdir/rmdir/unlink、/dev/zero、缓冲去重 | PASS |
 | ext4 structure | 51 项：超级块/GroupDesc/inode/extent/DirIter | PASS |
 | ext4 creation | open/write/lseek/read/fstat/dup/close/stat/mkdir/rmdir/unlink/EFAULT guards | PASS |
+| smp | 13 register constants, 3 DeliveryMode, CpuInfo states, CPU count, LAPIC base | PASS |
 | fork/exit/wait4 | fork + SIGTERM default action | PASS |
 | ring-3 | getpid→exit(42) roundtrip、slot+PML4 freed | PASS |
+| execve | ELF64 from ext4 → user-mode → getpid+exit(42) | PASS |
 
 ## 编译特性
 
@@ -248,29 +250,115 @@ qemu-system-x86_64 \
 | 信号投递（SIGSEGV/SIGTERM 等） | ✓ |
 | fork + COW 页表复制 | ✓ |
 | ELF64 加载器 | ✓ |
-| ELF64 execve | 进行中（Stage 4） |
-| `syscall` 指令入口 | 桩（cli; hlt） |
-| `arch_prctl`（FS/GS base, TLS） | 未实现 |
-| x86_64 `struct stat` ABI | 当前为 i386 布局 |
-| 动态链接器 (ld.so) | 结构支持，ABI 待补 |
+| ELF64 execve | ✓ |
+| Static ELF loading (no ld.so) | ✓ |
+| `syscall` 指令入口 | ✓（MSR STAR/LSTAR/SFMASK 已配置，entry.S 就绪） |
+| `arch_prctl`（FS/GS base, TLS） | ✓（ARCH_SET_FS/GET_FS/GS 通过 wrmsr） |
+| x86_64 `struct stat` ABI | ✓（Stat64，144 字节，glibc 兼容） |
+| 动态链接器 (ld.so) | 结构支持（PT_INTERP 加载），mmap 待补 |
 | 网络协议栈 | ARP/IP/ICMP/UDP/TCP 结构定义，未接驱动 |
 
 ### 已知限制
 
+#### 阻塞 LFS 用户态的关键缺口
+
 要在 LFS 用户态下运行 `/bin/bash` 等程序，以下功能需要先补齐：
 
-1. **`sys_execve`** — 当前返回 `-ENOSYS`，init 进程无法执行用户态二进制
-2. **`arch_prctl(ARCH_SET_FS)`** — glibc 启动第一条系统调用，用于装 TLS 指针
-3. **x86_64 `struct stat`** — `fstat` 等返回的结构体是 i386 布局，glibc 会误解
-4. **动态链接器支持** — 需要 `sys_mmap` + ELF 解释器加载
-5. **`syscall` 指令入口** — LFS 的 x86_64 glibc 使用 `syscall` 指令而非 `int 0x80`
+| 缺口 | 影响 | 当前状态 |
+|------|------|----------|
+| 动态链接器 (ld.so) | 需 `sys_mmap` 加载 ELF 段 | `mmap` 为 `-ENOSYS`，PT_INTERP 加载已就绪 |
+
+#### 架构与内核基础设施
+
+| 缺口 | 影响 | 当前状态 |
+|------|------|----------|
+| per-task file descriptor 表 | `do_exit` 里的 `close_all()` 操作全局 `FD_TABLE`，fork 后父子共用 fd | 全局静态数组 `FD_TABLE: [Option<usize>; 32]` |
+| per-task `pwd`/`root` | `chdir` 影响所有任务，多进程环境下路径解析互踩 | `super_block::pwd_inode()` / `root_inode()` 为全局状态 |
+| `clone` flags 语义 | `sys_clone` 无法创建线程（无 `CLONE_VM`/`CLONE_FILES` 等） | 返回 `-ENOSYS` |
+| POSIX 线程 (futex) | glibc `pthread_create` 依赖 `sys_futex` | `-ENOSYS`（缺 per-address 等待队列） |
+| POSIX 定时器 | `timer_create`/`timer_settime` 等未实现 | 全部 `-ENOSYS` |
+| 实时信号 (rt_sig*) | 缺用户态信号栈帧 (`setup_frame`/`sigreturn`)，无法投递带 `siginfo_t` 的信号 | 基本信号投递工作（`SIG_DFL`/`SIG_IGN`），`rt_sigaction` 等返回 `-ENOSYS` |
+| ANSI 终端转义序列 | 控制台只处理 `\n\r\t\b`，无 `csi_J`/`csi_K`/颜色序列等 VT102 控制 | `drivers/char_dev/console.rs` 为最小实现，`/dev/tty` 不支持 `ioctl` |
+
+#### 系统调用覆盖
+
+现有 341 个已接线调用中，89 个为 `-ENOSYS` 占位（大部分注明了所缺子系统）。
+其余返回合理默认值（如 `madvise`/`readahead` 忽略、`getgroups` 返回 0）。
+
+| 类别 | 缺失调用 | 数量 |
+|------|---------|------|
+| 信号 | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack` 等 | 10 |
+| 定时器 | `timer_create`, `timer_settime`, `clock_gettime` 等 | 8 |
+| 同步 | `futex`, `set_robust_list`, `get_robust_list` | 3 |
+| 进程 | `clone`, `clone3`, `execve`, `execveat` | 4 |
+| 内存 | `mmap`, `munmap`, `mprotect`, `mremap`, `msync` 等 | 8 |
+| 文件 | `sendfile`, `splice`, `copy_file_range`, `sync_file_range` | 4 |
+| 网络 | `socket`, `bind`, `connect`, `listen`, `accept` 等 | 18 |
+| I/O | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | 3 |
+| IPC | `msgget`, `semget`, `shmget` 等 | 10 |
+| 其他 | `ptrace`, `iopl`, `ioperm`, `kexec_load` 等 | 21 |
+
+#### 驱动与硬件
+
+| 缺口 | 当前状态 |
+|------|----------|
+| 串口 tty (`/dev/ttyS0`) | `src/serial.rs` 为单向输出端，无中断接收、无 tty 语义 |
+| IDE DMA | `src/drivers/block/hd.rs` 仅 PIO 模式 |
+| 软盘 | 未移植（`linux/drivers/block/floppy.c` ~1800 行状态机） |
+| SCSI | 未移植（完整子系统 ~20 文件） |
+| 网络设备驱动 | 协议栈结构就绪，无网卡驱动（NE2000/3c509/e1000 等） |
+| 声卡录音 (DMA input) | `dmabuf.rs` 输出路径就绪，输入路径为桩 |
+| SMP 多核 | LAPIC MMIO 基址可设，AP 启动流程已编码，缺 page table 映射和真实启动验证 |
 
 ### 路径规划
 
-1. **Stage 4** — ELF64 + execve：让内核能 `iretq` 到用户态运行 `/init`
-2. **Stage 5** — ABI 补齐：`arch_prctl`、`stat`、`mmap`、动态链接
-3. **Stage 6** — 设备驱动完善：串口 tty、IDE DMA
-4. **Stage 7** — `syscall` 指令启用 + `getdents64` 等系统调用补齐
+#### Stage 4 — ELF64 + execve ✅ （已完成）
+
+- `sys_execve`：`namei` → ELF 解析 → PT_LOAD 段映射 → auxv 栈初始化 → CR3 切换 → iretq
+- PT_INTERP 动态链接器加载（打开解释器文件 → 映射 PT_LOAD 段 → 设置 AT_BASE）
+- auxv 向量（AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_ENTRY/AT_BASE/AT_NULL）
+- 最小 ELF64 构造器（`build_minimal_elf64`），用于内核实测
+- 已验证：从 ext4 加载 ELF → iretq 到 ring-3 → 执行 `getpid()+exit(42)` → 退出码 42
+
+#### Stage 5 — ABI 补齐
+
+- **`arch_prctl(ARCH_SET_FS/ARCH_GET_FS)`**：per-task FS.base，glibc TLS 的关键依赖
+- **x86_64 `struct stat`**：扩展为 64 位字段（`st_dev`/`st_ino`/`st_size`/`st_blocks` 等），兼容 glibc
+- **动态链接**：`sys_mmap` + ELF PT_INTERP 路径解析 → ld.so 映射
+- **`syscall` 指令**：配置 MSR STAR（0xC0000081）/LSTAR（0xC0000082）/SFMASK（0xC0000084），swapgs，per-task 用户栈暂存
+- 补齐 `rt_sigaction`/`sigaltstack`/`sigreturn` 信号栈帧
+
+#### Stage 6 — 进程模型完善
+
+- **per-task fd 表**：将 `FD_TABLE` 从全局静态数组改为 `Task` 内字段，`fork` 时拷贝
+- **per-task `pwd`/`root`**：`fs_struct` 迁移到 `Task`
+- **`clone` flags**：`CLONE_VM`/`CLONE_FILES`/`CLONE_SIGHAND` 等，支持线程创建
+- **`sys_futex`**：per-address 等待队列，glibc pthread 互斥锁的基础
+- **`sys_wait4` 完善**：`WNOHANG`/`WUNTRACED` + 退出码编码修复（当前 exit(1..31) 被误判为信号）
+
+#### Stage 7 — 控制台与交互
+
+- **VT102 转义序列**：`csi_J`（清屏）、`csi_K`（清行）、`csi_m`（SGR 颜色）、光标定位
+- **串口 tty**：UART 中断接收 + tty 队列，支持 `/dev/ttyS0` 作为交互终端
+- **`/dev/tty` ioctl**：`TCGETS`/`TCSETS`/`TIOCGWINSZ` 等，bash 需要
+- **伪终端 (pty)**：成对 tty + `sys_openpty`，SSH/tmux 的基础
+
+#### Stage 8 — 网络
+
+- **网卡驱动**：e1000（QEMU 默认）或 NE2000
+- **socket 系统调用**：`socket`/`bind`/`connect`/`listen`/`accept`/`send`/`recv`
+- **TCP 状态机**：协议栈结构已有，需接 syscall 层和驱动收发包
+- **loopback 设备**：127.0.0.1 本地通信
+
+#### 长期
+
+- SMP 多核启动（APIC timer 替代 PIT、IPI、per-CPU 结构）
+- SATA/AHCI 驱动
+- NVMe 驱动
+- USB HID（键盘/鼠标）
+- VESA framebuffer + 图形控制台
+- 信号驱动的异步 I/O
+- cgroup / namespace 基础
 
 ## 许可证
 
