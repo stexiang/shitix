@@ -165,6 +165,11 @@ pub struct Task {
 
     /// 退出码。原版 `int exit_code`
     pub exit_code: i32,
+
+    /// 当前工作目录 inode。原版 `struct inode * pwd`
+    pub pwd: usize,
+    /// 根目录 inode。原版 `struct inode * root`
+    pub root: usize,
 }
 
 impl Task {
@@ -196,6 +201,8 @@ impl Task {
             fs_base: 0,
             gs_base: 0,
             exit_code: 0,
+            pwd: usize::MAX,
+            root: usize::MAX,
         }
     }
 

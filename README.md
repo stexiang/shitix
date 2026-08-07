@@ -255,7 +255,8 @@ qemu-system-x86_64 \
 | `syscall` 指令入口 | ✓（MSR STAR/LSTAR/SFMASK 已配置，entry.S 就绪） |
 | `arch_prctl`（FS/GS base, TLS） | ✓（ARCH_SET_FS/GET_FS/GS 通过 wrmsr） |
 | x86_64 `struct stat` ABI | ✓（Stat64，144 字节，glibc 兼容） |
-| 动态链接器 (ld.so) | 结构支持（PT_INTERP 加载），mmap 待补 |
+| 动态链接器 (ld.so) | 需 `sys_mmap` 加载 ELF 段 | `mmap` 已实现，PT_INTERP 加载已就绪 |
+| VT102 终端 | bash 需要 ANSI 转义序列 | ✅ CSI J/K/m/A/B/C/D/H, ESC 7/8/c, 16 色 SGR |
 | 网络协议栈 | ARP/IP/ICMP/UDP/TCP 结构定义，未接驱动 |
 
 ### 已知限制
@@ -278,7 +279,7 @@ qemu-system-x86_64 \
 | POSIX 线程 (futex) | glibc `pthread_create` 依赖 `sys_futex` | `-ENOSYS`（缺 per-address 等待队列） |
 | POSIX 定时器 | `timer_create`/`timer_settime` 等未实现 | 全部 `-ENOSYS` |
 | 实时信号 (rt_sig*) | 缺用户态信号栈帧 (`setup_frame`/`sigreturn`)，无法投递带 `siginfo_t` 的信号 | 基本信号投递工作（`SIG_DFL`/`SIG_IGN`），`rt_sigaction` 等返回 `-ENOSYS` |
-| ANSI 终端转义序列 | 控制台只处理 `\n\r\t\b`，无 `csi_J`/`csi_K`/颜色序列等 VT102 控制 | `drivers/char_dev/console.rs` 为最小实现，`/dev/tty` 不支持 `ioctl` |
+| ANSI 终端转义序列 | 控制台已支持 VT102 子集（CSI J/K/m/A/B/C/D/H、ESC 7/8/c）、16 色 SGR | `drivers/char_dev/console.rs` 完整 CSI 状态机 |
 
 #### 系统调用覆盖
 
@@ -338,7 +339,7 @@ qemu-system-x86_64 \
 
 #### Stage 7 — 控制台与交互
 
-- **VT102 转义序列**：`csi_J`（清屏）、`csi_K`（清行）、`csi_m`（SGR 颜色）、光标定位
+- **VT102 转义序列** ✅ 完整 CSI 状态机：`CSI J`（清屏/清到屏尾）、`CSI K`（清行）、`CSI m`（16 色 SGR）、`CSI A/B/C/D`（光标移动）、`CSI H`（定位）、`ESC 7/8`（保存/恢复光标）、`ESC c`（复位）
 - **串口 tty**：UART 中断接收 + tty 队列，支持 `/dev/ttyS0` 作为交互终端
 - **`/dev/tty` ioctl**：`TCGETS`/`TCSETS`/`TIOCGWINSZ` 等，bash 需要
 - **伪终端 (pty)**：成对 tty + `sys_openpty`，SSH/tmux 的基础
