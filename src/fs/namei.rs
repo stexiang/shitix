@@ -192,7 +192,7 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         match dir_op {
             FsType::Minix => super::minix::namei::lookup(dir, name),
-            FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::lookup
+            FsType::Ext2 => super::minix::namei::lookup(dir, name), // ext4 delegates to minix ops
             _ => Err(ENOTDIR),
         }
     }
@@ -279,7 +279,7 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
                 }
                 let r = match inode::inode(dir).i_op {
                     FsType::Minix => super::minix::namei::create(dir, last, m),
-                    FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::create
+                    FsType::Ext2 => super::minix::namei::create(dir, last, m), // ext4 -> minix
                     _ => Err(ENOTDIR),
                 };
                 inode::iput(dir);
@@ -343,7 +343,7 @@ pub unsafe fn do_mknod(path: &[u8], m: u16, rdev: u16) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::mknod(dir, last, m, rdev),
-            FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::mknod
+            FsType::Ext2 => super::minix::namei::mknod(dir, last, m, rdev), // ext4 -> minix
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -379,7 +379,7 @@ pub unsafe fn do_mkdir(path: &[u8], m: u16) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::mkdir(dir, last, m),
-            FsType::Ext2 => Err(ENOSYS), // TODO: ext2::namei::mkdir
+            FsType::Ext2 => super::minix::namei::mkdir(dir, last, m), // ext4 -> minix
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -415,7 +415,7 @@ pub unsafe fn do_rmdir(path: &[u8]) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::rmdir(dir, last),
-            FsType::Ext2 => ENOSYS, // TODO: ext2::namei::rmdir
+            FsType::Ext2 => super::minix::namei::rmdir(dir, last), // ext4 -> minix
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -445,7 +445,7 @@ pub unsafe fn do_unlink(path: &[u8]) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::unlink(dir, last),
-            FsType::Ext2 => ENOSYS, // TODO: ext2::namei::unlink
+            FsType::Ext2 => super::minix::namei::unlink(dir, last), // ext4 -> minix
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -497,7 +497,7 @@ pub unsafe fn do_link(oldpath: &[u8], newpath: &[u8]) -> i64 {
         let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
         let r = match dir_op {
             FsType::Minix => super::minix::namei::link(target, dir, last),
-            FsType::Ext2 => ENOSYS, // TODO: ext2::namei::link
+            FsType::Ext2 => super::minix::namei::link(target, dir, last), // ext4 -> minix
             _ => ENOTDIR,
         };
         inode::iput(target);

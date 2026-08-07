@@ -40,6 +40,13 @@ use task::{HZ, STACK_MAGIC, flags};
 // fs/ 与 drivers/ 需要这几个名字；原版它们都在 sched.h 里公开。
 pub use task::{NR_TASKS, Task, TaskState};
 
+/// syscall 指令的栈暂存区（定义在 entry.S .bss）。
+mod syscall_scratch {
+    unsafe extern "C" {
+        pub static mut kernel_rsp_scratch: u64;
+    }
+}
+
 /// 任务表。对应原版 `struct task_struct * task[NR_TASKS] = {&init_task, }`。
 /// 原版是指针数组（槽位空 = NULL），我们是值数组（槽位空 = `TaskState::Unused`）。
 static mut TASKS: [Task; NR_TASKS] = [const { Task::empty() }; NR_TASKS];
@@ -300,6 +307,9 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
     if next_rsp0 != 0 {
         // SAFETY: next_rsp0 是 next 内核栈的栈顶，由创建时算好。
         unsafe { desc::set_rsp0(next_rsp0) }
+        // 同步更新 syscall_entry 的内核栈 scratch
+        unsafe { core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(syscall_scratch::kernel_rsp_scratch), next_rsp0) };
     }
 
     // 切页表。next_cr3==0 表示共用内核页表（启动 PML4=0x4000），
@@ -316,6 +326,26 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
             // 换页表影响之后所有内存访问，不能声明 nostack。
             core::arch::asm!("mov cr3, {}", in(reg) target_cr3,
                              options(preserves_flags));
+        }
+    }
+
+    // 切 FS/GS base（TLS）。只在值不同时才写 MSR。
+    // SAFETY: CPL=0，wrmsr 合法。
+    unsafe {
+        let tasks = &*core::ptr::addr_of_mut!(TASKS);
+        if tasks[prev].fs_base != tasks[next].fs_base {
+            core::arch::asm!("wrmsr",
+                in("ecx") 0xC000_0100u64,
+                in("eax") tasks[next].fs_base as u32,
+                in("edx") (tasks[next].fs_base >> 32) as u32,
+                options(nomem, nostack, preserves_flags));
+        }
+        if tasks[prev].gs_base != tasks[next].gs_base {
+            core::arch::asm!("wrmsr",
+                in("ecx") 0xC000_0101u64,
+                in("eax") tasks[next].gs_base as u32,
+                in("edx") (tasks[next].gs_base >> 32) as u32,
+                options(nomem, nostack, preserves_flags));
         }
     }
 

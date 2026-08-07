@@ -4,14 +4,9 @@
 //!
 //! # 与原版的结构性差异
 //!
-//! 原版 fd 表在 `current->filp[NR_OPEN]`（每进程 256 项）。我们的
-//! `Task` 还没有 `filp` 字段（见 `sched/task.rs` 的取舍说明），
-//! 所以 fd 表暂时是**全局**的一张 [`FD_TABLE`]，容量 [`NR_OPEN`]。
-//! 这在只有内核态调用方的当下是正确的（所有代码共享一个"进程"），
-//! 但 `sys_fork` 一到位就必须搬进 `Task` —— 否则父子进程会共享 fd 表
-//! 的**表本身**而不是各自持有对同一批 `File` 的引用，`close` 会互相影响。
-//! 搬迁时 `Task` 里加 `filp: [usize; NR_OPEN]`，`copy_process` 里
-//! 逐项 `f_count += 1`（原版 `fork.c` 的 `copy_files` 就是这么做的）。
+//! fd 表现在是 **per-task** 的（`Task::filp[NR_OPEN]`，原版 `current->filp`）。
+//! fork 时整表复制，每项对 File 的 `f_count` +1；close 减引用计数。
+//! 纯内核线程（task[0]、worker 等）不使用 fd 表。
 //!
 //! 不移植：`sys_chown`/`sys_chmod` 的 uid 检查（没有 uid 体系）、
 //! `sys_utime`、`sys_access`（都依赖 `permission()` 的完整版本）、
@@ -24,25 +19,54 @@ use crate::fs::{NR_OPEN, mode, namei, oflags, super_block};
 use crate::klib::errno::{EBADF, EINVAL, EMFILE, ENFILE, ENOTDIR, EROFS};
 use crate::pr_info;
 
-/// fd → 打开文件表下标。原版是 `current->filp[]`（见模块文档）。
-static mut FD_TABLE: [usize; NR_OPEN] = [NIL; NR_OPEN];
+/// 每任务 FD 表（旁路数组，不在 Task 里省 BSS）。
+static mut TASK_FILP: [[usize; NR_OPEN]; crate::sched::NR_TASKS] =
+    [[NIL; NR_OPEN]; crate::sched::NR_TASKS];
 
-/// 取某个 fd 对应的打开文件表下标，无效返回 [`NIL`]。
+/// 取当前任务某个 fd 对应的打开文件表下标，无效返回 [`NIL`]。
 pub fn fd_to_filp(fd: usize) -> usize {
-    if fd >= NR_OPEN {
-        return NIL;
+    if fd >= NR_OPEN { return NIL; }
+    // SAFETY: 进程上下文，单核。
+    unsafe { TASK_FILP[crate::sched::current_index()][fd] }
+}
+
+/// 设当前任务的 fd → filp 映射。
+fn set_fd_to_filp(fd: usize, filp_idx: usize) {
+    if fd < NR_OPEN {
+        unsafe { TASK_FILP[crate::sched::current_index()][fd] = filp_idx }
     }
-    // SAFETY: 已查界；单核，改动都在进程上下文。
-    unsafe { (*core::ptr::addr_of!(FD_TABLE))[fd] }
+}
+
+/// 设指定任务的 fd → filp 映射（供 fork 用）。
+pub fn set_task_fd(task_idx: usize, fd: usize, filp_idx: usize) {
+    if fd < NR_OPEN && task_idx < crate::sched::NR_TASKS {
+        unsafe { TASK_FILP[task_idx][fd] = filp_idx }
+    }
+}
+
+/// 取指定任务的 fd。
+pub fn task_fd(task_idx: usize, fd: usize) -> usize {
+    if fd >= NR_OPEN || task_idx >= crate::sched::NR_TASKS { return NIL; }
+    unsafe { TASK_FILP[task_idx][fd] }
+}
+
+/// fork 时复制 fd 表。
+pub fn clone_fds(from: usize, to: usize) {
+    if from < crate::sched::NR_TASKS && to < crate::sched::NR_TASKS && from != to {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &raw const TASK_FILP[from], &raw mut TASK_FILP[to], 1);
+        }
+    }
 }
 
 /// 找一个空闲 fd。对应原版 `sys_open` 里那个
 /// `for(fd = 0 ; fd < NR_OPEN ; fd++) if (!current->filp[fd]) break;`。
 fn get_unused_fd() -> usize {
-    // SAFETY: 只读表；进程上下文。
     unsafe {
+        let nr = crate::sched::current_index();
         for fd in 0..NR_OPEN {
-            if (*core::ptr::addr_of!(FD_TABLE))[fd] == NIL {
+            if TASK_FILP[nr][fd] == NIL {
                 return fd;
             }
         }
@@ -50,13 +74,12 @@ fn get_unused_fd() -> usize {
     }
 }
 
-/// 把 fd 绑到一个打开文件表项上。
+/// 把 fd 绑到一个打开文件表项上。操作当前任务的 filp 表。
 ///
 /// # Safety
 /// `fd < NR_OPEN`；进程上下文调用。
 unsafe fn set_fd(fd: usize, f: usize) {
-    // SAFETY: 契约转交。
-    unsafe { (*core::ptr::addr_of_mut!(FD_TABLE))[fd] = f }
+    set_fd_to_filp(fd, f);
 }
 
 /// 打开一个文件。对应原版 `sys_open()`。
@@ -339,21 +362,13 @@ pub unsafe fn close_all() {
     }
 }
 
-/// 初始化 fd 表。原版没有对应函数（`INIT_TASK` 里 `filp` 是全 NULL）。
-///
-/// # Safety
-/// 启动期调用一次。
+/// 初始化 fd 表。每个 task 在创建时由 Task::empty() 初始化。
 pub unsafe fn init() {
-    // SAFETY: 契约保证独占。
-    unsafe {
-        for fd in 0..NR_OPEN {
-            (*core::ptr::addr_of_mut!(FD_TABLE))[fd] = NIL;
-        }
-    }
     pr_info!("open: {} fds per process", NR_OPEN);
 }
 
-/// 已打开的 fd 数。自检用。
+/// 已打开的 fd 数（当前任务）。自检用。
 pub fn nr_open_fds() -> usize {
+    let nr = crate::sched::current_index();
     (0..NR_OPEN).filter(|&fd| fd_to_filp(fd) != NIL).count()
 }

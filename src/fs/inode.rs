@@ -405,8 +405,13 @@ unsafe fn read_inode(n: usize) {
         lock_inode(n);
         let sb_nr = inode(n).i_sb;
         if sb_nr != NIL {
-            // 原版是 s_op->read_inode 这个函数指针；我们只有 minix
-            super::minix::read_inode(n);
+            let magic = super::super_block::sb(sb_nr).s_magic;
+            if magic == 0xEF53 {
+                // ext4: 已在 ext4::ops::read_super 中预填，或后续从磁盘读取
+                // 当前阶段：root inode 已由 read_super 初始化
+            } else {
+                super::minix::read_inode(n);
+            }
         }
         unlock_inode(n);
     }

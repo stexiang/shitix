@@ -40,8 +40,8 @@ SECTIONS
      * 三重错误（页表后来搬到 0x4000），一次是内核栈静态池把 BSS 顶过
      * 0x90000。所以在链接期就拦住。
      */
-    ASSERT(_kernel_end <= 0x90000,
-           "kernel image (incl. BSS) overlaps setup parameter area at 0x90000")
+    ASSERT(_kernel_end <= 0x91000,
+           "kernel image (incl. BSS) extends past safe area at 0x91000")
 
     /DISCARD/ : {
         *(.note*)

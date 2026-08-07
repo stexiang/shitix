@@ -282,6 +282,7 @@
 | 17:22 | ext4 selftest 体积超限修复：_kernel_end 0x934F0→0x8A4F0（23KB 余量）；selftest.rs 重写为零 format_args!（42KB→8KB 对象文件）；新增 Ext4SuperBlock::from_slice(&[u8])；修 gd 64bit hi 字节偏移；51/51 全通过 | src/fs/ext4/selftest.rs, src/fs/ext4/super_block.rs | PASS | ~25k |
 | 22:15 | Stage 2 完成：signal/exit/fork/wait4 | src/signal.rs, src/exit.rs, src/syscall/sys.rs, boot/entry.S, src/traps.rs, src/lib.rs | fork selftest ok + 全自检绿色 | ~38k |
 | 23:50 | Stage 3 完成：用户态 ring-3 往返 | src/mm/paging.rs, src/mm/area.rs, src/umm/mod.rs, src/sched/task.rs, src/syscall/sys.rs, src/exit.rs, src/sched/mod.rs, src/traps.rs, src/lib.rs | iretq→user code→int 0x80→exit(42)→wait4 全链条通过，SHITIX_BOOT_OK | ~50k |
+| 15:30 | Stage 4 完成：ELF64+execve+完整用户态ABI | src/elf/mod.rs, src/fs/stat.rs, src/fs/open.rs, src/fs/mod.rs, src/mm/paging.rs, src/sched/task.rs, src/sched/mod.rs, src/signal.rs, src/syscall/sys.rs, src/lib.rs | ELF64解析+execve加载+ring3运行+exit(0)；brk/mmap/arch_prctl/rt_sig*/Stat64实现；per-task FD；信号帧setup_frame；_kernel_end=0x8F530(2.7KB) | ~65k |
 | 22:15 | Stage 2 完成：signal/exit/fork/wait4 | src/signal.rs, src/exit.rs, src/syscall/sys.rs, boot/entry.S, src/traps.rs, src/lib.rs | fork selftest ok + 全自检绿色 | ~38k |
 
 ## Session: 2026-08-06 02:12
@@ -300,6 +301,26 @@
 |------|--------|---------|---------|--------|
 
 ## Session: 2026-08-06 04:36
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:24
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:25
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:26
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:28
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|

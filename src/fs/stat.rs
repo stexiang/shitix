@@ -52,6 +52,65 @@ pub struct Stat {
     pub __unused5: u32,
 }
 
+/// x86_64 `struct stat`（兼容 glibc）。144 字节。
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Stat64 {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i64; 3],
+}
+
+impl Stat64 {
+    pub const fn zeroed() -> Self {
+        Stat64 {
+            st_dev: 0, st_ino: 0, st_nlink: 0, st_mode: 0,
+            st_uid: 0, st_gid: 0, __pad0: 0, st_rdev: 0,
+            st_size: 0, st_blksize: 0, st_blocks: 0,
+            st_atime: 0, st_atime_nsec: 0,
+            st_mtime: 0, st_mtime_nsec: 0,
+            st_ctime: 0, st_ctime_nsec: 0,
+            __unused: [0; 3],
+        }
+    }
+
+    /// 从 inode 填充 Stat64。
+    /// # Safety
+    /// `inr` 必须是有效 inode 号。
+    pub unsafe fn from_inode(inr: usize) -> Option<Self> {
+        // SAFETY: 契约转交。
+        let ip = unsafe { crate::fs::inode::iget(inr, 0) };
+        if ip == crate::fs::inode::NIL {
+            return None;
+        }
+        let mut s = Self::zeroed();
+        s.st_ino = inr as u64;
+        s.st_nlink = unsafe { (*crate::fs::inode::inode(ip)).i_nlink as u64 };
+        s.st_mode = unsafe { (*crate::fs::inode::inode(ip)).i_mode as u32 };
+        s.st_uid = unsafe { (*crate::fs::inode::inode(ip)).i_uid as u32 };
+        s.st_gid = unsafe { (*crate::fs::inode::inode(ip)).i_gid as u32 };
+        s.st_size = unsafe { (*crate::fs::inode::inode(ip)).i_size as i64 };
+        s.st_blksize = 1024;
+        s.st_blocks = (s.st_size + 511) / 512;
+        Some(s)
+    }
+}
+
 impl Stat {
     pub const fn zeroed() -> Self {
         Stat {

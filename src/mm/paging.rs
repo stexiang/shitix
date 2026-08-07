@@ -266,25 +266,28 @@ pub fn alloc_pml4() -> usize {
     p
 }
 
-/// 在新分配的用户 PML4 里共享内核的 PDPT[0]→PD 映射。
+/// 在新分配的用户 PML4 里建立内核映射。
 ///
-/// 把启动页表（`boot_pml4`）的 PML4[0] 条目拷贝到 `dst_pml4`，
-/// 使内核可以通过 `dst_pml4` 继续访问 0..1GB 的恒等映射范围（无 USER 位）。
-/// 用户进程会有**独立**的 user_pdpt 页来映射用户空间（PML4[0] 内的 PDPT[1+]）。
+/// 分配一个干净的 PDPT 页，PDPT[0] = kernel_pd(0x6000) | PRESENT | RW（无 USER），
+/// 其他 PDPT 条目为 0（供用户空间使用，隔离各进程的用户页表子树）。
 ///
-/// 返回 false 表示 `dst_pml4 == 0` 或启动页表不可读。
+/// 返回 false 表示 `dst_pml4 == 0` 或内存不足。
 pub fn clone_kernel_pdpt(dst_pml4: usize) -> bool {
     if dst_pml4 == 0 {
         return false;
     }
-    // SAFETY：启动 PML4 在 0x4000，恒等映射内可读；dst_pml4 同理。
+    // 分配一个独立的 PDPT 页，避免与启动 PDPT(0x5000) 共享
+    // 从而隔离各进程的用户页表子树。
+    let pdpt = get_free_page();
+    if pdpt == 0 {
+        return false;
+    }
+    // SAFETY：dst_pml4 / pdpt 在恒等映射内可写。
     unsafe {
-        let boot_entry = entry(0x4000, 0);
-        if boot_entry & flags::PRESENT == 0 {
-            return false;
-        }
-        // 拷贝 PML4[0] 条目而不带 USER 位。
-        set_entry(dst_pml4, 0, boot_entry & !flags::USER);
+        // PML4[0] → 新的 PDPT（先不设 USER，等 map_page 需要时再加）
+        set_entry(dst_pml4, 0, pdpt as u64 | flags::PRESENT | flags::RW);
+        // PDPT[0] → 内核 PD(0x6000)，无 USER
+        set_entry(pdpt, 0, 0x6000u64 | flags::PRESENT | flags::RW);
     }
     true
 }

@@ -345,6 +345,119 @@ pub fn print_elf_info(header: &Elf32Header) {
         header.e_phoff, header.e_phnum, header.e_phentsize);
 }
 
+// =============================================================================
+// ELF64
+// =============================================================================
+
+/// 解析 64 位 ELF 文件头
+pub fn parse_elf64(data: &[u8]) -> Result<Elf64Header, ElfError> {
+    if data.len() < 64 {
+        return Err(ElfError::InvalidHeader);
+    }
+
+    let ident: [u8; 16] = data[..16].try_into().unwrap();
+
+    if !verify_magic(&ident) {
+        return Err(ElfError::InvalidMagic);
+    }
+    if elf_class(&ident) != ElfClass::ELF64 {
+        return Err(ElfError::InvalidClass);
+    }
+    if elf_data(&ident) != ElfData::LittleEndian {
+        return Err(ElfError::InvalidData);
+    }
+    if elf_version(&ident) != 1 {
+        return Err(ElfError::InvalidVersion);
+    }
+
+    let e_type = u16::from_le_bytes([data[16], data[17]]);
+    let e_machine = u16::from_le_bytes([data[18], data[19]]);
+    let e_version = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+    let e_entry = u64::from_le_bytes(data[24..32].try_into().unwrap());
+    let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap());
+    let e_shoff = u64::from_le_bytes(data[40..48].try_into().unwrap());
+    let e_flags = u32::from_le_bytes([data[48], data[49], data[50], data[51]]);
+    let e_ehsize = u16::from_le_bytes([data[52], data[53]]);
+    let e_phentsize = u16::from_le_bytes([data[54], data[55]]);
+    let e_phnum = u16::from_le_bytes([data[56], data[57]]);
+    let e_shentsize = u16::from_le_bytes([data[58], data[59]]);
+    let e_shnum = u16::from_le_bytes([data[60], data[61]]);
+    let e_shstrndx = u16::from_le_bytes([data[62], data[63]]);
+
+    Ok(Elf64Header {
+        e_ident: ident,
+        e_type,
+        e_machine,
+        e_version,
+        e_entry,
+        e_phoff,
+        e_shoff,
+        e_flags,
+        e_ehsize,
+        e_phentsize,
+        e_phnum,
+        e_shentsize,
+        e_shnum,
+        e_shstrndx,
+    })
+}
+
+/// 解析 64 位程序头（56 字节）
+pub fn parse_phdr64(data: &[u8], offset: usize) -> Result<Elf64Phdr, ElfError> {
+    let end = offset + 56;
+    if data.len() < end {
+        return Err(ElfError::InvalidProgramHeader);
+    }
+    let d = &data[offset..end];
+
+    Ok(Elf64Phdr {
+        p_type:   u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+        p_flags:  u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
+        p_offset: u64::from_le_bytes(d[8..16].try_into().unwrap()),
+        p_vaddr:  u64::from_le_bytes(d[16..24].try_into().unwrap()),
+        p_paddr:  u64::from_le_bytes(d[24..32].try_into().unwrap()),
+        p_filesz: u64::from_le_bytes(d[32..40].try_into().unwrap()),
+        p_memsz:  u64::from_le_bytes(d[40..48].try_into().unwrap()),
+        p_align:  u64::from_le_bytes(d[48..56].try_into().unwrap()),
+    })
+}
+
+/// 验证 64 位 ELF 是否可执行
+pub fn is_executable64(header: &Elf64Header) -> Result<ElfType, ElfError> {
+    let elf_type = match header.e_type {
+        2 => ElfType::Executable,
+        3 => ElfType::Shared,
+        _ => return Err(ElfError::InvalidType),
+    };
+    if header.e_machine != 62 {
+        return Err(ElfError::InvalidMachine);
+    }
+    if elf_type == ElfType::Executable && header.e_entry == 0 {
+        return Err(ElfError::InvalidHeader);
+    }
+    Ok(elf_type)
+}
+
+/// 快速检测是否为有效的 x86_64 ELF64
+pub fn is_valid_elf64(data: &[u8]) -> bool {
+    data.len() >= 64
+        && data[0] == 0x7F && data[1] == b'E' && data[2] == b'L' && data[3] == b'F'
+        && data[4] == 2  // ELF64
+        && data[5] == 1  // LE
+        && u16::from_le_bytes([data[18], data[19]]) == 62  // x86_64
+}
+
+/// PF_* → page protection 标志转换
+pub fn phdr_prot_to_flags(p_flags: u32) -> u64 {
+    use crate::mm::paging::flags;
+    let mut prot = flags::USER;
+    if p_flags & 1 != 0 { prot |= flags::PRESENT; }    // PF_X
+    if p_flags & 2 != 0 { prot |= flags::RW; }          // PF_W
+    if p_flags & 4 != 0 { prot |= flags::PRESENT; }     // PF_R: 只读也是 present
+    if prot & flags::PRESENT == 0 { prot |= flags::PRESENT; } // 兜底
+    prot
+}
+
 /// 检查是否为有效的 ELF 文件
 pub fn is_valid_elf(data: &[u8]) -> bool {
     if data.len() < 52 {

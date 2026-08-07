@@ -675,6 +675,56 @@ pub fn clone_sigactions(from: usize, to: usize) {
 // Signal Delivery
 // =============================================================================
 
+/// 在用户栈上搭信号帧，使 `iretq` 回到用户态时跳转进 handler。
+///
+/// 帧布局（从高到低）：
+///   [原用户栈]
+///   [sigreturn 蹦床: mov $15,%eax; int $0x80; ret]    ← 8 B
+///   [saved rip] (8 B)
+///   [saved cs]  (8 B)
+///   [saved rflags] (8 B)
+///   [saved rsp] (8 B)
+///   [saved ss]  (8 B)                                   ← 新 rsp = 这里
+///
+/// # Safety
+/// `regs` 必须指向当前任务内核栈顶的 pt_regs。
+unsafe fn setup_frame(regs: *mut crate::traps::PtRegs, signum: u32, handler: extern "C" fn(u32)) {
+    use crate::desc::selector::{USER_CS, USER_DS};
+
+    // SAFETY: 契约转交。
+    unsafe {
+        let r = &mut *regs;
+
+        // 计算信号帧在用户栈上的位置（rsp 往下放 64 字节）
+        let frame_sp = (r.rsp - 64) & !0xF; // 16 字节对齐
+
+        // 1. 写 sigreturn 蹦床到用户栈
+        let trampoline: [u8; 8] = [0xb8, 0x0f, 0x00, 0x00, 0x00, // mov eax, 15
+                                   0xcd, 0x80,                     // int 0x80
+                                   0xc3];                          // ret
+        // 蹦床在上，saved regs 在下
+        let tramp_addr = frame_sp + 40; // 5 个 saved qwords = 40 字节后
+        // SAFETY: 恒等映射可写；用户页表映射了这些页。
+        core::ptr::copy_nonoverlapping(trampoline.as_ptr(), tramp_addr as *mut u8, 8);
+
+        // 2. 保存当前 pt_regs 的关键字段到用户栈
+        let save = frame_sp as *mut u64;
+        core::ptr::write_volatile(save.add(0), r.ss);     // [frame_sp +  0] saved ss
+        core::ptr::write_volatile(save.add(1), r.rsp);    // [frame_sp +  8] saved rsp
+        core::ptr::write_volatile(save.add(2), r.rflags); // [frame_sp + 16] saved rflags
+        core::ptr::write_volatile(save.add(3), r.cs);     // [frame_sp + 24] saved cs
+        core::ptr::write_volatile(save.add(4), r.rip);    // [frame_sp + 32] saved rip
+
+        // 3. 改写 pt_regs：下一次 iretq 会跳到 handler
+        r.rip = handler as u64;
+        r.cs = USER_CS as u64;
+        r.rflags = 0x202;  // IF=1
+        r.rsp = frame_sp;
+        r.ss = USER_DS as u64;
+        r.rdi = signum as u64; // 第一个参数 = 信号号
+    }
+}
+
 /// 投递待处理信号。由 `entry.S:ret_from_sys_call` 在返回用户态前调用，
 /// 对应原版 `ret_from_sys_call` 里那句 `call _do_signal`。
 ///
@@ -689,7 +739,6 @@ pub fn clone_sigactions(from: usize, to: usize) {
 /// 的位置调用。`regs` 必须指向当前内核栈顶那份 pt_regs。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn do_signal(regs: *mut crate::traps::PtRegs) {
-    let _ = regs; // 有了用户态信号帧之后要用它改 rip/rsp
     let nr = sched::current_index();
 
     // SAFETY: nr 来自 current_index()，槽位必然有效。
@@ -724,14 +773,10 @@ pub unsafe extern "C" fn do_signal(regs: *mut crate::traps::PtRegs) {
             if h as usize == ign as usize {
                 continue;
             }
-            // 自定义 handler。缺用户态信号帧，先按「终止」处理（见函数文档）。
-            crate::pr_warn!(
-                "do_signal: pid {} sig {} has a handler but user frames are not implemented; terminating",
-                // SAFETY: 只读。
-                unsafe { (*task).pid },
-                signum
-            );
-            crate::exit::do_exit(signum as i32);
+            // 自定义 handler：在用户栈上搭信号帧
+            // SAFETY: regs 指向当前内核栈上的 pt_regs。
+            unsafe { setup_frame(regs, signum, h) };
+            continue; // 已设好帧，返回用户态后 handler 会跑
         }
 
         // SIG_DFL：按原版 do_signal 的 default 分支分类。

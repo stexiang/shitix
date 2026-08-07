@@ -46,6 +46,9 @@ pub mod feature;
 pub mod group_desc;
 pub mod dir;
 pub mod selftest;
+pub mod bitmap;
+pub mod ops;
+pub mod mkfs;
 
 // Re-exports
 pub use super_block::{Ext4SuperBlock, Ext4FeatureFlags};
@@ -54,6 +57,7 @@ pub use extent::{ExtentHeader, ExtentIdx, Extent, ExtentNode};
 pub use feature::Ext4Features;
 pub use group_desc::Ext4GroupDesc;
 pub use dir::{Ext4DirEntry, DirIter};
+pub use ops::read_super;
 
 /// ext4 文件类型
 pub mod file_type {

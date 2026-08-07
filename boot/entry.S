@@ -286,17 +286,25 @@ system_call:
  * syscall 指令入口（x86_64 特有，原版没有）。
  * 进入时：rcx = 用户 rip，r11 = 用户 rflags，且**没有换栈**——
  * 必须自己从 TSS 里取内核栈。原版 int 0x80 由 CPU 通过 TSS.ss0/esp0 换栈，
- * 这里要手工做。
- *
- * 暂未启用（需要 per-cpu 的用户栈暂存位置，等 sched 的 percpu 就位）。
- * 保留符号以便 syscall::init 决定是否写 MSR_LSTAR。
- */
-    .global syscall_entry
-syscall_entry:
-    /* 目前 MSR_LSTAR 未指向这里，走到这说明配置错了，直接停机比乱跑安全 */
-    cli
-    hlt
-    jmp     syscall_entry
+	 * 这里要手工换栈 + swapgs。
+	 * 用全局 scratch 变量代替 per-cpu 区域存用户 RSP，
+	 * kernel_rsp_scratch 在 switch_to_task 里更新。
+	 */
+	    .global syscall_entry
+	syscall_entry:
+	    swapgs
+	    movq    %rsp, user_rsp_scratch(%rip)
+	    movq    kernel_rsp_scratch(%rip), %rsp
+	    pushq   $0x23
+	    pushq   user_rsp_scratch(%rip)
+	    pushq   %r11
+	    pushq   $0x1B
+	    pushq   %rcx
+	    pushq   %rax
+	    cld
+	    SAVE_ALL
+	    call    do_syscall
+	    jmp     ret_from_sys_call
 
 /* ---- 返回路径（对应原版 ret_from_sys_call）---- */
 
@@ -463,3 +471,13 @@ kernel_thread_entry:
     cli
 1:  hlt
     jmp     1b
+
+/* ---- syscall scratch 变量 ---------------------------------- */
+    .section .bss
+    .align 8
+    .global user_rsp_scratch
+user_rsp_scratch:
+    .quad 0
+    .global kernel_rsp_scratch
+kernel_rsp_scratch:
+    .quad 0

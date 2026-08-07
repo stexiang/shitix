@@ -172,13 +172,17 @@ pub unsafe fn check_mounted(n: usize) {
         let p = sb_ptr(n);
         let ds = core::ptr::read_volatile(core::ptr::addr_of!((*p).s_dirsize));
         let nl = core::ptr::read_volatile(core::ptr::addr_of!((*p).s_namelen));
-        assert!(
-            (ds == 16 && nl == 14) || (ds == 32 && nl == 30),
-            "sb({}): dirsize/namelen corrupt: {}/{} (s_dev={:#06x} magic={:#x})",
-            n, ds, nl,
-            core::ptr::read_volatile(core::ptr::addr_of!((*p).s_dev)),
-            core::ptr::read_volatile(core::ptr::addr_of!((*p).s_magic))
-        );
+        let magic = core::ptr::read_volatile(core::ptr::addr_of!((*p).s_magic));
+        // ext4 没有 dirsize/namelen 概念，只校验 minix
+        if magic != 0xEF53 {
+            assert!(
+                (ds == 16 && nl == 14) || (ds == 32 && nl == 30),
+                "sb({}): dirsize/namelen corrupt: {}/{} (s_dev={:#06x} magic={:#x})",
+                n, ds, nl,
+                core::ptr::read_volatile(core::ptr::addr_of!((*p).s_dev)),
+                magic
+            );
+        }
     }
 }
 
@@ -458,9 +462,12 @@ pub unsafe fn read_super(dev: u16, flags: u64, silent: bool) -> usize {
             }
         }
 
-        if !super::minix::read_super(n, silent) {
-            (*sb_ptr(n)).s_dev = 0;
-            return NIL;
+        // 先试 ext4，再试 minix
+        if !super::ext4::ops::read_super(n, silent) {
+            if !super::minix::read_super(n, silent) {
+                (*sb_ptr(n)).s_dev = 0;
+                return NIL;
+            }
         }
         n
     }
@@ -554,7 +561,7 @@ pub unsafe fn mount_root(dev: u16, flags: u64) -> bool {
         check_mounted(n);
 
         pr_info!(
-            "VFS: Mounted root (minix filesystem){}.",
+            "VFS: Mounted root{}.",
             if flags & MS_RDONLY != 0 { " readonly" } else { "" }
         );
         true

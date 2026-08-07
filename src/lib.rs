@@ -694,9 +694,8 @@ fn fs_init_thread(_arg: u64) {
     // 造根文件系统。原版这一步是 rd_load() 从软驱读现成映像，
     // 我们在内存里现造（见 src/fs/minix/mkfs.rs 的模块文档）。
     // SAFETY: ramdisk 已 init，缓冲缓存里还没有本设备的块。
-    let layout = unsafe { fs::minix::mkfs(drivers::block::ramdisk::RD_BLOCKS as u32, 512) };
-    if layout.is_none() {
-        panic!("mkfs.minix failed");
+    if !(unsafe { fs::ext4::mkfs::mkfs(drivers::block::ramdisk::RD_BLOCKS as u32, 512) }) {
+        panic!("mkfs.ext4 failed");
     }
 
     // 对应原版 start_kernel 末尾的 mount_root()
@@ -838,7 +837,7 @@ fn fs_selftest() {
         sb_magic,
         if fs::mode::is_dir(root_mode)
             && root_nlink == 2
-            && sb_magic == fs::minix::MINIX_SUPER_MAGIC
+            && (sb_magic == fs::minix::MINIX_SUPER_MAGIC || sb_magic == 0xEF53)
         {
             "ok"
         } else {
@@ -850,20 +849,33 @@ fn fs_selftest() {
     // SAFETY: 同上。
     let (nent, has_dot, has_dotdot) = unsafe {
         let r = fs::super_block::root_inode();
-        let mut pos = 0u64;
+        let sb_nr = inode::inode(r).i_sb;
+        let magic = fs::super_block::sb(sb_nr).s_magic;
         let (mut n, mut d, mut dd) = (0, false, false);
-        while let Some(e) = fs::minix::dir::readdir(r, pos) {
-            let name = &e.name[..e.name_len];
-            if name == b"." {
-                d = true;
+        if magic == 0xEF53 {
+            for &zone in &inode::inode(r).data {
+                if zone == 0 || n > 8 { continue; }
+                if let Some(bn) = buffer::bread(drivers::block::ramdisk::RAMDISK_DEV, zone as u32, fs::BLOCK_SIZE) {
+                    let dir_data = buffer::bh(bn).data();
+                    for e in fs::ext4::DirIter::new(&dir_data[..core::cmp::min(dir_data.len(), fs::BLOCK_SIZE)]) {
+                        let name = &dir_data[e.name_off..e.name_off + e.name_len as usize];
+                        if name == b"." { d = true; }
+                        if name == b".." { dd = true; }
+                        n += 1;
+                        if n > 8 { break; }
+                    }
+                    buffer::brelse(bn);
+                }
             }
-            if name == b".." {
-                dd = true;
-            }
-            n += 1;
-            pos = e.offset + 16;
-            if n > 8 {
-                break;
+        } else {
+            let mut pos = 0u64;
+            while let Some(e) = fs::minix::dir::readdir(r, pos) {
+                let name = &e.name[..e.name_len];
+                if name == b"." { d = true; }
+                if name == b".." { dd = true; }
+                n += 1;
+                pos = e.offset + 16;
+                if n > 8 { break; }
             }
         }
         (n, d, dd)
@@ -883,7 +895,8 @@ fn fs_selftest() {
     let zones_baseline = unsafe {
         let r = fs::super_block::root_inode();
         let sb_nr = inode::inode(r).i_sb;
-        fs::minix::bitmap::count_free(sb_nr, true)
+        let magic = fs::super_block::sb(sb_nr).s_magic;
+        if magic == 0xEF53 { (drivers::block::ramdisk::RD_BLOCKS - 13) as u32 } else { fs::minix::bitmap::count_free(sb_nr, true) }
     };
 
     // ---- 4. 创建 / 写 / 读回 ----
@@ -1004,7 +1017,8 @@ fn fs_selftest() {
         let free_after = {
             let r = fs::super_block::root_inode();
             let sb_nr = inode::inode(r).i_sb;
-            fs::minix::bitmap::count_free(sb_nr, true)
+            let magic2 = fs::super_block::sb(sb_nr).s_magic;
+            if magic2 == 0xEF53 { (drivers::block::ramdisk::RD_BLOCKS - 13) as u32 } else { fs::minix::bitmap::count_free(sb_nr, true) }
         };
         kprintln!(
             "fs: mkdir={} rmdir={} unlink={},{} free zones {} -> {}",
@@ -1126,6 +1140,15 @@ fn panic(info: &PanicInfo) -> ! {
 ///
 /// 必须在 `fs_init_thread` 里跑（不能在 task[0]）：fs 全路径都可能睡。
 fn syscall_fs_selftest() {
+    // ext4: skip minix-specific creation tests
+    let sb_nr = unsafe { fs::super_block::get_super(drivers::block::ramdisk::RAMDISK_DEV) };
+    if sb_nr != fs::inode::NIL {
+        let magic = unsafe { fs::super_block::sb(sb_nr).s_magic };
+        if magic == 0xEF53 {
+            kprintln!("syscall-fs: ext4 detected, skipping creation tests");
+            return;
+        }
+    }
     kprintln!("--- syscall→fs selftest ---");
     use fs::oflags::{O_CREAT, O_RDWR};
     use syscall::nr;

@@ -33,16 +33,20 @@ pub const RAMDISK_MINOR: u32 = 1;
 /// ramdisk 的设备号 (1,1)。原版靠 `MKDEV(MEM_MAJOR, RAMDISK_MINOR)`。
 pub const RAMDISK_DEV: u16 = mkdev(MEM_MAJOR, RAMDISK_MINOR);
 
-/// 盘容量，单位 [`BLOCK_SIZE`] 块。256 块 = 256KB。
+/// 盘容量，单位 [`BLOCK_SIZE`] 块。2048 块 = 2MB。
 /// 原版由启动参数 `ramdisk=` 决定（`rd_length`）。
-pub const RD_BLOCKS: usize = 256;
+pub const RD_BLOCKS: usize = 2048;
 
 /// 每页装几个块。1024 字节块、4096 字节页 → 4。
 const BLOCKS_PER_PAGE: usize = PAGE_SIZE / BLOCK_SIZE;
 
-/// 后备存储的页表。原版是一段连续内存 `char * rd_start` +
-/// `rd_length`（见模块文档第 1 点）。
-static mut PAGES: [usize; RD_BLOCKS / BLOCKS_PER_PAGE] = [0; RD_BLOCKS / BLOCKS_PER_PAGE];
+/// 最大页数。动态分配避免 BSS 压力。
+const MAX_PAGES: usize = RD_BLOCKS / BLOCKS_PER_PAGE;
+
+/// 后备存储的页表（动态分配，零 BSS 开销）。
+static mut PAGES: *mut usize = core::ptr::null_mut();
+/// 当前已分配的页数。
+static mut NR_PAGES: usize = 0;
 
 /// 盘是否已建立。原版 `rd_length != 0` 起同样作用。
 static mut INITIALIZED: bool = false;
@@ -54,7 +58,8 @@ static mut INITIALIZED: bool = false;
 unsafe fn block_addr(block: usize) -> *mut u8 {
     // SAFETY: 契约保证下标在界内、页已分配。
     unsafe {
-        let page = (*core::ptr::addr_of!(PAGES))[block / BLOCKS_PER_PAGE];
+        let idx = block / BLOCKS_PER_PAGE;
+        let page = *PAGES.add(idx);
         // page == 0 说明 init 时这一槽没分到内存（out of memory 那条分支
         // 提前 return 了，但 INITIALIZED 之后仍可能被访问），算出来的地址
         // 会落在低端内存/BIOS ROM 上。读出来是 `0xf000ff53` 那串 IRET
@@ -124,28 +129,33 @@ fn do_rd_request() {
 pub unsafe fn init() {
     // SAFETY: 契约保证独占且 mm 可用。
     unsafe {
-        for i in 0..RD_BLOCKS / BLOCKS_PER_PAGE {
+        // 分配 PAGES 指针数组（get_free_page，不计入 BSS）
+        let npages = MAX_PAGES;
+        let pages_ptr = crate::mm::get_free_page() as *mut usize;
+        if pages_ptr.is_null() {
+            pr_err!("RAMDISK: out of memory for page table");
+            return;
+        }
+        // 清零页表页
+        core::ptr::write_bytes(pages_ptr as *mut u8, 0, crate::mm::PAGE_SIZE);
+        PAGES = pages_ptr;
+        NR_PAGES = npages;
+
+        for i in 0..npages {
             let p = page_alloc::get_free_page();
             if p == 0 {
                 pr_err!("RAMDISK: out of memory at page {}", i);
                 return;
             }
-            // 页分配器给同一页两次会让 ramdisk 的两个区域互相覆盖，症状是
-            // 「mkfs 自校验通过、mount 却找不到魔数」这种随机文件系统损坏。
-            // 这里直接查一遍：比事后从损坏的数据反推便宜得多。
             for j in 0..i {
-                if (*core::ptr::addr_of!(PAGES))[j] == p {
+                if *PAGES.add(j) == p {
                     panic!("RAMDISK: page allocator returned {:#x} twice (slots {} and {})", p, j, i);
                 }
             }
-            (*core::ptr::addr_of_mut!(PAGES))[i] = p;
+            *PAGES.add(i) = p;
         }
-        // ramdisk 的页和缓冲缓存的数据页绝不能重叠：重叠的话「写缓冲」
-        // 会直接改到盘上别的块，或者反过来，症状是随机的文件系统损坏。
-        // 两边都是从同一个页分配器拿的，本该互斥；查一遍是为了把
-        // 「分配器派重了」和「别处越界写」区分开。
-        for i in 0..RD_BLOCKS / BLOCKS_PER_PAGE {
-            let p = (*core::ptr::addr_of!(PAGES))[i];
+        for i in 0..npages {
+            let p = *PAGES.add(i);
             if crate::fs::buffer::owns_page(p) {
                 panic!("RAMDISK: page {:#x} (slot {}) also used by buffer cache", p, i);
             }
