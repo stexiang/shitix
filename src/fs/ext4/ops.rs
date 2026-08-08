@@ -262,13 +262,180 @@ pub mod full {
     }
 
     /// bmap: 逻辑块 → 物理块映射。
-    /// 使用 `data[0..8]` 作为直接块指针（同 minix zones 模型）。
+    ///
+    /// `block` 以 1024 字节为单位（与 `ext4_file_read` 的 `bs = block_size = 1024`
+    /// 一致）。重新从磁盘读 inode，遍历 extent 树（或经典直接/间接块指针）
+    /// 得到物理块号，避免 `i.data[0..9]` 只能记 9 个直接块的局限——大文件
+    /// （如 /bin/sh）超出前 9 个逻辑块后旧实现返回 0，导致 execve 读到全零页。
     pub unsafe fn bmap(ip: usize, block: u32, _create: bool) -> u32 {
+        unsafe { bmap_phys(ip, block) }
+    }
+
+    /// 读磁盘 inode 的原始 60 字节 `i_block` 区。失败返 `None`。
+    unsafe fn read_inode_iblock(ip: usize) -> Option<([u8; 60], usize, u16)> {
         unsafe {
             let i = inode::inode(ip);
-            if (block as usize) < 9 {
-                let phys = core::ptr::read_volatile(&raw const i.data[block as usize]) as u32;
-                if phys != 0 { return phys; }
+            let ino = i.i_ino;
+            let sb_nr = i.i_sb;
+            if sb_nr == NIL || ino == 0 { return None; }
+            let info = ext4_info(sb_nr);
+            if !info.valid { return None; }
+            let dev = sb(sb_nr).s_dev;
+            let inode_table = info.ext4_gd.inode_table;
+            let byte_off = (ino as u64 - 1) * info.inode_size as u64;
+            let blk = inode_table + byte_off / info.block_size as u64;
+            let block_off = (byte_off % info.block_size as u64) as usize;
+            let b = buffer::bread(dev, blk as u32, info.block_size)?;
+            let data = bh(b).data();
+            let need = block_off + info.inode_size as usize;
+            if need > data.len() { buffer::brelse(b); return None; }
+            let raw = &data[block_off..need];
+            let ei = Ext4Inode::from_bytes(raw)?;
+            // i_block 区起自偏移 40，长 60 字节。
+            let off = 40;
+            if off + 60 > raw.len() { buffer::brelse(b); return None; }
+            let mut ib = [0u8; 60];
+            ib.copy_from_slice(&raw[off..off + 60]);
+            buffer::brelse(b);
+            Some((ib, info.fs_block_size, dev))
+        }
+    }
+
+    /// 在 extent 树里查逻辑块 `lblock`（fs 块单位）的物理块号（fs 块单位）。
+    /// `ib` 是根节点（inode i_block 区 60 字节）。支持 depth 0（叶子）
+    /// 与 depth>0（索引→下探磁盘块）。
+    unsafe fn extent_lookup(ib: &[u8; 60], lblock: u32, dev: u16, fs_bs: usize) -> Option<u64> {
+        unsafe {
+            let root = ExtentNode::parse(ib)?;
+            let lblock_fs = lblock;
+            if root.header().is_leaf() {
+                let e = root.lookup_leaf(lblock_fs)?;
+                let phys = e.ee_start() + (lblock_fs as u64 - e.ee_block() as u64);
+                return Some(phys);
+            }
+            // 索引节点：逐层下探，最多 5 层（ext4 树深上限）。
+            let mut node_buf = *ib;
+            for _ in 0..5 {
+                let node = ExtentNode::parse(&node_buf[..])?;
+                let child_blk = node.lookup_index(lblock_fs)?;
+                let b = buffer::bread(dev, child_blk as u32, fs_bs)?;
+                let data = bh(b).data();
+                let take = core::cmp::min(data.len(), node_buf.len());
+                node_buf[..take].copy_from_slice(&data[..take]);
+                buffer::brelse(b);
+                let child = ExtentNode::parse(&node_buf[..])?;
+                if child.header().is_leaf() {
+                    let e = child.lookup_leaf(lblock_fs)?;
+                    let phys = e.ee_start() + (lblock_fs as u64 - e.ee_block() as u64);
+                    return Some(phys);
+                }
+            }
+            None
+        }
+    }
+
+    /// 经典（非 extent）块映射：12 直接 + 1 一级 + 1 二级 + 1 三级间接。
+    /// `lblock`/返回值均以 fs 块为单位。指针在 i_block 区：[0..12] 直接，
+    /// [12] 一级，[13] 二级，[14] 三级（每指针 4 字节小端）。
+    unsafe fn classic_lookup(ib: &[u8; 60], lblock: u32, dev: u16, fs_bs: usize) -> Option<u32> {
+        unsafe {
+            let ptrs_per_block = (fs_bs / 4) as u32;
+            let rd32 = |o: usize| -> u32 {
+                u32::from_le_bytes([ib[o], ib[o + 1], ib[o + 2], ib[o + 3]])
+            };
+            // 12 直接块（偏移 0..48）
+            if lblock < 12 {
+                let p = rd32((lblock as usize) * 4);
+                return if p != 0 { Some(p) } else { None };
+            }
+            let mut idx = lblock - 12;
+            // 一级间接：偏移 48
+            if idx < ptrs_per_block {
+                let ind = rd32(48);
+                if ind == 0 { return None; }
+                return read_indirect(dev, ind, idx, fs_bs);
+            }
+            idx -= ptrs_per_block;
+            // 二级间接：偏移 52
+            if idx < ptrs_per_block * ptrs_per_block {
+                let dind = rd32(52);
+                if dind == 0 { return None; }
+                let outer = idx / ptrs_per_block;
+                let inner = idx % ptrs_per_block;
+                let b = buffer::bread(dev, dind, fs_bs)?;
+                let data = bh(b).data();
+                let off = (outer as usize) * 4;
+                let ind = if off + 4 <= data.len() {
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                } else { 0 };
+                buffer::brelse(b);
+                if ind == 0 { return None; }
+                return read_indirect(dev, ind, inner, fs_bs);
+            }
+            idx -= ptrs_per_block * ptrs_per_block;
+            // 三级间接：偏移 56
+            let tind = rd32(56);
+            if tind == 0 { return None; }
+            let ppb2 = ptrs_per_block * ptrs_per_block;
+            let outer = idx / ppb2;
+            let mid = (idx % ppb2) / ptrs_per_block;
+            let inner = idx % ptrs_per_block;
+            let b = buffer::bread(dev, tind, fs_bs)?;
+            let data = bh(b).data();
+            let off = (outer as usize) * 4;
+            let dind = if off + 4 <= data.len() {
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+            } else { 0 };
+            buffer::brelse(b);
+            if dind == 0 { return None; }
+            let b = buffer::bread(dev, dind, fs_bs)?;
+            let data = bh(b).data();
+            let off = (mid as usize) * 4;
+            let ind = if off + 4 <= data.len() {
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+            } else { 0 };
+            buffer::brelse(b);
+            if ind == 0 { return None; }
+            read_indirect(dev, ind, inner, fs_bs)
+        }
+    }
+
+    /// 读一级间接块 `ind` 中第 `idx` 个指针。
+    unsafe fn read_indirect(dev: u16, ind: u32, idx: u32, fs_bs: usize) -> Option<u32> {
+        unsafe {
+            let b = buffer::bread(dev, ind, fs_bs)?;
+            let data = bh(b).data();
+            let off = (idx as usize) * 4;
+            let p = if off + 4 <= data.len() {
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+            } else { 0 };
+            buffer::brelse(b);
+            if p != 0 { Some(p) } else { None }
+        }
+    }
+
+    /// bmap 的实现：返回 1024 字节单位的物理块号。
+    unsafe fn bmap_phys(ip: usize, block: u32) -> u32 {
+        unsafe {
+            let (ib, fs_bs, dev) = match read_inode_iblock(ip) {
+                Some(v) => v,
+                None => return 0,
+            };
+            let scale = (fs_bs / 1024) as u32;
+            // block 是 1024 字节单位；extent/classic 用 fs 块单位。
+            let lblock_fs = block / scale;
+            let sub = block % scale; // 块内 1024 子块偏移
+            // i_block 区头两个字节为 extent 树根 magic（0xF30A）即用 extent。
+            let uses_ext = u16::from_le_bytes([ib[0], ib[1]]) == 0xF30A;
+            if uses_ext {
+                if let Some(phys_fs) = extent_lookup(&ib, lblock_fs, dev, fs_bs) {
+                    return (phys_fs as u32) * scale + sub;
+                }
+                return 0;
+            }
+            // 经典直接/间接块
+            if let Some(phys_fs) = classic_lookup(&ib, lblock_fs, dev, fs_bs) {
+                return phys_fs * scale + sub;
             }
             0
         }

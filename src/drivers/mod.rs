@@ -34,6 +34,7 @@ pub unsafe fn init() {
     unsafe {
         block::ll_rw::init();
         block::ramdisk::init();
+        #[cfg(feature = "extra-drivers")]
         block::hd::init();
         char_dev::init();
         #[cfg(feature = "extra-drivers")]

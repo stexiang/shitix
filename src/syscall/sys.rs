@@ -290,6 +290,11 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     let mut interp_path: Option<&[u8]> = None;
     let mut at_phdr: u64 = 0;
     let mut interp_base: u64 = 0; // AT_BASE
+    // 第一个 PT_LOAD 段的 (file_off, vaddr)：没有 PT_PHDR 时用它推算
+    // phdr 的加载地址（ELF 头+程序头总在第一个 LOAD 段里）。
+    let mut first_load_off: u64 = 0;
+    let mut first_load_va: u64 = 0;
+    let mut have_first_load = false;
 
     for i in 0..phnum {
         let phdr = match parse_phdr64(elf_data, phoff + i * phentsize) {
@@ -297,6 +302,11 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
             Err(_) => continue,
         };
         let ptype = phdr.p_type;
+        crate::serial::print("EXEC: phdr ");
+        crate::serial::print_dec(i as u64);
+        crate::serial::print(" type=");
+        crate::serial::print_dec(ptype as u64);
+        crate::serial::putc(b'\n');
         if ptype == 3 { // PT_INTERP
             let off = phdr.p_offset as usize;
             let sz = phdr.p_filesz as usize;
@@ -307,14 +317,30 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         if ptype == 6 { // PT_PHDR
             at_phdr = phdr.p_vaddr;
         }
+        if ptype == 1 && !have_first_load { // PT_LOAD
+            first_load_off = phdr.p_offset;
+            first_load_va = phdr.p_vaddr;
+            have_first_load = true;
+        }
     }
-    // Fallback PHDR address
-    if at_phdr == 0 { at_phdr = USERSPACE_START + phoff as u64; }
+    // Fallback PHDR address: 没有 PT_PHDR 时，phdr 在第一个 LOAD 段内，
+    // 加载地址 = first_load_va + (phoff - first_load_off)。
+    // 旧实现用 USERSPACE_START（0x4000_0000，栈区基址）+ phoff，得到的
+    // 是未映射地址，glibc __libc_setup_tls 读 _dl_phdr 即 page fault。
+    if at_phdr == 0 && have_first_load && phoff as u64 >= first_load_off {
+        at_phdr = first_load_va + (phoff as u64 - first_load_off);
+    }
 
     // 6a. 如果有 PT_INTERP，加载动态链接器
     if let Some(ipath) = interp_path {
+        crate::serial::print("EXEC: interp=");
+        crate::serial::print(core::str::from_utf8(ipath).unwrap_or("?"));
+        crate::serial::putc(b'\n');
         // 打开解释器文件
         let ifd = unsafe { crate::fs::open::sys_open(ipath, crate::fs::oflags::O_RDONLY, 0) };
+        crate::serial::print("EXEC: interp open ifd=");
+        crate::serial::print_dec(ifd as i64 as u64);
+        crate::serial::putc(b'\n');
         if ifd >= 0 {
             let ibuf = get_free_page();
             if ibuf != 0 {
@@ -359,6 +385,11 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                             }
                             // entry = 解释器入口 (relocated)
                             entry = ihdr.e_entry;
+                            crate::serial::print("EXEC: interp entry=");
+                            crate::serial::raw_hex64(entry);
+                            crate::serial::print(" base=");
+                            crate::serial::raw_hex64(interp_base);
+                            crate::serial::putc(b'\n');
                         }
                     }
                 }
@@ -438,12 +469,23 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                 let copy_end = core::cmp::min(PAGE_SIZE, vaddr + filesz - va);
                 let file_src = file_off + (va - vaddr) + copy_start;
                 let copy_len = copy_end - copy_start;
-                // Read from file descriptor (seek + read) for large ELFs
+                // Read from file descriptor (seek + read) for large ELFs.
+                // 循环读直到填满 copy_len：底层 read 可能一次只返回部分字节
+                // （大文件走 ext4 extent/间接块，bread 受缓冲页大小限制）。
                 if copy_len > 0 {
                     unsafe {
                         crate::fs::read_write::lseek(fd, file_src as i64, crate::fs::SEEK_SET);
-                        let dest = core::slice::from_raw_parts_mut(pg as *mut u8, copy_len);
-                        crate::fs::read_write::read(fd, dest);
+                        let mut filled = 0usize;
+                        while filled < copy_len {
+                            let dest = core::slice::from_raw_parts_mut(
+                                (pg as *mut u8).add(filled), copy_len - filled);
+                            let n = crate::fs::read_write::read(fd, dest);
+                            if n <= 0 {
+                                // EOF 或出错：剩余保持零（get_free_page 已清零）。
+                                break;
+                            }
+                            filled += n as usize;
+                        }
                     }
                 }
             }
@@ -460,29 +502,89 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         (*t).brk = page_align(max_va);
     }
 
-    // 8. 设置用户栈
-    let stack_page = get_free_page();
-    if stack_page == 0 {
-        crate::serial::print("EXEC: stack get_free_page FAILED\n");
+    // 8. 设置用户栈 —— glibc 启动（TLS 设置、IFUNC 解析、signal stack）需要较大栈，
+    //    只给一页会溢出。分配 16 页（64KB）栈区，把 argv/envp/auxv 写在最顶页。
+    const STACK_PAGES: usize = 16;
+    let stack_top_off = STACK_PAGES * PAGE_SIZE;          // 栈区大小
+    let stack_base_va = USERSPACE_START as usize + 0x2000; // 栈区最低虚拟地址
+    let stack_top_va = stack_base_va + stack_top_off;     // 栈区最高虚拟地址（exclusive）
+    // 仅映射栈页（每页一张物理页）。失败则逐页回滚。
+    let mut mapped = 0usize;
+    while mapped < STACK_PAGES {
+        let pg = get_free_page();
+        if pg == 0 { break; }
+        let va = stack_base_va + mapped * PAGE_SIZE;
+        if !unsafe { paging::map_page(new_pml4, va, pg, paging::flags::SHARED) } {
+            free_page(pg);
+            break;
+        }
+        mapped += 1;
+    }
+    if mapped < STACK_PAGES {
+        crate::serial::print("EXEC: stack map partial FAILED\n");
+        unsafe {
+            for k in 0..mapped {
+                let va = stack_base_va + k * PAGE_SIZE;
+                if let Some(phys) = paging::translate(new_pml4, va) {
+                    paging::unmap_page(new_pml4, va);
+                    free_page(phys);
+                }
+            }
+        }
         crate::mm::free_page(buf);
         unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOMEM as i64);
     }
-    if !unsafe { paging::map_page(new_pml4, USERSPACE_START as usize + 0x2000, stack_page, paging::flags::SHARED) } {
-        crate::serial::print("EXEC: stack map_page FAILED\n");
-        free_page(stack_page);
-        unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
-        return -(ENOMEM as i64);
-    }
-    // 在栈顶写 auxv: AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_ENTRY,AT_BASE,AT_NULL
-    let stack_top_vaddr = USERSPACE_START + 0x3000u64;
+    // 顶页的物理地址（用来在上面写 argc/argv/envp/auxv + 字符串）。
+    let top_page = unsafe { paging::translate(new_pml4, stack_top_va - PAGE_SIZE) }.unwrap_or(0);
+
+    // AT_EXECFN / AT_PLATFORM / argv[0] 字符串：放在顶页最末尾，从后往前。
+    // auxv/argv/argc 则从顶页的 n_slots-1 往下写。
     let n_slots = PAGE_SIZE / 8;
-    // SAFETY: stack_page 在恒等映射内
+    let argc_slot: usize;
+    let execfn_va: u64;
+    let platform_va: u64;
+    let argv0_va: u64;
+    let random_va: u64;   // AT_RANDOM: 16 字节随机数（这里全 0）
+    // SAFETY: top_page 在恒等映射内，独占。
     unsafe {
-        let s = stack_page as *mut u64;
+        let base = top_page as *mut u8;
+        let top = base.add(PAGE_SIZE); // 顶页末尾（exclusive）
+        // 从末尾往前放字符串（NUL 结尾）。
+        let mut put = |s: &[u8]| -> u64 {
+            let len = s.len() + 1; // 含 NUL
+            let p = top.sub(len);
+            core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
+            *p.add(s.len()) = 0;
+            (stack_top_va - len) as u64
+        };
+        platform_va = put(b"x86_64");
+        execfn_va = put(b"/bin/sh");
+        argv0_va = put(b"sh");
+        // AT_RANDOM: 16 字节，放在 argv0 前
+        let rp = top.sub(b"/bin/sh".len() + 1 + b"x86_64".len() + 1 + b"sh".len() + 1 + 16);
+        core::ptr::write_bytes(rp, 0, 16);
+        random_va = (stack_top_va - (b"/bin/sh".len() + 1 + b"x86_64".len() + 1 + b"sh".len() + 1 + 16)) as u64;
+
+        // 顶页按 u64 槽位写 auxv/envp/argv/argc。字符串已写在页末，auxv 从
+        // n_slots-1 往下，避开字符串区（字符串总共占用页末 ~40 字节，auxv
+        // 从 slot n_slots-1 往下写 30 个槽，远不会撞上字符串）。
+        let s = top_page as *mut u64;
         let mut i = n_slots - 1;
         s.add(i).write_volatile(0); i -= 1; // AT_NULL val
         s.add(i).write_volatile(0); i -= 1; // AT_NULL key
+        s.add(i).write_volatile(0); i -= 1; // AT_HWCAP2(26) val
+        s.add(i).write_volatile(26); i -= 1; // AT_HWCAP2 key
+        s.add(i).write_volatile(0xbfebfbff | (1<<0) | (1<<9) | (1<<19)); i -= 1; // AT_HWCAP(16) val (SSE/SSE2/etc)
+        s.add(i).write_volatile(16); i -= 1; // AT_HWCAP key
+        s.add(i).write_volatile(100); i -= 1; // AT_CLKTCK(17) val
+        s.add(i).write_volatile(17); i -= 1; // AT_CLKTCK key
+        s.add(i).write_volatile(random_va); i -= 1; // AT_RANDOM(25) val
+        s.add(i).write_volatile(25); i -= 1; // AT_RANDOM key
+        s.add(i).write_volatile(platform_va); i -= 1; // AT_PLATFORM(15) val
+        s.add(i).write_volatile(15); i -= 1; // AT_PLATFORM key
+        s.add(i).write_volatile(execfn_va); i -= 1; // AT_EXECFN(31) val
+        s.add(i).write_volatile(31); i -= 1; // AT_EXECFN key
         s.add(i).write_volatile(entry); i -= 1; // AT_ENTRY(9) val
         s.add(i).write_volatile(9); i -= 1;    // AT_ENTRY key
         s.add(i).write_volatile(interp_base); i -= 1; // AT_BASE(7) val
@@ -495,11 +597,23 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         s.add(i).write_volatile(4); i -= 1;    // AT_PHENT key
         s.add(i).write_volatile(at_phdr); i -= 1; // AT_PHDR(3) val
         s.add(i).write_volatile(3); i -= 1;    // AT_PHDR key
+        s.add(i).write_volatile(0); i -= 1;    // AT_EGID(14) val
+        s.add(i).write_volatile(14); i -= 1;   // AT_EGID key
+        s.add(i).write_volatile(0); i -= 1;    // AT_GID(13) val
+        s.add(i).write_volatile(13); i -= 1;   // AT_GID key
+        s.add(i).write_volatile(0); i -= 1;    // AT_EUID(12) val
+        s.add(i).write_volatile(12); i -= 1;   // AT_EUID key
+        s.add(i).write_volatile(0); i -= 1;    // AT_UID(11) val
+        s.add(i).write_volatile(11); i -= 1;   // AT_UID key
+        s.add(i).write_volatile(0); i -= 1;    // AT_SECURE(23) val
+        s.add(i).write_volatile(23); i -= 1;   // AT_SECURE key
         s.add(i).write_volatile(0); i -= 1;    // NULL envp
-        s.add(i).write_volatile(0); i -= 1;    // NULL argv
-        s.add(i).write_volatile(0);            // argc=0
+        s.add(i).write_volatile(argv0_va); i -= 1; // argv[0]
+        s.add(i).write_volatile(1);             // argc=1
+        argc_slot = i;
     }
-    let user_rsp = stack_top_vaddr as u64 - ((n_slots - 18) * 8) as u64;
+    // user_rsp 指向 argc 槽的虚拟地址。
+    let user_rsp = stack_top_va as u64 - ((n_slots - argc_slot) * 8) as u64;
 
     // 8. 设置当前任务使用新页表，并立即加载 CR3。
     unsafe {
@@ -858,9 +972,52 @@ pub fn exit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 原版往用户态的 `struct utsname *` 写六个定长字符串。同 [`times`]，
 /// 缺 `verify_area` 所以不往用户指针写，改成直接打印到控制台
 /// 并返回 0——够验证调用链路，等 fs/mm 到位后改成真的填结构体。
-pub fn uname(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    crate::pr!(Level::Info, "shitix {} {} {} {}",
-               crate::UTS_SYSNAME, crate::UTS_RELEASE, crate::UTS_VERSION, crate::UTS_MACHINE);
+pub fn uname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::{EFAULT, utsname_len};
+    // `struct utsname`：6 个 65 字节字段（sysname/nodename/release/version/
+    // machine/domainname），共 390 字节。对应 glibc 的 `struct utsname`。
+    // 之前只 pr! 打日志、不回填用户缓冲区，glibc 读到全 0 的 release，
+    // 解析出版本 0，判定 < 最小内核版本 → `FATAL: kernel too old`。
+    let buf = args.a0 as *mut u8;
+    if buf.is_null() {
+        return -(EFAULT as i64);
+    }
+    // SAFETY: buf 来自用户态 a0。execve 后 CR3 已切到用户 PML4，
+    // 用户栈页（含此缓冲区）已映射且 U/S=1；内核 CPL=0 可写。
+    // 长度 390 在一个 4KB 页内（栈对齐），不会跨未映射页。
+    unsafe {
+        let mut p = buf;
+        let mut zeroed = 0usize;
+        let fill = |p: *mut u8, s: &str, len: usize| {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(len - 1);
+            let dst = core::slice::from_raw_parts_mut(p, len);
+            dst[..n].copy_from_slice(&bytes[..n]);
+            // 其余清 0
+            for b in &mut dst[n..] {
+                *b = 0;
+            }
+        };
+        fill(p, crate::UTS_SYSNAME, utsname_len);
+        p = p.add(utsname_len);
+        zeroed += utsname_len;
+        fill(p, crate::UTS_SYSNAME, utsname_len); // nodename（暂同 sysname）
+        p = p.add(utsname_len);
+        zeroed += utsname_len;
+        fill(p, crate::UTS_RELEASE, utsname_len);
+        p = p.add(utsname_len);
+        zeroed += utsname_len;
+        fill(p, crate::UTS_VERSION, utsname_len);
+        p = p.add(utsname_len);
+        zeroed += utsname_len;
+        fill(p, crate::UTS_MACHINE, utsname_len);
+        p = p.add(utsname_len);
+        zeroed += utsname_len;
+        // domainname（GNU 扩展，第 6 字段）留空
+        fill(p, "", utsname_len);
+        zeroed += utsname_len;
+        debug_assert_eq!(zeroed, 390);
+    }
     0
 }
 
@@ -927,10 +1084,16 @@ pub fn brk(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             let end = crate::mm::page::page_align(new_brk + crate::mm::PAGE_SIZE - 1);
             let mut va = start;
             while va < end {
-                // Skip already-mapped pages (ELF segments etc)
-                if paging::translate(pml4, va).is_none() {
+                // 只跳过「已经是用户页」的地址。低 1GB 是 2MB 内核大页恒等映射，
+                // 用户进程首次访问某 2MB 区间时会把大页拆成 512 个 present-but-not-user
+                // 的 4KB 表项（见 paging::next_level 的 HUGE 分支）。用 translate() 会把
+                // 这些内核拆分页误判为已映射；这里必须用 is_user_mapped，否则 brk 分配
+                // 出的堆页仍是内核专用页，用户态一访问就 err=0x5。
+                if !paging::is_user_mapped(pml4, va) {
                     let pg = get_free_page();
                     if pg == 0 { return old_brk as i64; }
+                    // map_page 会覆盖该 PTE（哪怕是内核拆分页），换上新的用户物理页。
+                    // 不释放被覆盖的内核物理页——它属于内核恒等映射，由内核自身管理。
                     if !paging::map_page(pml4, va, pg, paging::flags::SHARED) {
                         free_page(pg);
                         return old_brk as i64;
@@ -944,9 +1107,13 @@ pub fn brk(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             let mut va = end;
             while va > start {
                 va -= crate::mm::PAGE_SIZE;
-                if let Some(phys) = paging::translate(pml4, va) {
-                    paging::unmap_page(pml4, va);
-                    free_page(phys);
+                // 只回收「用户页」。内核拆分页（present-but-not-user）不归 brk 管，
+                // free 它们的物理地址会释放内核自身内存。
+                if paging::is_user_mapped(pml4, va) {
+                    if let Some(phys) = paging::translate(pml4, va) {
+                        paging::unmap_page(pml4, va);
+                        free_page(phys);
+                    }
                 }
             }
         }

@@ -154,19 +154,24 @@ e820_done:
     lgdt    gdt_desc
     lidt    idt_desc
 
-/* CR4.PAE | CR4.PGE */
+/* CR4.PAE | CR4.PGE | CR4.OSFXSR | CR4.OSXMMEXCPT
+ * OSFXSR(0x200)+OSXMMEXCPT(0x400) 让 SSE/SSE2 指令可用并把 SSE 异常
+ * 导向 #XM 而非 #UD；不开的话任何访问 XMM 的指令（glibc 启动里很多，
+ * 例如 movd %ebx,%xmm0）会触发 #UD->SIGILL，用户程序无法启动。 */
     movl    %cr4, %eax
-    orl     $0xA0, %eax
+    orl     $0x6A0, %eax
     movl    %eax, %cr4
 
 /* CR3 = PML4 */
     movl    $PML4_ADDR, %eax
     movl    %eax, %cr3
 
-/* EFER.LME = 1, EFER.SCE = 1 (syscall enable) */
+/* EFER.LME = 1, EFER.SCE = 1 (syscall enable), EFER.NXE = 1 (NX bit)。
+ * NXE 必须开：mprotect 给 .data/.bss 设 NO_EXEC(位63) 时，若 NXE 关闭，
+ * 位63 是保留位，CPU 一访问就 #PF(reserved) 把 glibc 启动卡死。 */
     movl    $0xC0000080, %ecx
     rdmsr
-    orl     $0x101, %eax
+    orl     $0x901, %eax
     wrmsr
 
 /* 同时开 PG 和 PE，直接进入 long mode 的 compatibility 状态 */

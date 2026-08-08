@@ -32,9 +32,15 @@ pub mod umm;
 
 /// `sys_uname` 报告的系统信息。对应原版 `include/linux/utsname.h` 里
 /// `init_uts_ns` 的字段和 `version.c` 的 `UTS_RELEASE`。
-pub const UTS_SYSNAME: &str = "shitix";
-pub const UTS_RELEASE: &str = "1.0.9-rust";
-pub const UTS_VERSION: &str = "#1";
+///
+/// `UTS_RELEASE` 故意报一个较新的版本号：本内核虽是 Linux 1.0.9 的 Rust
+/// 重写，但用户态跑的是现代 glibc 编译的 /bin/sh，glibc 启动时会解析
+/// uname.release 并与编译期最小内核版本（通常 3.2）比较，低于即
+/// `FATAL: kernel too old` 直接退出。报 6.6.0 既满足 glibc 版本检查，
+/// 又保留 "-shitix" 后缀标识来源。
+pub const UTS_SYSNAME: &str = "Linux";
+pub const UTS_RELEASE: &str = "6.6.0-shitix";
+pub const UTS_VERSION: &str = "#1 SMP x86_64";
 pub const UTS_MACHINE: &str = "x86_64";
 
 use console::Color;

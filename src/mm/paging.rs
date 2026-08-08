@@ -233,6 +233,47 @@ pub unsafe fn translate(pml4: usize, vaddr: usize) -> Option<usize> {
     }
 }
 
+/// 查询虚拟地址是否映射为**用户可访问**的页（最终 PTE 含 PRESENT|USER）。
+///
+/// 与 [`translate`] 的区别：后者只看 PRESENT，会把「拆分 2MB 内核大页后留下的
+/// present-but-not-user 的 4KB 表项」也算作已映射。brk 等用户内存分配器必须用本函数，
+/// 否则会把内核拆分页当成「已分配的用户页」而跳过映射，导致用户态访问这些页时
+/// 触发 err=0x5 的保护故障（present + read + user）。
+///
+/// # Safety
+/// `pml4` 必须是有效的四级页表根物理地址。
+pub unsafe fn is_user_mapped(pml4: usize, vaddr: usize) -> bool {
+    // SAFETY: 每级都先查 PRESENT 再往下走，不会解引用无效页表。
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        let pdpt = (e & ADDR_MASK) as usize;
+
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        if e & flags::HUGE != 0 {
+            return e & flags::USER != 0;
+        }
+        let pd = (e & ADDR_MASK) as usize;
+
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        if e & flags::HUGE != 0 {
+            return e & flags::USER != 0;
+        }
+        let pt = (e & ADDR_MASK) as usize;
+
+        let e = entry(pt, pt_index(vaddr));
+        e & (flags::PRESENT | flags::USER) == (flags::PRESENT | flags::USER)
+    }
+}
+
 /// 撤销一页映射，返回它原先指向的物理地址。
 /// 对应原版 `unmap_page_range()`（原版会顺带 `free_page`，这里把释放交给调用者）。
 ///

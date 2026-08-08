@@ -256,6 +256,21 @@ fn send_sig_stub(signr: u32, name: &str, regs: &PtRegs, error_code: u64, cr2: Op
                "{}: sig {} at rip={:#x} err={:#x} cr2={:#x} (user)",
                name, signr, regs.rip, error_code, cr2.unwrap_or(0));
 
+    // DEBUG: dump user rsp/rax and the return address on the user stack,
+    // 以定位用户态为何跳到错误地址（如 0x1000）。
+    if signr == 11 {
+        crate::pr!(Level::Err, "USER regs: rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rbp={:#x}",
+                   regs.rsp, regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rbp);
+        let usp = regs.rsp as usize;
+        // 读用户栈顶 8 个 u64（返回地址等）
+        for k in 0..8usize {
+            let addr = usp + k*8;
+            // SAFETY: 仅诊断读，地址来自用户 rsp；可能触发嵌套 #PF，但顶层已 in_panic 风险低
+            let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            crate::pr!(Level::Err, "  ustack[{:#x}] = {:#x}", addr, v);
+        }
+    }
+
     let nr = sched::current_index();
 
     // task[0] 收不了致命信号——它是 swapper，杀了就没人可调度。

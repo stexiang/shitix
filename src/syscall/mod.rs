@@ -1222,10 +1222,10 @@ pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
 
     // ---- DEBUG: trace first 60 syscalls (all numbers) ----
     {
-        let a0 = regs.rdi;
-        let a1 = regs.rsi;
         let count = unsafe { *core::ptr::addr_of!(SYSCALL_COUNT) };
         if count <= 60 {
+            let a0 = regs.rdi;
+            let a1 = regs.rsi;
             unsafe {
                 crate::serial::raw_hex64(call_nr as u64);
                 crate::serial::putc(b'(');
