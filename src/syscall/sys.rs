@@ -463,8 +463,12 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                 return -(ENOMEM as i64);
             }
 
-            // 拷贝文件内容到该页
-            if va >= vaddr && va < vaddr + filesz {
+            // 拷贝文件内容到该页。条件改为「页与 [vaddr, vaddr+filesz) 有重叠」：
+            // 段的 p_vaddr 不一定页对齐（如 0x60d380），包含 vaddr 的那一页
+            // (va < vaddr) 仍要加载 vaddr 之后的部分文件内容（.init_array 等
+            // 就落在这种首页里）。旧条件 `va >= vaddr` 把首页整页跳过，导致
+            // .init_array 读到 0，__libc_csu_init call *(init_array[0]) 跳飞。
+            if va < vaddr + filesz && va + PAGE_SIZE > vaddr {
                 let copy_start = if va < vaddr { vaddr - va } else { 0 };
                 let copy_end = core::cmp::min(PAGE_SIZE, vaddr + filesz - va);
                 let file_src = file_off + (va - vaddr) + copy_start;
@@ -477,8 +481,9 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                         crate::fs::read_write::lseek(fd, file_src as i64, crate::fs::SEEK_SET);
                         let mut filled = 0usize;
                         while filled < copy_len {
+                            // 文件数据写到 pg + copy_start + filled（首页 copy_start>0）。
                             let dest = core::slice::from_raw_parts_mut(
-                                (pg as *mut u8).add(filled), copy_len - filled);
+                                (pg as *mut u8).add(copy_start + filled), copy_len - filled);
                             let n = crate::fs::read_write::read(fd, dest);
                             if n <= 0 {
                                 // EOF 或出错：剩余保持零（get_free_page 已清零）。
@@ -538,39 +543,50 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     // 顶页的物理地址（用来在上面写 argc/argv/envp/auxv + 字符串）。
     let top_page = unsafe { paging::translate(new_pml4, stack_top_va - PAGE_SIZE) }.unwrap_or(0);
 
-    // AT_EXECFN / AT_PLATFORM / argv[0] 字符串：放在顶页最末尾，从后往前。
-    // auxv/argv/argc 则从顶页的 n_slots-1 往下写。
+    // 用户栈初始布局（自顶向下，与 glibc _dl_setup_stack / SysV ABI 一致）：
+    //   [字符串区：AT_EXECFN/AT_PLATFORM/argv[0]/AT_RANDOM]  ← 页最顶
+    //   [auxv: AT_NULL..AT_*]
+    //   [envp: NULL]
+    //   [argv: argv[0], NULL]
+    //   [argc]
+    // 旧实现把字符串写在页顶、auxv 又从最高槽(n_slots-1=top-8)往下写，
+    // 两者重叠：AT_NULL 把 "/bin/sh\0"/"sh\0" 清零，argv[0] 变成空串，
+    // BusyBox 取 basename 为空 → ": applet not found"。下面用游标正确分隔。
     let n_slots = PAGE_SIZE / 8;
     let argc_slot: usize;
     let execfn_va: u64;
     let platform_va: u64;
     let argv0_va: u64;
-    let random_va: u64;   // AT_RANDOM: 16 字节随机数（这里全 0）
+    let random_va: u64;
     // SAFETY: top_page 在恒等映射内，独占。
     unsafe {
         let base = top_page as *mut u8;
         let top = base.add(PAGE_SIZE); // 顶页末尾（exclusive）
-        // 从末尾往前放字符串（NUL 结尾）。
+        // 1) 字符串区：用递减游标从页顶往下放，互不重叠。
+        let mut cur = top;
+        // AT_RANDOM: 16 字节，glibc 期望 16 字节对齐，先对齐游标。
+        cur = cur.sub((cur as usize) & 0xF);
+        let rp = cur.sub(16);
+        core::ptr::write_bytes(rp, 0, 16);
+        random_va = (stack_top_va - (top as usize - rp as usize)) as u64;
+        cur = rp;
+        // 普通字符串：argv[0]/AT_EXECFN/AT_PLATFORM（游标递减，不重叠）。
         let mut put = |s: &[u8]| -> u64 {
             let len = s.len() + 1; // 含 NUL
-            let p = top.sub(len);
+            let p = cur.sub(len);
             core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
             *p.add(s.len()) = 0;
-            (stack_top_va - len) as u64
+            cur = p;
+            (stack_top_va - (top as usize - p as usize)) as u64
         };
+        argv0_va = put(b"/bin/sh");
+        execfn_va = argv0_va; // AT_EXECFN 与 argv[0] 共用同一字符串
         platform_va = put(b"x86_64");
-        execfn_va = put(b"/bin/sh");
-        argv0_va = put(b"sh");
-        // AT_RANDOM: 16 字节，放在 argv0 前
-        let rp = top.sub(b"/bin/sh".len() + 1 + b"x86_64".len() + 1 + b"sh".len() + 1 + 16);
-        core::ptr::write_bytes(rp, 0, 16);
-        random_va = (stack_top_va - (b"/bin/sh".len() + 1 + b"x86_64".len() + 1 + b"sh".len() + 1 + 16)) as u64;
 
-        // 顶页按 u64 槽位写 auxv/envp/argv/argc。字符串已写在页末，auxv 从
-        // n_slots-1 往下，避开字符串区（字符串总共占用页末 ~40 字节，auxv
-        // 从 slot n_slots-1 往下写 30 个槽，远不会撞上字符串）。
+        // 2) auxv/argv/argc 槽位区：从字符串区下方往下写。
+        let aux_top = (cur as usize) & !0x7; // 8 对齐
+        let mut i = (aux_top - (top_page as usize)) / 8 - 1; // 最高可用槽
         let s = top_page as *mut u64;
-        let mut i = n_slots - 1;
         s.add(i).write_volatile(0); i -= 1; // AT_NULL val
         s.add(i).write_volatile(0); i -= 1; // AT_NULL key
         s.add(i).write_volatile(0); i -= 1; // AT_HWCAP2(26) val
@@ -608,6 +624,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         s.add(i).write_volatile(0); i -= 1;    // AT_SECURE(23) val
         s.add(i).write_volatile(23); i -= 1;   // AT_SECURE key
         s.add(i).write_volatile(0); i -= 1;    // NULL envp
+        s.add(i).write_volatile(0); i -= 1;    // argv 终止 NULL
         s.add(i).write_volatile(argv0_va); i -= 1; // argv[0]
         s.add(i).write_volatile(1);             // argc=1
         argc_slot = i;
@@ -1362,8 +1379,12 @@ pub fn mprotect(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
     if len == 0 { return -(EINVAL as i64); }
 
-    let start = crate::mm::page::page_align(addr);
-    let end = crate::mm::page::page_align(addr + len + PAGE_SIZE - 1);
+    let start = crate::mm::page::page_base(addr);
+    // end = ceil(addr+len) 向上取整到页边界（一次取整即可）。
+    // 旧代码 page_align(addr+len+PAGE_SIZE-1) 会再多吃一整页：
+    // mprotect(0x60d000,0x7000) 本应只覆盖 [0x60d000,0x614000)，
+    // 旧 end=0x615000 把 0x614000 这页也改成只读，导致 glibc 写 0x6149a0 触发 #PF。
+    let end = crate::mm::page::page_align(addr + len);
 
     // Build protection flags for set_page_flags (PRESENT is added automatically).
     // x86_64: RW=writable, USER=user-accessible, NO_EXEC=no instruction fetch.

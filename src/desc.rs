@@ -431,11 +431,21 @@ pub unsafe fn init_idt() {
 fn init_syscall_msrs() {
     // SAFETY: CPL=0，wrmsr 合法。
     unsafe {
-        // IA32_STAR: [47:32]=KERNEL_CS(0x08)
+        // IA32_STAR (0xC0000081) 布局：
+        //   bits [31:0]   保留（必须 0）          → eax
+        //   bits [47:32]  syscall 内核 CS          → edx 低 16
+        //   bits [63:48]  sysret 用户 CS 基址       → edx 高 16
+        // 旧代码把 0x0008_0000 写进 eax、edx 写 0，
+        // 结果 STAR[47:32]=0：`syscall` 把内核 CS 加载成 0（NULL）。
+        // 代码在 long mode 平坦段下能跑，但 swapper 被时钟打断后 iretq
+        // 试图恢复 CS=0 → #GP(0)，shell 打完提示词 "/ # " 即崩溃。
+        let kernel_cs = selector::KERNEL_CS as u32;          // 0x08
+        let user_cs_base = (selector::USER_CS & !3) as u32;  // 0x18
+        let edx = (user_cs_base << 16) | kernel_cs;          // 0x0018_0008
         core::arch::asm!("wrmsr",
             in("ecx") 0xC000_0081u32,
-            in("eax") 0x0008_0000u32,
-            in("edx") 0u32,
+            in("eax") 0u32,
+            in("edx") edx,
             options(nomem, nostack, preserves_flags));
 
         // IA32_LSTAR: syscall_entry 地址
