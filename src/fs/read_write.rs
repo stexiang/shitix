@@ -82,6 +82,7 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
     unsafe {
         let f = fd_to_filp(fd);
         if f == NIL {
+            crate::serial::print("RW: fd_to_filp=NIL\n");
             return -(EBADF as i64);
         }
         let (n, fmode, flags) = {
@@ -89,10 +90,12 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
             (fp.f_inode, fp.f_mode, fp.f_flags)
         };
         if n == NIL {
+            crate::serial::print("RW: inode=NIL\n");
             return -(EBADF as i64);
         }
         // 原版：`if (!(file->f_mode & 2)) return -EBADF`（2 = 可写）
         if fmode & 2 == 0 {
+            crate::serial::print("RW: mode lacks WRITE\n");
             return -(EBADF as i64);
         }
         if buf.is_empty() {
@@ -109,7 +112,13 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
         };
 
         let m = inode::inode(n).i_mode;
-        let r = match inode::inode(n).i_op {
+        let iop = inode::inode(n).i_op;
+        crate::serial::print("RW: i_op=");
+        crate::serial::raw_hex64(iop as u64);
+        crate::serial::print(" rdev=");
+        crate::serial::raw_hex64(inode::inode(n).i_rdev as u64);
+        crate::serial::putc(b'\n');
+        let r = match iop {
             FsType::Chr => super::devices::chrdev_write(inode::inode(n).i_rdev, pos, buf),
             FsType::Blk => super::devices::block_write(inode::inode(n).i_rdev, pos, buf),
             FsType::Minix => {

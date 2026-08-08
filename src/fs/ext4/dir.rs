@@ -111,12 +111,18 @@ impl<'a> Iterator for DirIter<'a> {
         let name_len = b[6];
         let file_type = b[7];
 
-        // 损坏检查：rec_len 必须能真的推进，且不能越界
+        // 损坏检查
         if rec_len < EXT4_DIR_ENTRY_HEADER_LEN as u16
             || rec_len % 4 != 0
             || (rec_len as usize) < EXT4_DIR_ENTRY_HEADER_LEN + name_len as usize
-            || self.pos + rec_len as usize > self.buf.len()
         {
+            return None;
+        }
+        // Check that the entry data (header + name) fits in buffer.
+        // rec_len may extend beyond buffer for the last entry in a dir block
+        // (e.g., 4096-byte block read as 1024-byte sub-blocks).
+        let entry_end = self.pos + EXT4_DIR_ENTRY_HEADER_LEN + name_len as usize;
+        if entry_end > self.buf.len() {
             return None;
         }
 
@@ -127,7 +133,9 @@ impl<'a> Iterator for DirIter<'a> {
             file_type,
             name_off: self.pos + EXT4_DIR_ENTRY_HEADER_LEN,
         };
-        self.pos += rec_len as usize;
+        // Advance by rec_len, but don't go past the buffer
+        let next = self.pos + rec_len as usize;
+        self.pos = if next > self.buf.len() { self.buf.len() } else { next };
         Some(e)
     }
 }

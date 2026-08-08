@@ -760,6 +760,9 @@ pub unsafe fn getblk(dev: u16, block: u32, size: usize) -> Option<usize> {
             }
             if (*bp).b_dirt {
                 sync_buffers(0, false);
+                // Explicitly clear dirtiness after syncing, so this buffer
+                // can be reused on the next loop iteration.
+                (*bp).b_dirt = false;
                 continue;
             }
             // 睡的时候别人可能已经把这个块读进缓存了
@@ -905,6 +908,8 @@ pub unsafe fn sync_buffers(dev: u16, wait: bool) -> bool {
                 (*buf_ptr(slot)).b_count += 1;
                 ll_rw_block(WRITE, &mut [slot]);
                 (*buf_ptr(slot)).b_count -= 1;
+                // Clear dirty flag after successful write (fixes buffer reuse bug)
+                (*buf_ptr(slot)).b_dirt = false;
                 retry = true;
             }
             if !(wait && retry && pass < 2) {

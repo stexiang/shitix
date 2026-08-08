@@ -1215,11 +1215,27 @@ pub fn syscall_count() -> u64 {
 pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
     // SAFETY: 契约保证 regs 有效且我们独占。
     let regs = unsafe { &mut *regs };
-    // 调用号在 orig_rax（entry.S 的 `pushq %rax` 存的），同原版 orig_eax
     let call_nr = regs.orig_rax as usize;
 
     // SAFETY: 单核；系统调用不可重入到自身。
     unsafe { *core::ptr::addr_of_mut!(SYSCALL_COUNT) += 1 }
+
+    // ---- DEBUG: trace first 60 syscalls (all numbers) ----
+    {
+        let a0 = regs.rdi;
+        let a1 = regs.rsi;
+        let count = unsafe { *core::ptr::addr_of!(SYSCALL_COUNT) };
+        if count <= 60 {
+            unsafe {
+                crate::serial::raw_hex64(call_nr as u64);
+                crate::serial::putc(b'(');
+                crate::serial::raw_hex64(a0);
+                crate::serial::putc(b',');
+                crate::serial::raw_hex64(a1);
+                crate::serial::putc(b')');
+            }
+        }
+    }
 
     // 原版：`cmpl _NR_syscalls,%eax; jae ret_from_sys_call`（此前已把
     // EAX 格预置成 -ENOSYS）
@@ -1241,6 +1257,11 @@ pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
     //   movl %eax,EAX(%esp); movl errno(%ebx),%edx; negl %edx; je ret_...
     // SAFETY: 同上，current 在整个系统调用期间有效。
     let errno = unsafe { crate::sched::current() }.errno;
+    let final_ret = if errno != 0 {
+        -(errno as i64)
+    } else {
+        ret
+    };
     if errno != 0 {
         regs.rax = (-(errno as i64)) as u64;
         set_carry(regs, true);
@@ -1248,6 +1269,16 @@ pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
         regs.rax = ret as u64;
         // 负返回值也算错误（现代约定），CF 照原版一起设
         set_carry(regs, ret < 0);
+    }
+
+    // ---- DEBUG: print return value ----
+    let count = unsafe { *core::ptr::addr_of!(SYSCALL_COUNT) };
+    if count <= 60 {
+        unsafe {
+            crate::serial::putc(b'=');
+            crate::serial::raw_hex64_signed(final_ret);
+            crate::serial::putc(b'\n');
+        }
     }
 }
 

@@ -216,30 +216,46 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
 
     // 2. 从文件系统打开并读取 ELF（通过 VFS namei → read）
     let fd = unsafe { crate::fs::open::sys_open(path, crate::fs::oflags::O_RDONLY, 0) };
-    if fd < 0 { return fd; }
+    if fd < 0 {
+        crate::serial::print("EXEC: open FAILED fd=");
+        crate::serial::raw_hex64_signed(fd);
+        crate::serial::putc(b'\n');
+        return fd;
+    }
     let fd = fd as usize;
+
+    crate::serial::print("EXEC: open ok fd=");
+    crate::serial::print_dec(fd as u64);
+    crate::serial::putc(b'\n');
 
     let buf = crate::mm::get_free_page();
     if buf == 0 {
+        crate::serial::print("EXEC: get_free_page for elf buf FAILED\n");
         unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOMEM as i64);
     }
     let page_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, crate::mm::PAGE_SIZE) };
     let n = unsafe { crate::fs::read_write::read(fd, page_slice) };
-    unsafe { crate::fs::open::sys_close(fd); } // fd consumed, no more refs
-    if n < 64 {
-        crate::mm::free_page(buf);
-        return -(ENOEXEC as i64);
-    }
+    crate::serial::print("EXEC: read n=");
+    crate::serial::print_dec(n as u64);
+    crate::serial::putc(b'\n');
+    // Don't close fd yet — we'll need it for segment data loading
     let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
 
     // 3. 解析 ELF64
     let header = match parse_elf64(elf_data) {
         Ok(h) => h,
-        Err(_) => { crate::mm::free_page(buf); return -(ENOEXEC as i64); }
+        Err(_) => {
+            crate::serial::print("EXEC: parse_elf64 FAILED\n");
+            crate::mm::free_page(buf);
+            unsafe { crate::fs::open::sys_close(fd); }
+            return -(ENOEXEC as i64);
+        }
     };
     if is_executable64(&header).is_err() {
+        crate::serial::print("EXEC: is_executable64 FAILED\n");
         crate::mm::free_page(buf);
+        unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOEXEC as i64);
     }
 
@@ -255,10 +271,12 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     // 5. 分配新 PML4
     let new_pml4 = paging::alloc_pml4();
     if new_pml4 == 0 {
+        crate::serial::print("EXEC: alloc_pml4 FAILED\n");
         crate::mm::free_page(buf);
         return -(ENOMEM as i64);
     }
     if !paging::clone_kernel_pdpt(new_pml4) {
+        crate::serial::print("EXEC: clone_kernel_pdpt FAILED\n");
         free_page(new_pml4);
         crate::mm::free_page(buf);
         return -(ENOMEM as i64);
@@ -320,7 +338,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                                 let ifoff = iphd.p_offset as usize;
                                 let iprot = crate::elf::phdr_prot_to_flags(iphd.p_flags);
                                 let istart = ivaddr & !0xFFF;
-                                let iend = page_align(ivaddr + imemsz + PAGE_SIZE - 1);
+                                let iend = page_align(ivaddr + imemsz) + 16 * PAGE_SIZE;
                                 for va in (istart..iend).step_by(PAGE_SIZE) {
                                     let pg = get_free_page();
                                     if pg == 0 { break; }
@@ -339,7 +357,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                                 }
                                 if interp_base == 0 { interp_base = istart as u64; }
                             }
-                            // entry = 解释器入口
+                            // entry = 解释器入口 (relocated)
                             entry = ihdr.e_entry;
                         }
                     }
@@ -350,8 +368,21 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         }
     }
 
-    // 7. 加载主程序的 PT_LOAD 段
+    // 7. Map zero page writable (busybox reads/writes NULL during early init)
+    {
+        let pg = get_free_page();
+        if pg != 0 {
+            unsafe { paging::map_page(new_pml4, 0, pg, paging::flags::SHARED); }
+        } else {
+            crate::serial::print("EXEC: zero page alloc FAILED (non-fatal)\n");
+        }
+    }
 
+    // 8. 加载主程序的 PT_LOAD 段
+    let mut max_va: usize = 0;
+    crate::serial::print("EXEC: phnum=");
+    crate::serial::print_dec(phnum as u64);
+    crate::serial::putc(b'\n');
     for i in 0..phnum {
         let phdr = match parse_phdr64(elf_data, phoff + i * phentsize) {
             Ok(p) => p,
@@ -365,26 +396,39 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         let filesz = phdr.p_filesz as usize;
         let memsz = phdr.p_memsz as usize;
         let file_off = phdr.p_offset as usize;
-        if file_off + filesz > elf_data.len() {
-            continue;
-        }
 
         // 计算页面保护
         let prot = crate::elf::phdr_prot_to_flags(phdr.p_flags);
 
-        // 按页映射
+        // 按页映射。writable segments get 2 extra pages: BSS clearing
+        // in glibc startup walks past __bss_end to page-aligned _end symbol.
         let start_va = vaddr & !0xFFF;
-        let end_va = page_align(vaddr + memsz + PAGE_SIZE - 1);
+        let extra = if phdr.p_flags & 2 != 0 { 2 * PAGE_SIZE } else { PAGE_SIZE };
+        let end_va = page_align(vaddr + memsz) + extra;
+        crate::serial::print("EXEC: LOAD vaddr=");
+        crate::serial::raw_hex64(vaddr as u64);
+        crate::serial::print(" filesz=");
+        crate::serial::print_dec(filesz as u64);
+        crate::serial::print(" memsz=");
+        crate::serial::print_dec(memsz as u64);
+        crate::serial::print(" pages=");
+        crate::serial::print_dec(((end_va - start_va) / PAGE_SIZE) as u64);
+        crate::serial::putc(b'\n');
+        if end_va > max_va { max_va = end_va; }
         let mut va = start_va;
         while va < end_va {
             let pg = get_free_page();
             if pg == 0 {
+                crate::serial::print("EXEC: get_free_page for PT_LOAD FAILED\n");
                 crate::mm::free_page(buf);
+                unsafe { crate::fs::open::sys_close(fd); }
                 return -(ENOMEM as i64);
             }
             if !unsafe { paging::map_page(new_pml4, va, pg, prot) } {
+                crate::serial::print("EXEC: map_page for PT_LOAD FAILED\n");
                 free_page(pg);
                 crate::mm::free_page(buf);
+                unsafe { crate::fs::open::sys_close(fd); }
                 return -(ENOMEM as i64);
             }
 
@@ -394,14 +438,12 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                 let copy_end = core::cmp::min(PAGE_SIZE, vaddr + filesz - va);
                 let file_src = file_off + (va - vaddr) + copy_start;
                 let copy_len = copy_end - copy_start;
-                if file_src + copy_len <= elf_data.len() {
-                    // SAFETY: pg 在恒等映射内。
+                // Read from file descriptor (seek + read) for large ELFs
+                if copy_len > 0 {
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            elf_data.as_ptr().add(file_src),
-                            pg as *mut u8,
-                            copy_len,
-                        );
+                        crate::fs::read_write::lseek(fd, file_src as i64, crate::fs::SEEK_SET);
+                        let dest = core::slice::from_raw_parts_mut(pg as *mut u8, copy_len);
+                        crate::fs::read_write::read(fd, dest);
                     }
                 }
             }
@@ -411,13 +453,23 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         }
     }
 
-    // 7. 设置用户栈
+    // 7.5 Initialize brk to page-aligned end of loaded segments
+    unsafe {
+        let nr = sched::current_index();
+        let t = sched::task_ptr(nr);
+        (*t).brk = page_align(max_va);
+    }
+
+    // 8. 设置用户栈
     let stack_page = get_free_page();
     if stack_page == 0 {
+        crate::serial::print("EXEC: stack get_free_page FAILED\n");
         crate::mm::free_page(buf);
+        unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOMEM as i64);
     }
     if !unsafe { paging::map_page(new_pml4, USERSPACE_START as usize + 0x2000, stack_page, paging::flags::SHARED) } {
+        crate::serial::print("EXEC: stack map_page FAILED\n");
         free_page(stack_page);
         unsafe { crate::mm::free_page(buf); crate::fs::open::sys_close(fd); }
         return -(ENOMEM as i64);
@@ -477,6 +529,11 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         crate::fs::open::sys_close(fd);
     }
 
+    crate::serial::print("EXEC: success, iretq to entry=");
+    crate::serial::raw_hex64(entry);
+    crate::serial::print(" rsp=");
+    crate::serial::raw_hex64(user_rsp);
+    crate::serial::putc(b'\n');
     0
 }
 
@@ -533,99 +590,115 @@ pub fn build_minimal_elf64() -> ([u8; 256], usize) {
 }
 
 /// 构建 /sbin/init ELF64 — 打印 banner、测试 ioctl、循环 idle。
-/// Build a minimal /sbin/init ELF64:
-///   fd=1: write("shitix /sbin/init: booted!\n")
-///   fd=0: ioctl(TCGETS)
-///   exit(0)
+/// Build a minimal /init ELF64 that loops: write banner, read stdin, echo.
 pub fn build_init_elf() -> (&'static [u8], usize) {
     static mut ELF_BUF: [u8; 512] = [0; 512];
     static mut ELF_SIZE: usize = 0;
     static mut ELF_BUILT: bool = false;
 
     unsafe {
-        if ELF_BUILT {
-            return (&*core::ptr::addr_of!(ELF_BUF), ELF_SIZE);
-        }
+        if ELF_BUILT { return (&*core::ptr::addr_of!(ELF_BUF), ELF_SIZE); }
     }
 
     let vaddr: u64 = crate::umm::USERSPACE_START;
-    let msg = b"shitix /sbin/init: booted!\n";
-    let msg_len = msg.len();
+    let banner = b"\nshitix shell -- type something, exit to quit\n\0";
+    let prompt = b"> \0";
 
-    // Build code with correct RIP-relative addressing.
-    // Layout: [code][align 4][msg]
-    // LEA rsi, [rip + X] where X = msg_offset - (lea_offset + 7)
-
-    // First pass: build code with placeholder LEA offset
-    let code_template: &[u8] = &[
-        // write(1, msg, msg_len)
-        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (7B)
-        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1 (7B)
-        0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00, // lea rsi, [rip+0] placeholder (7B)
-        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // mov rdx, msg_len placeholder (7B)
-        0xcd, 0x80,                                  // int 0x80 (2B)
+    // x86_64 code: banner → loop{ prompt → read(0,buf,64) → echo → check exit → }
+    // We use absolute addressing via mov rsi, imm64 for data pointers.
+    let code: &[u8] = &[
+        // write(1, banner, banner_len)
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // 00: mov rax, 1
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // 07: mov rdi, 1
+        0x48, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x00, // 0e: movabs rsi, banner (patched)
+                    0x00, 0x00, 0x00,
+        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // 18: mov rdx, banner_len (patched)
+        0xcd, 0x80, // 22: int 0x80
+        // loop:
+        // write(1, prompt, 2)
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // 24: mov rax, 1
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // 2b: mov rdi, 1
+        0x48, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x00, // 32: movabs rsi, prompt (patched)
+                    0x00, 0x00, 0x00,
+        0x48, 0xc7, 0xc2, 0x02, 0x00, 0x00, 0x00, // 3c: mov rdx, 2
+        0xcd, 0x80, // 46: int 0x80
+        // read(0, [rsp-64], 64)
+        0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00, // 48: mov rax, 0
+        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // 4f: mov rdi, 0
+        0x48, 0x8d, 0x74, 0x24, 0xc0,             // 56: lea rsi, [rsp-64]
+        0x48, 0xc7, 0xc2, 0x40, 0x00, 0x00, 0x00, // 5b: mov rdx, 64
+        0xcd, 0x80, // 65: int 0x80
+        // if rax <= 0: exit(0)
+        0x48, 0x85, 0xc0, // 67: test rax,rax
+        0x7e, 0x25,       // 6a: jle exit (+37)
+        // echo: write(1, [rsp-64], rax)
+        0x48, 0x89, 0xc2, // 6c: mov rdx, rax
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // 6f: mov rax, 1
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // 76: mov rdi, 1
+        0x48, 0x8d, 0x74, 0x24, 0xc0,             // 7d: lea rsi, [rsp-64]
+        0xcd, 0x80, // 82: int 0x80
+        // check if "exit\n" at [rsp-64]
+        0x48, 0x8d, 0x74, 0x24, 0xc0,             // 84: lea rsi, [rsp-64]
+        0x81, 0x3e, 0x65, 0x78, 0x69, 0x74,       // 89: cmp [rsi], 'exit'
+        0x75, 0xc8, // 8f: jne loop
+        0x80, 0x7e, 0x04, 0x0a,                    // 91: cmp byte [rsi+4], '\n'
+        0x75, 0xc3, // 95: jne loop
         // exit(0)
-        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60 (7B)
-        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0 (7B)
-        0xcd, 0x80,                                  // int 0x80 (2B)
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // 97: mov rax, 60
+        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // 9e: mov rdi, 0
+        0xcd, 0x80, // a8: int 0x80
+        // Padding
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // fill to 188
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
     ];
 
-    let mut code = [0u8; 128];
-    let cs = code_template.len();
-    code[..cs].copy_from_slice(code_template);
-
-    // Compute alignment
-    let code_end_padding = (4 - (cs % 4)) % 4;
-    let msg_offset = cs + code_end_padding; // where msg starts in the binary
-
-    // LEA is at byte 14 in the code, total 7 bytes, so RIP after LEA = 14 + 7 = 21
-    let lea_at = 14usize;
-    let msg_va = vaddr + msg_offset as u64;
-    let lea_rip = vaddr + (lea_at + 7) as u64;
-    let lea_disp = (msg_va.wrapping_sub(lea_rip)) as i32;
-
-    // Write correct LEA displacement
-    code[lea_at + 3..lea_at + 7].copy_from_slice(&lea_disp.to_le_bytes());
-    // Write correct msg_len (at offset 28-32 in mov rdx instruction)
-    code[28..32].copy_from_slice(&(msg_len as u32).to_le_bytes());
-
-    let total = msg_offset + msg_len;
-    let elf_header_size = 64;
-    let phdr_size = 56;
-    let file_offset = elf_header_size + phdr_size; // 120
+    let cs = code.len(); // 188
+    let file_offset = 120usize; // ELF hdr (64) + phdr (56)
+    let banner_off = cs;
+    let prompt_off = cs + banner.len();
+    let total = cs + banner.len() + prompt.len();
 
     unsafe {
         let elf = &mut *core::ptr::addr_of_mut!(ELF_BUF);
         // ELF64 header
         elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        elf[4] = 2; elf[5] = 1; elf[6] = 1; // 64-bit, LE, v1
-        elf[16..18].copy_from_slice(&2u16.to_le_bytes());  // ET_EXEC
-        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
-        elf[20..24].copy_from_slice(&1u32.to_le_bytes());  // EV_CURRENT
-        elf[24..32].copy_from_slice(&vaddr.to_le_bytes()); // entry
-        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
-        elf[40..48].copy_from_slice(&0u64.to_le_bytes());  // shoff
-        elf[54..56].copy_from_slice(&64u16.to_le_bytes()); // ehsize
-        elf[56..58].copy_from_slice(&56u16.to_le_bytes()); // phentsize
-        elf[58..60].copy_from_slice(&1u16.to_le_bytes());  // phnum
-        // PT_LOAD phdr at offset 64
+        elf[4] = 2; elf[5] = 1; elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&vaddr.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[40..48].copy_from_slice(&0u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&64u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&56u16.to_le_bytes());
+        elf[58..60].copy_from_slice(&1u16.to_le_bytes());
+        // PT_LOAD phdr
         let mut p = 64;
-        elf[p..p+4].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
-        elf[p+4..p+8].copy_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
-        elf[p+8..p+16].copy_from_slice(&(file_offset as u64).to_le_bytes());  // p_offset
-        elf[p+16..p+24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
-        elf[p+32..p+40].copy_from_slice(&(total as u64).to_le_bytes()); // p_filesz
-        elf[p+40..p+48].copy_from_slice(&((total + 4096) as u64).to_le_bytes()); // p_memsz
-        elf[p+48..p+56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        let memsz = total + 4096;
+        elf[p..p+4].copy_from_slice(&1u32.to_le_bytes());
+        elf[p+4..p+8].copy_from_slice(&7u32.to_le_bytes());
+        elf[p+8..p+16].copy_from_slice(&(file_offset as u64).to_le_bytes());
+        elf[p+16..p+24].copy_from_slice(&vaddr.to_le_bytes());
+        elf[p+32..p+40].copy_from_slice(&(total as u64).to_le_bytes());
+        elf[p+40..p+48].copy_from_slice(&(memsz as u64).to_le_bytes());
+        elf[p+48..p+56].copy_from_slice(&0x1000u64.to_le_bytes());
         p += 56;
-        // Code
+        // Copy code
         elf[p..p+cs].copy_from_slice(&code[..cs]);
+        // Patch movabs rsi for banner (offset 0x0e+2 = bytes 16-23 of code)
+        let banner_va = vaddr + file_offset as u64 + banner_off as u64;
+        elf[p+0x10..p+0x18].copy_from_slice(&banner_va.to_le_bytes());
+        // Patch banner_len (offset 0x18+2 = bytes 26-29 of code)
+        elf[p+0x1a..p+0x1e].copy_from_slice(&(banner.len() as u32).to_le_bytes());
+        // Patch movabs rsi for prompt (offset 0x32+2 = bytes 52-59 of code)
+        let prompt_va = vaddr + file_offset as u64 + prompt_off as u64;
+        elf[p+0x34..p+0x3c].copy_from_slice(&prompt_va.to_le_bytes());
         p += cs;
-        // Align
-        while p % 4 != 0 { p += 1; }
-        // Message
-        elf[p..p+msg_len].copy_from_slice(msg);
-        p += msg_len;
+        // Data
+        elf[p..p+banner.len()].copy_from_slice(banner);
+        p += banner.len();
+        elf[p..p+prompt.len()].copy_from_slice(prompt);
+        p += prompt.len();
 
         ELF_SIZE = p;
         ELF_BUILT = true;
@@ -696,26 +769,56 @@ pub fn times(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 「无效 fd」和「未打开」，暂时统一）。
 pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let fd = args.a0 as i64;
-    if fd < 0 {
-        return -(EBADF as i64);
-    }
+    if fd < 0 { return -(EBADF as i64); }
     let sz64 = args.a2;
     if sz64 == 0 { return 0; }
-    // Pipe fast path: bypass VFS
     if crate::fs::pipe::fd_is_pipe(fd as usize) {
         let pipe_idx = crate::fs::pipe::fd_to_pipe(fd as usize).unwrap();
         return crate::fs::pipe::pipe_write(pipe_idx, args.a1 as *const u8, sz64 as usize);
     }
     // SAFETY: user_buf 已校验范围。
-    let fd_usize = fd as usize;
     let buf = match unsafe { user_buf(args.a1, sz64) } {
         Ok(b) => b,
-        Err(e) => return e,
+        Err(e) => {
+            // DEBUG
+            crate::serial::print("W: user_buf failed\n");
+            return e;
+        }
     };
+
+    // DEBUG: check fd via filp
+    {
+        let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
+        crate::serial::print("W: fd=");
+        crate::serial::print_dec(fd as u64);
+        crate::serial::print(" filp=");
+        crate::serial::raw_hex64(filp_idx as u64);
+        crate::serial::putc(b'\n');
+        if filp_idx != crate::fs::inode::NIL {
+            let fp = unsafe { crate::fs::file_table::filp(filp_idx) };
+            let ino = fp.f_inode;
+            crate::serial::print("W: inode=");
+            crate::serial::raw_hex64(ino as u64);
+            crate::serial::print(" mode=");
+            crate::serial::raw_hex64(fp.f_mode as u64);
+            crate::serial::putc(b'\n');
+            if ino != crate::fs::inode::NIL {
+                let ip = unsafe { crate::fs::inode::inode(ino) };
+                crate::serial::print("W: ino.i_op=");
+                crate::serial::print_dec(ip.i_op as u64);
+                crate::serial::print(" i_rdev=");
+                crate::serial::raw_hex64(ip.i_rdev as u64);
+                crate::serial::putc(b'\n');
+            }
+        }
+    }
 
     // 先走 fs 层：fd 真的 open 过就写文件/设备。
     // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
     let r = unsafe { crate::fs::read_write::write(fd as usize, buf) };
+    crate::serial::print("W: rw_ret=");
+    crate::serial::raw_hex64_signed(r);
+    crate::serial::putc(b'\n');
     if r != -(EBADF as i64) {
         return r;
     }
@@ -726,6 +829,7 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd != 1 && fd != 2 {
         return -(EBADF as i64);
     }
+    crate::serial::print("W: fallback console write\n");
     match core::str::from_utf8(buf) {
         Ok(s) => {
             crate::print!("{}", s);
@@ -823,11 +927,14 @@ pub fn brk(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             let end = crate::mm::page::page_align(new_brk + crate::mm::PAGE_SIZE - 1);
             let mut va = start;
             while va < end {
-                let pg = get_free_page();
-                if pg == 0 { return old_brk as i64; }
-                if !paging::map_page(pml4, va, pg, paging::flags::SHARED) {
-                    free_page(pg);
-                    return old_brk as i64;
+                // Skip already-mapped pages (ELF segments etc)
+                if paging::translate(pml4, va).is_none() {
+                    let pg = get_free_page();
+                    if pg == 0 { return old_brk as i64; }
+                    if !paging::map_page(pml4, va, pg, paging::flags::SHARED) {
+                        free_page(pg);
+                        return old_brk as i64;
+                    }
                 }
                 va += crate::mm::PAGE_SIZE;
             }
@@ -1310,16 +1417,44 @@ pub fn fcntl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
     
     match cmd {
-        // F_DUPFD - 复制文件描述符
-        0 => -(ENOSYS as i64),
-        // F_GETFD - 获取文件描述符标志
+        // F_DUPFD: duplicate fd, return >= arg
+        0 => {
+            let start = arg.max(0);
+            let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
+            if filp_idx == crate::fs::inode::NIL { return -(EBADF as i64); }
+            // Find a free fd >= start
+            let mut new_fd = start;
+            let nr = unsafe { crate::sched::current_index() };
+            while new_fd < crate::fs::NR_OPEN {
+                if unsafe { crate::fs::open::task_fd(nr, new_fd) == crate::fs::inode::NIL }
+                    && !crate::fs::pipe::fd_is_pipe(new_fd)
+                    && !crate::net::socket::fd_is_socket(new_fd)
+                {
+                    unsafe { crate::fs::open::set_task_fd(nr, new_fd, filp_idx); }
+                    unsafe { crate::fs::file_table::filp(filp_idx).f_count += 1; }
+                    return new_fd as i64;
+                }
+                new_fd += 1;
+            }
+            -(crate::klib::errno::EMFILE as i64)
+        }
+        // F_GETFD
         1 => 0,
-        // F_SETFD - 设置文件描述符标志
+        // F_SETFD
         2 => 0,
-        // F_GETFL - 获取文件状态标志
-        3 => 0, // O_ACCMODE 暂时返回 0
-        // F_SETFL - 设置文件状态标志
-        4 => 0,
+        // F_GETFL
+        3 => {
+            let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
+            if filp_idx == crate::fs::inode::NIL { return -(EBADF as i64); }
+            unsafe { crate::fs::file_table::filp(filp_idx).f_flags as i64 }
+        }
+        // F_SETFL
+        4 => {
+            let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
+            if filp_idx == crate::fs::inode::NIL { return -(EBADF as i64); }
+            unsafe { crate::fs::file_table::filp(filp_idx).f_flags = arg as u32; }
+            0
+        }
         _ => -(EINVAL as i64),
     }
 }
@@ -2098,8 +2233,48 @@ pub fn getrlimit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// process control.
 pub fn prctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let option = args.a0 as i32;
-    crate::pr_warn!("sys_prctl: option={} (stub)", option);
-    -(ENOSYS as i64)
+    let arg2 = args.a1;
+    match option {
+        3 => 1,  // PR_GET_DUMPABLE → superuser dumpable
+        4 => 0,  // PR_SET_DUMPABLE → accepted
+        15 => { // PR_SET_NAME: set task comm
+            let name_ptr = arg2 as *const u8;
+            if name_ptr.is_null() { return -(EFAULT as i64); }
+            unsafe {
+                let t = sched::current();
+                let mut len = 0;
+                while len < 15 {
+                    let b = core::ptr::read_volatile(name_ptr.add(len));
+                    if b == 0 { break; }
+                    t.comm[len] = b;
+                    len += 1;
+                }
+                t.comm[len] = 0;
+            }
+            0
+        }
+        16 => { // PR_GET_NAME: get task comm
+            let buf = arg2 as *mut u8;
+            if buf.is_null() { return -(EFAULT as i64); }
+            unsafe {
+                let t = sched::current();
+                let mut i = 0;
+                while i < 16 {
+                    core::ptr::write_volatile(buf.add(i), t.comm[i]);
+                    if t.comm[i] == 0 { break; }
+                    i += 1;
+                }
+            }
+            0
+        }
+        22 => 0, // PR_SET_SECCOMP
+        23 => 0, // PR_CAPBSET_READ
+        36 => 0, // PR_SET_NO_NEW_PRIVS
+        _ => {
+            crate::pr_warn!("sys_prctl: option={} (stub)", option);
+            0 // Be permissive: most prctl options are optional
+        }
+    }
 }
 
 /// set child tid address.

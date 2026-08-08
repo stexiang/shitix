@@ -123,7 +123,8 @@ pub mod full {
         pub ext4_sb: Ext4SuperBlock,
         pub ext4_gd: Ext4GroupDesc,
         pub inode_size: u32,
-        pub block_size: usize,
+        pub block_size: usize,    // always 1024 for buffer cache
+        pub fs_block_size: usize, // actual filesystem block size
         pub inodes_per_group: u32,
         pub blocks_per_group: u32,
         pub valid: bool,
@@ -136,7 +137,8 @@ pub mod full {
                 block_bitmap: 0, inode_bitmap: 0, inode_table: 0, free_blocks_count: 0,
                 free_inodes_count: 0, used_dirs_count: 0, flags: 0, itable_unused: 0, checksum: 0,
             },
-            inode_size: 128, block_size: 1024, inodes_per_group: 0, blocks_per_group: 0, valid: false,
+            inode_size: 128, block_size: 1024, fs_block_size: 1024,
+            inodes_per_group: 0, blocks_per_group: 0, valid: false,
         }
     }
 
@@ -229,13 +231,29 @@ pub mod full {
                     i.data = [0; 9];
                     if ei.uses_extent() {
                         let ib = ei.i_block_raw();
-                        if u16::from_le_bytes([ib[0],ib[1]]) == 0xF30A && ib[2] > 0 {
-                            let p = u32::from_le_bytes([ib[20],ib[21],ib[22],ib[23]]);
-                            i.data[0] = p as u16;
+                        if u16::from_le_bytes([ib[0],ib[1]]) == 0xF30A {
+                            let n_entries = ib[2] as usize;
+                            let scale = (info.fs_block_size / 1024) as u32;
+                            // Parse all extent entries, populate i.data for each logical block
+                            for e in 0..n_entries {
+                                let off = 12 + e * 12; // header(12) + entry(12)
+                                let ee_block = u32::from_le_bytes([ib[off],ib[off+1],ib[off+2],ib[off+3]]);
+                                let ee_len = u16::from_le_bytes([ib[off+4],ib[off+5]]) as u32;
+                                let ee_start_lo = u32::from_le_bytes([ib[off+8],ib[off+9],ib[off+10],ib[off+11]]);
+                                // Populate i.data[logical_blk] for each 1024-byte block in this extent
+                                let phys_base = ee_start_lo * scale; // first 1024-byte block
+                                for blk in 0..(ee_len * scale) {
+                                    let idx = (ee_block * scale + blk) as usize;
+                                    if idx < 9 {
+                                        i.data[idx] = (phys_base + blk) as u16;
+                                    }
+                                }
+                            }
                         }
                         i.i_flags |= super::super::inode_flags::EXT4_EXTENTS_FL as u64;
                     } else {
-                        i.data[0] = ei.i_block[0] as u16;
+                        let scale = (info.fs_block_size / 1024) as u32;
+                        i.data[0] = (ei.i_block[0] as u32 * scale) as u16;
                     }
                 }
             }
@@ -390,7 +408,7 @@ pub mod full {
         if data.len() < 58 || data[56] != 0x53 || data[57] != 0xEF {
             unsafe { buffer::brelse(bn); } return false;
         }
-        let block_size: usize = 1024 << (data[24] as usize);
+        let fs_block_size: usize = 1024 << (data[24] as usize);
         let bpg = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
         let inodes_pg = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
         let inode_size: u32 = {
@@ -401,37 +419,51 @@ pub mod full {
             } else { 128 }
         };
         let features_incompat = u32::from_le_bytes([data[96], data[97], data[98], data[99]]);
-        let desc_block = if block_size == 1024 { 2u32 } else { 1u32 };
-        let desc_bn = match unsafe { buffer::bread(dev, desc_block, block_size) } {
+        // Always use 1024-byte buffer reads to avoid cache key conflicts.
+        // For filesystems with 4096-byte blocks, the descriptor table is at
+        // 1024-byte block numbers: 2 (for 1024B blocks) or 4 (for 4096B blocks).
+        let desc_1024_block = if fs_block_size == 1024 { 2u32 } else { 4u32 };
+        let desc_bn = match unsafe { buffer::bread(dev, desc_1024_block, 1024) } {
             Some(b) => b, None => { unsafe { buffer::brelse(bn); } return false; }
         };
         let desc_data = unsafe { bh(desc_bn).data() };
         let desc_size = if (features_incompat & 0x0080) != 0 { 64 } else { 32 };
-        let gd = match Ext4GroupDesc::from_bytes(&desc_data[..desc_size], desc_size) {
+        let mut gd = match Ext4GroupDesc::from_bytes(&desc_data[..desc_size], desc_size) {
             Some(g) => g, None => { unsafe { buffer::brelse(desc_bn); buffer::brelse(bn); } return false; }
         };
         let ext4_sb = unsafe { Ext4SuperBlock::from_slice(data) };
         let info = ext4_info_mut(n);
+        let scale = (fs_block_size / 1024) as u32; // 1 for 1K, 4 for 4K blocks
+        // Scale filesystem-block fields to 1024-byte buffer blocks
+        let mut gd = gd;
+        gd.block_bitmap *= scale as u64;
+        gd.inode_bitmap *= scale as u64;
+        gd.inode_table *= scale as u64;
+        gd.free_blocks_count *= scale;
         info.ext4_sb = ext4_sb; info.ext4_gd = gd; info.inode_size = inode_size;
-        info.block_size = block_size; info.inodes_per_group = inodes_pg;
-        info.blocks_per_group = bpg; info.valid = true;
+        info.block_size = 1024; // Always use 1024-byte buffer blocks
+        info.fs_block_size = fs_block_size; // Actual filesystem block size for scaling
+        info.inodes_per_group = inodes_pg;
+        info.blocks_per_group = bpg * scale;
+        info.valid = true;
 
         unsafe {
             let s = super_block::sb_ptr(n);
-            (*s).s_magic = 0xEF53; (*s).s_blocksize = block_size as u32;
-            (*s).s_blocksize_bits = (10 + (data[24] & 0x07)) as u8;
+            // Always use 1024-byte blocks for buffer cache compatibility.
+            // Filesystem with 4096-byte blocks multiplies block numbers by 4.
+            (*s).s_magic = 0xEF53; (*s).s_blocksize = 1024;
+            (*s).s_blocksize_bits = 10;
             (*s).s_dirsize = 32; (*s).s_namelen = 255;
             let ip = inode::iget(n, 2);
             if ip == NIL { unsafe { buffer::brelse(desc_bn); buffer::brelse(bn); } return false; }
             let i = inode::inode(ip);
-            i.i_mode = 0o40755; i.i_nlink = 2; i.i_size = 1024;
             i.i_op = FsType::Ext2; i.i_sb = n;
             let info_ref = ext4_info(n);
             let inode_table = info_ref.ext4_gd.inode_table;
             let byte_off = 1u64 * inode_size as u64;
-            let ino_block = inode_table + byte_off / block_size as u64;
-            let ino_off = (byte_off % block_size as u64) as usize;
-            if let Some(ino_bn) = buffer::bread(dev, ino_block as u32, block_size) {
+            let ino_block = inode_table + byte_off / info.block_size as u64;
+            let ino_off = (byte_off % info.block_size as u64) as usize;
+            if let Some(ino_bn) = buffer::bread(dev, ino_block as u32, info.block_size) {
                 let idata = bh(ino_bn).data();
                 if ino_off + inode_size as usize <= idata.len() {
                     if let Some(ei) = Ext4Inode::from_bytes(&idata[ino_off..ino_off + inode_size as usize]) {
@@ -439,16 +471,26 @@ pub mod full {
                         i.i_nlink = ei.i_links_count as u16; i.i_size = ei.i_size() as u32;
                         i.i_mode = ei.i_mode; i.i_atime = ei.atime(); i.i_mtime = ei.mtime(); i.i_ctime = ei.ctime();
                         let i_block = ei.i_block_raw();
-                        // 从 extent 树中提取第一个数据块号存入 data[0]
+                        // Parse all extent entries, populate i.data for each logical block
                         if ei.uses_extent() {
                             let m = u16::from_le_bytes([i_block[0], i_block[1]]);
-                            if m == 0xF30A && i_block[2] > 0 {
-                                let ee_start_lo = u32::from_le_bytes([i_block[20], i_block[21], i_block[22], i_block[23]]);
-                                i.data[0] = ee_start_lo as u16;
+                            if m == 0xF30A {
+                                let n_entries = i_block[2] as usize;
+                                for e in 0..n_entries {
+                                    let off = 12 + e * 12;
+                                    let ee_blk = u32::from_le_bytes([i_block[off],i_block[off+1],i_block[off+2],i_block[off+3]]);
+                                    let ee_len = u16::from_le_bytes([i_block[off+4],i_block[off+5]]) as u32;
+                                    let ee_lo = u32::from_le_bytes([i_block[off+8],i_block[off+9],i_block[off+10],i_block[off+11]]);
+                                    let phys_base = ee_lo * scale;
+                                    for blk in 0..(ee_len * scale) {
+                                        let idx = (ee_blk * scale + blk) as usize;
+                                        if idx < 9 { i.data[idx] = (phys_base + blk) as u16; }
+                                    }
+                                }
                                 i.i_flags |= super::super::inode_flags::EXT4_EXTENTS_FL as u64;
                             }
                         } else {
-                            i.data[0] = ei.i_block[0] as u16;
+                            i.data[0] = (ei.i_block[0] as u32 * scale) as u16;
                         }
                     }
                 }

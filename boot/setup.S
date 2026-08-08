@@ -77,7 +77,7 @@ _setup_start:
     movw    %ax, %es
     xorl    %ebx, %ebx
     xorw    %bp, %bp
-    movw    $0xE000, %di        /* es:di = 0x9E000, 避开 setup 自身 */
+    movw    $0xF000, %di        /* es:di = 0x9F000, 避开 setup 自身与 kernel BSS */
 e820_loop:
     movl    $0x0000E820, %eax
     movl    $0x534D4150, %edx   /* 'SMAP' */
@@ -88,7 +88,7 @@ e820_loop:
     jne     e820_done
     incw    %bp
     addw    $20, %di
-    cmpw    $0xE000 + 20*128, %di
+    cmpw    $0xF000 + 20*128, %di
     jae     e820_done
     testl   %ebx, %ebx
     jnz     e820_loop
@@ -163,10 +163,10 @@ e820_done:
     movl    $PML4_ADDR, %eax
     movl    %eax, %cr3
 
-/* EFER.LME = 1 */
+/* EFER.LME = 1, EFER.SCE = 1 (syscall enable) */
     movl    $0xC0000080, %ecx
     rdmsr
-    orl     $0x100, %eax
+    orl     $0x101, %eax
     wrmsr
 
 /* 同时开 PG 和 PE，直接进入 long mode 的 compatibility 状态 */

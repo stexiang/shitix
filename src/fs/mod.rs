@@ -46,7 +46,7 @@ pub use inode::{Inode, iget, iput};
 pub use super_block::{SuperBlock, mount_root};
 
 /// 原版 `NR_OPEN 256`。每进程 fd 上限。与 Task 的 filp 数组大小一致。
-pub const NR_OPEN: usize = 16;
+pub const NR_OPEN: usize = 64;
 /// 原版 `NR_INODE 2048`，缩到 64。
 pub const NR_INODE: usize = 64;
 /// 原版 `NR_FILE 1024`，缩到 32。

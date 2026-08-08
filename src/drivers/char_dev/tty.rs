@@ -403,6 +403,14 @@ unsafe fn echo_char(t: &mut Tty, c: u8) {
 /// 只能在进程上下文调用（`ISIG` 路径会发信号）。调用时需已关中断，
 /// 因为要与键盘中断争 `read_q`。
 pub unsafe fn copy_to_cooked() {
+    // Poll serial port for input and feed into TTY read queue
+    while crate::serial::has_char() {
+        let c = crate::serial::getc();
+        let t = tty();
+        if !t.read_q.is_full() {
+            t.read_q.put(c);
+        }
+    }
     // SAFETY: 契约转交。
     unsafe {
         let t = tty();
@@ -596,10 +604,18 @@ pub unsafe fn tty_read(buf: &mut [u8]) -> i64 {
                 return n as i64;
             }
             crate::irq::restore_flags(flags);
-            // 没数据：睡在 secondary 上等键盘中断唤醒。
-            // 原版这里还检查 `current->signal & ~current->blocked` 以便
-            // 被信号打断时返回 -ERESTARTSYS；signal.rs 到位后补上。
-            (*core::ptr::addr_of_mut!(TTY)).secondary.proc_list.interruptible_sleep_on();
+            // 没数据：轮询串口 + 定时睡眠
+            while crate::serial::has_char() {
+                let c = crate::serial::getc();
+                if !tty().read_q.is_full() {
+                    tty().read_q.put(c);
+                }
+            }
+            // Sleep 1 tick to let other tasks run and wait for input
+            let t = crate::sched::current();
+            t.state = crate::sched::task::TaskState::Interruptible;
+            t.timeout = crate::sched::jiffies() + 1;
+            crate::sched::schedule();
         }
     }
 }
@@ -616,6 +632,10 @@ pub unsafe fn tty_read(buf: &mut [u8]) -> i64 {
 /// # Safety
 /// 只能在进程上下文调用。
 pub unsafe fn tty_write(buf: &[u8]) -> i64 {
+    // DEBUG
+    crate::serial::print("TTY_W: len=");
+    crate::serial::print_dec(buf.len() as u64);
+    crate::serial::putc(b'\n');
     // SAFETY: 契约转交。
     unsafe {
         let t = tty();

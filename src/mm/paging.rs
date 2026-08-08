@@ -110,17 +110,31 @@ unsafe fn set_entry(table: usize, idx: usize, val: u64) {
 /// # Safety
 /// `table` 必须是有效的、被恒等映射的页表页物理地址。
 unsafe fn next_level(table: usize, idx: usize, user: bool) -> Option<usize> {
-    // SAFETY: 由调用者契约保证 table 有效。
     unsafe {
         let e = entry(table, idx);
         if e & flags::PRESENT != 0 {
             if e & flags::HUGE != 0 {
-                // 撞到 setup.S 建的 2MB 大页：不在这里做拆分，交给调用者处理
-                return None;
+                // Split 2MB large page for user-space access.
+                // Strip GLOBAL flag — TLB entries with GLOBAL persist across CR3
+                // switches and would point to old 2MB pages instead of new 4KB ones.
+                let pt = get_free_page();
+                if pt == 0 { return None; }
+                let phys = e & ADDR_MASK;
+                // Keep PRESENT|RW but NEVER add USER: the split entries cover
+                // the entire 2MB region including free pages that contain
+                // allocator metadata (free-list pointers). USER flag is added
+                // later by map_page only for the specific pages the ELF loader
+                // allocates. Also strip HUGE and GLOBAL.
+                let base_flags = (e & !ADDR_MASK & !flags::HUGE & !0x100) | flags::PRESENT;
+                for i in 0..512 {
+                    set_entry(pt, i, (phys + i as u64 * 4096) | base_flags);
+                }
+                let mut new_e = (pt as u64) | base_flags;
+                if user { new_e |= flags::USER; }
+                set_entry(table, idx, new_e);
+                return Some(pt);
             }
             // 条目已存在：追加 USER 位（如果需要且尚未设置）。
-            // 这是 2026-08-07 修的关键 bug——之前这里直接 return，
-            // 漏掉了「在共享页表条目上补 USER」这条路径。
             if user && (e & flags::USER == 0) {
                 set_entry(table, idx, e | flags::USER);
             }
@@ -268,26 +282,29 @@ pub fn alloc_pml4() -> usize {
 
 /// 在新分配的用户 PML4 里建立内核映射。
 ///
-/// 分配一个干净的 PDPT 页，PDPT[0] = kernel_pd(0x6000) | PRESENT | RW（无 USER），
-/// 其他 PDPT 条目为 0（供用户空间使用，隔离各进程的用户页表子树）。
+/// 分配独立的 PDPT + PD 页，复制内核 PD 条目。
+/// 这样用户进程的 2MB 页拆分不会污染共享内核 PD(0x6000)。
 ///
 /// 返回 false 表示 `dst_pml4 == 0` 或内存不足。
 pub fn clone_kernel_pdpt(dst_pml4: usize) -> bool {
     if dst_pml4 == 0 {
         return false;
     }
-    // 分配一个独立的 PDPT 页，避免与启动 PDPT(0x5000) 共享
-    // 从而隔离各进程的用户页表子树。
     let pdpt = get_free_page();
-    if pdpt == 0 {
+    let pd = get_free_page();
+    if pdpt == 0 || pd == 0 {
+        if pdpt != 0 { crate::mm::free_page(pdpt); }
+        if pd != 0 { crate::mm::free_page(pd); }
         return false;
     }
-    // SAFETY：dst_pml4 / pdpt 在恒等映射内可写。
+    // SAFETY：dst_pml4 / pdpt / pd 在恒等映射内可写。
     unsafe {
-        // PML4[0] → 新的 PDPT（先不设 USER，等 map_page 需要时再加）
+        // Copy kernel PD entries (512 × 8 bytes = 4096 bytes) from 0x6000
+        core::ptr::copy_nonoverlapping(0x6000usize as *const u8, pd as *mut u8, 4096);
+        // PML4[0] → new PDPT
         set_entry(dst_pml4, 0, pdpt as u64 | flags::PRESENT | flags::RW);
-        // PDPT[0] → 内核 PD(0x6000)，无 USER
-        set_entry(pdpt, 0, 0x6000u64 | flags::PRESENT | flags::RW);
+        // PDPT[0] → NEW PD (not shared 0x6000)
+        set_entry(pdpt, 0, pd as u64 | flags::PRESENT | flags::RW);
     }
     true
 }

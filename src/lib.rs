@@ -708,72 +708,56 @@ fn build_sbin_init() -> (&'static [u8], usize) {
     syscall::sys::build_init_elf()
 }
 
+/// Build a simple interactive /init ELF64: banner → read stdin → echo → exit on "exit".
+/// (For future shell testing; currently uses build_init_elf for basic boot test.)
+#[allow(dead_code)]
+fn build_shell_elf() -> (&'static [u8], usize) {
+    build_sbin_init() // placeholder
+}
+
 fn fs_init_thread(_arg: u64) {
     if LFS_BOOT {
-        sprintln!("LFS: === real boot mode ===");
+        sprintln!("LFS: === LFS boot mode ===");
 
-        // 1. Try IDE ext4 mount, fallback to ramdisk
-        sprintln!("LFS: trying to mount root from IDE...");
-        let root_dev = fs::mkdev(3, 0);
-        let mounted = unsafe { fs::mount_root(root_dev, 0) };
-        if !mounted {
-            sprintln!("LFS: IDE mount failed, creating ramdisk ext4");
-            if !(unsafe { fs::ext4::mkfs::mkfs(drivers::block::ramdisk::RD_BLOCKS as u32, 512) }) {
-                panic!("mkfs.ext4 failed");
-            }
-            unsafe { fs::mount_root(drivers::block::ramdisk::RAMDISK_DEV, 0) };
-        }
-
-        // 2. Create /dev/console device node at root
-        sprintln!("LFS: creating /dev/console...");
+        // 1. Wire fd 0/1/2 to TTY console (direct inode, no filesystem needed)
+        sprintln!("LFS: wiring fd 0/1/2 to console...");
         unsafe {
-            fs::namei::do_mknod(b"/console",
-                fs::mode::S_IFCHR | 0o666,
-                fs::mkdev(drivers::block::major::TTY_MAJOR, 0));
-        }
-
-        // 3. Create /init ELF at root level (like the working execve_selftest)
-        sprintln!("LFS: creating /init...");
-        unsafe {
-            let (elf_data, elf_size) = build_sbin_init();
-            let fd = fs::open::sys_creat(b"/init", 0o755);
-            if fd >= 0 {
-                fs::read_write::write(fd as usize, &elf_data[..elf_size]);
-                fs::open::sys_close(fd as usize);
-                sprintln!("LFS: /init written ({} bytes)", elf_size);
-            } else {
-                sprintln!("LFS: creat /init failed: {}", fd);
-            }
-        }
-
-        // 4. Open stdin/stdout/stderr → /dev/console
-        sprintln!("LFS: opening stdin/stdout/stderr...");
-        unsafe {
-            for fd in 0..3u64 {
-                let f = crate::fs::open::sys_open(
-                    b"/console", crate::fs::oflags::O_RDWR, 0);
-                if f != fd as i64 {
-                    sprintln!("LFS: warning: wanted fd {} got {}", fd, fd);
+            let console_ino = crate::fs::inode::get_empty_inode();
+            if console_ino != crate::fs::inode::NIL {
+                let ino = crate::fs::inode::inode(console_ino);
+                ino.i_mode = crate::fs::mode::S_IFCHR | 0o666;
+                ino.i_op = crate::fs::inode::FsType::Chr;
+                ino.i_rdev = crate::fs::mkdev(drivers::block::major::TTY_MAJOR, 0);
+                ino.i_count = 3;
+                for fd in 0..3usize {
+                    let filp = crate::fs::file_table::get_empty_filp();
+                    if filp != crate::fs::inode::NIL {
+                        let f = crate::fs::file_table::filp(filp);
+                        f.f_mode = 3; // O_RDWR (bit0=read, bit1=write)
+                        f.f_inode = console_ino;
+                        crate::fs::open::set_task_fd(crate::sched::current_index(), fd, filp);
+                    }
                 }
             }
         }
 
-        // 5. Verify
-        sprintln!("LFS: verifying /init...");
-        let test_fd = unsafe {
-            crate::fs::open::sys_open(b"/init", crate::fs::oflags::O_RDONLY, 0)
-        };
-        sprintln!("LFS: open /init = {}", test_fd);
-
-        // Set FS_INIT_DONE first (like execve_selftest does)
+        // 2. Mount root: try IDE, fallback to ramdisk
+        sprintln!("LFS: mounting root...");
+        let ide_dev = fs::mkdev(3, 1);
+        let mounted = unsafe { fs::mount_root(ide_dev, 0) };
         unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
 
-        sprintln!("LFS: execve /init...");
-        let ret = unsafe {
-            syscall::syscall3(syscall::nr::EXECVE,
-                b"/init\0".as_ptr() as u64, 0, 0)
-        };
-        sprintln!("LFS: /init returned {} (should not reach)", ret);
+        if mounted {
+            sprintln!("LFS: execve /bin/sh...");
+            let ret = unsafe {
+                syscall::syscall3(syscall::nr::EXECVE,
+                    b"/bin/sh\0".as_ptr() as u64, 0, 0)
+            };
+            sprintln!("LFS: /bin/sh returned {}", ret);
+        } else {
+            sprintln!("LFS: IDE not found — run with second drive for busybox shell");
+            sprintln!("LFS: (current boot continues to selftest mode)");
+        }
         return;
     }
 
