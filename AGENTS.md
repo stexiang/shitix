@@ -18,6 +18,9 @@
 ### 已解决的历史问题
 - ~~LLVM noalias 优化导致 super block 数据竞争~~（bug-023）
 - ~~内存溢出（OOM）导致 panic~~
+- ~~execve 硬编码 argv（argc=1/argv[0]="/bin/sh"）导致外部命令拿不到参数~~
+- ~~sendfile 是返回 0 的存根，busybox cat 用 sendfile 时静默无输出~~
+- ~~clone/fork 不复制 fd 表（clone_fds 错误地只在 CLONE_FILES 时调用），子进程无 stdin/stdout/stderr~~
 - ~~COW 页面故障未处理导致 SIGSEGV~~（bug-cow）：`try_handle_cow_fault` 对
   引用计数为 0（未跟踪）的页返回 `Some(false)`，fork 后父进程写栈即被杀。
   已改为 refs<=1 直接授予写权限（保留 NX 位）。
