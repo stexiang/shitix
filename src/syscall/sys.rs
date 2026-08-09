@@ -910,46 +910,12 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // SAFETY: user_buf 已校验范围。
     let buf = match unsafe { user_buf(args.a1, sz64) } {
         Ok(b) => b,
-        Err(e) => {
-            // DEBUG
-            crate::serial::print("W: user_buf failed\n");
-            return e;
-        }
+        Err(e) => return e,
     };
-
-    // DEBUG: check fd via filp
-    {
-        let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
-        crate::serial::print("W: fd=");
-        crate::serial::print_dec(fd as u64);
-        crate::serial::print(" filp=");
-        crate::serial::raw_hex64(filp_idx as u64);
-        crate::serial::putc(b'\n');
-        if filp_idx != crate::fs::inode::NIL {
-            let fp = unsafe { crate::fs::file_table::filp(filp_idx) };
-            let ino = fp.f_inode;
-            crate::serial::print("W: inode=");
-            crate::serial::raw_hex64(ino as u64);
-            crate::serial::print(" mode=");
-            crate::serial::raw_hex64(fp.f_mode as u64);
-            crate::serial::putc(b'\n');
-            if ino != crate::fs::inode::NIL {
-                let ip = unsafe { crate::fs::inode::inode(ino) };
-                crate::serial::print("W: ino.i_op=");
-                crate::serial::print_dec(ip.i_op as u64);
-                crate::serial::print(" i_rdev=");
-                crate::serial::raw_hex64(ip.i_rdev as u64);
-                crate::serial::putc(b'\n');
-            }
-        }
-    }
 
     // 先走 fs 层：fd 真的 open 过就写文件/设备。
     // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
     let r = unsafe { crate::fs::read_write::write(fd as usize, buf) };
-    crate::serial::print("W: rw_ret=");
-    crate::serial::raw_hex64_signed(r);
-    crate::serial::putc(b'\n');
     if r != -(EBADF as i64) {
         return r;
     }
@@ -960,7 +926,6 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd != 1 && fd != 2 {
         return -(EBADF as i64);
     }
-    crate::serial::print("W: fallback console write\n");
     match core::str::from_utf8(buf) {
         Ok(s) => {
             crate::print!("{}", s);

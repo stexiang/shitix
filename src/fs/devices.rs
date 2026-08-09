@@ -171,24 +171,10 @@ pub unsafe fn chrdev_write(rdev: u16, pos: u64, buf: &[u8]) -> i64 {
     unsafe {
         let ma = major(rdev);
         let mi = minor(rdev);
-        crate::serial::print("CHR: major=");
-        crate::serial::print_dec(ma as u64);
-        crate::serial::print(" minor=");
-        crate::serial::print_dec(mi as u64);
-        crate::serial::putc(b'\n');
         match get_chrfops(ma) {
-            Some(CharDev::Tty) => {
-                crate::serial::print("CHR: -> tty_write\n");
-                char_dev::tty::tty_write(buf)
-            }
-            Some(CharDev::Mem) => {
-                crate::serial::print("CHR: -> mem_write\n");
-                char_dev::mem::write(mi, pos, buf)
-            }
-            None => {
-                crate::serial::print("CHR: no driver\n");
-                -(ENXIO as i64)
-            }
+            Some(CharDev::Tty) => char_dev::tty::tty_write(buf),
+            Some(CharDev::Mem) => char_dev::mem::write(mi, pos, buf),
+            None => -(ENXIO as i64),
         }
     }
 }

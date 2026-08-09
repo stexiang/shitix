@@ -632,10 +632,6 @@ pub unsafe fn tty_read(buf: &mut [u8]) -> i64 {
 /// # Safety
 /// 只能在进程上下文调用。
 pub unsafe fn tty_write(buf: &[u8]) -> i64 {
-    // DEBUG
-    crate::serial::print("TTY_W: len=");
-    crate::serial::print_dec(buf.len() as u64);
-    crate::serial::putc(b'\n');
     // SAFETY: 契约转交。
     unsafe {
         let t = tty();
