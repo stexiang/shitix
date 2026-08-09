@@ -86,14 +86,27 @@ cargo build "${CARGO_FLAGS[@]}" 2> >(grep -v 'ld\.so\.preload' >&2 || true)
 [[ -f "$CARGO_OUT" ]] || die "找不到 $CARGO_OUT"
 
 step "汇编 bootsect / setup / head"
+# 可选：用 KERNEL_CMDLINE 环境变量覆盖 setup.S 里内置的默认内核命令行
+# （等价原版 CONFIG_CMDLINE）。未设置时用 setup.S 里的 cmdline_default。
+SETUP_LINK_OBJS=()
+SETUP_ASDEFS=()
+if [[ -n "${KERNEL_CMDLINE:-}" ]]; then
+    step "覆盖内核命令行: $KERNEL_CMDLINE"
+    SETUP_ASDEFS+=(--defsym CMDLINE_OVERRIDE=1)
+    # 把命令行写进一个临时 .S 片段，单独汇编成 .o，链接进 setup.elf
+    printf '.section .rodata\n.globl cmdline_override\ncmdline_override:\n.asciz "%s"\n' "$KERNEL_CMDLINE" \
+        > "$OUT/cmdline_override.S"
+    as --32 -o "$OUT/cmdline_override.o" "$OUT/cmdline_override.S"
+    SETUP_LINK_OBJS+=("$OUT/cmdline_override.o")
+fi
 as --32 -o "$OUT/bootsect.o" boot/bootsect.S
-as --32 -o "$OUT/setup.o"    boot/setup.S
+as --32 "${SETUP_ASDEFS[@]}" -o "$OUT/setup.o" boot/setup.S
 as --64 -o "$OUT/head.o"     boot/head.S
 as --64 -o "$OUT/entry.o"    boot/entry.S
 
 step "链接"
 ld -m elf_i386 -T boot/bootsect.ld -o "$OUT/bootsect.elf" "$OUT/bootsect.o"
-ld -m elf_i386 -T boot/setup.ld    -o "$OUT/setup.elf"    "$OUT/setup.o"
+ld -m elf_i386 -T boot/setup.ld    -o "$OUT/setup.elf"    "$OUT/setup.o" "${SETUP_LINK_OBJS[@]}"
 ld -m elf_x86_64 -n -T boot/kernel.ld -o "$OUT/system.elf" \
     "$OUT/head.o" "$OUT/entry.o" "$CARGO_OUT"
 

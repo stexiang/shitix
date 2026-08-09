@@ -932,6 +932,22 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
     result
 }
 
+/// 把 `LAST_PID` 重置为 0，使下一个 [`kernel_thread`] 拿到 PID 1。
+///
+/// 仅用于在 `sched_selftest` 的 worker 退出后、创建 init 线程前，让 init
+/// 成为 PID 1（用户态 init 会 `getpid()==1` 自检）。调用方需保证此刻没有
+/// 其他活跃任务持有会被复用的 PID（sched_selftest 的 worker 已 exit）。
+///
+/// # Safety
+/// 关中断独占 `LAST_PID`；调用方保证 PID 1 当前未被任何活跃任务占用。
+pub unsafe fn reset_last_pid_for_init() {
+    let flags = unsafe { irq::local_irq_save() };
+    unsafe {
+        *core::ptr::addr_of_mut!(LAST_PID) = 0;
+    }
+    unsafe { irq::restore_flags(flags) };
+}
+
 /// 内核线程返回时的收尾。由 `entry.S:kernel_thread_entry` 调用。
 /// 原版没有对应物（内核线程概念本身就是新增的）。
 ///

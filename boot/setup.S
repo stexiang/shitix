@@ -17,6 +17,11 @@
 
     .set INITSEG,  0x9000       /* 机器参数区（与原版一致）*/
     .set SYSSEG,   0x1000       /* system 所在段, 物理 0x10000 */
+    .set CMDLINESEG, 0x9000     /* 命令行缓冲区物理段基址 */
+    .set CMDLINE_OFF, 0x1000    /* 命令行缓冲区物理地址 0x91000：
+                                 * 在 setup(0x90200) 与 E820 数组(0x9E000) 之间，
+                                 * 且高于内核镜像末尾（链接脚本 ASSERT _kernel_end<=0x90000），
+                                 * BSS 清零与 page_alloc（低 1MB 保留）都不会动它。*/
 /* 页表放在 0x4000 起的 3 个页。
  *
  * 原来在 0x70000，但内核镜像从 0x10000 装载，BSS 增长到 0x76680 之后
@@ -94,6 +99,28 @@ e820_loop:
     jnz     e820_loop
 e820_done:
     movw    %bp, %es:0x1E0
+
+/*
+ * 把内置命令行拷到 0x91000 缓冲区。
+ * 对应原版 setup.S 末尾处理 command_line 的步骤（原版从 bootsect 的
+ * 0x9000:0x0020 处取命令行；这里用编译期内置的默认值，等价于内核
+ * CONFIG_CMDLINE）。Rust 侧 start_kernel 从固定物理地址 0x91000 读取。
+ */
+    movw    $CMDLINESEG, %ax
+    movw    %ax, %es
+    movw    $CMDLINE_OFF, %di
+    /* 若 build.sh 用 --defsym CMDLINE_OVERRIDE=1 链接了 cmdline_override，
+     * 就用它；否则用内置的 cmdline_default（等价 CONFIG_CMDLINE）。 */
+.ifdef CMDLINE_OVERRIDE
+    movw    $cmdline_override, %si
+.else
+    movw    $cmdline_default, %si
+.endif
+    cld
+1:  lodsb
+    stosb
+    testb   %al, %al
+    jnz     1b
 
 /* 屏蔽全部中断源: 8259 + CPU（同原版思路，进保护模式前必须静默）*/
     cli
@@ -221,3 +248,15 @@ gdt_desc:
 idt_desc:
     .word   0
     .long   0
+
+/* ---- 内置内核命令行（等价 CONFIG_CMDLINE）----
+ * root=      根设备（/dev/hda2 = IDE 主盘第 2 分区；标准 LFS 布局）
+ * ro         先只读挂载，init 再 remount-rw（标准 SysV boot 序列）
+ * init=      init 程序（LFS 默认 /sbin/init）
+ * console=   控制台设备
+ * 修改此字符串即改默认启动行为，无需改 Rust 侧。
+ * 测试时可用 `KERNEL_CMDLINE="..." bash scripts/build.sh ...` 覆盖。
+ */
+    .section .rodata
+cmdline_default:
+    .asciz  "root=/dev/hda2 ro init=/sbin/init console=tty0"

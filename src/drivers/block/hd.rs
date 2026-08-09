@@ -50,7 +50,9 @@ const CMD_INIT_DEV_PARAMS: u8 = 0x91;   // 初始化设备参数
 const HD_IRQ: u32 = 14;
 
 /// 最大硬盘数
-const MAX_HD: usize = 2;
+pub const MAX_HD: usize = 2;
+/// 对外公开的硬盘数（供 root 设备探测用）。
+pub const MAX_HD_DRIVES: usize = MAX_HD;
 /// 最大重试次数
 const MAX_ERRORS: usize = 16;
 
@@ -65,6 +67,21 @@ static mut RESET_FLAG: bool = false;
 static mut HD_SIZES: [u64; MAX_HD] = [0; MAX_HD];
 /// 已初始化标志
 static mut INITIALIZED: bool = false;
+
+/// 每个硬盘的主分区数（MBR 最多 4 个主分区）。
+const NR_PARTS: usize = 4;
+/// 分区起始扇区偏移（512B 单位）。按 minor 下标存：minor 0=整盘(偏移0)，
+/// minor 1..=4 = hda1..hda4，minor 16=整盘 hdb，minor 17..=20 = hdb1..hdb4。
+/// 未解析到的分区偏移为 0。对应原版 `hd_struct` 里的 `start_sect`。
+static mut PART_START: [[u64; NR_PARTS + 1]; MAX_HD] = [[0; NR_PARTS + 1]; MAX_HD];
+
+/// 由 minor 号算出 (drive, partition_index_or_whole)。
+/// minor 0/16 = 整盘，minor 1..4 / 17..20 = 分区 0..3。
+fn minor_to_drive_part(minor: u32) -> (usize, usize) {
+    let drive = (minor / 16) as usize;
+    let part = (minor % 16) as usize; // 0 = 整盘, 1..=4 = 分区
+    (drive, part)
+}
 
 // ---- I/O 辅助函数 ----
 
@@ -291,20 +308,33 @@ unsafe fn hd_identify(dev: usize) -> Option<u64> {
 /// 对应原版 `do_hd_request()`。
 fn do_hd_request() {
     let major_num = HD_MAJOR as u32;
-    let (cmd, sector, nr_sectors, buffer_addr, bh, dev) = {
+    let (cmd, sector, nr_sectors, buffer_addr, bh, minor) = {
         let req = unsafe { super::ll_rw::cur(major_num) };
-        // Extract device minor from bh->b_dev
+        // 设备号取自 bh->b_dev 的低 8 位（minor）。minor 0/16=整盘，
+        // 1..4/17..20=分区。对应原版 `do_hd_request` 开头对 minor 的解码。
         let d = unsafe { crate::fs::buffer::bh(req.bh).b_dev as u32 };
-        let drive = (d & 0xFF) as usize; // minor = drive index
-        (req.cmd, req.sector as u64, req.nr_sectors as u64, req.buffer, req.bh, drive)
+        (req.cmd, req.sector as u64, req.nr_sectors as u64, req.buffer, req.bh, d & 0xFF)
     };
 
+    let (drive, part) = minor_to_drive_part(minor);
+
+    // 分区起始扇区偏移：整盘(part==0)为 0，分区取 PART_START[drive][part]。
+    // 对应原版 `bh->b_rsector += hd_struct[MINOR].start_sect`。
+    let part_off = if part == 0 {
+        0
+    } else if drive < MAX_HD && part <= NR_PARTS {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PART_START[drive][part])) }
+    } else {
+        0
+    };
+    let abs_sector = sector + part_off;
+
     // Read HD size for this drive
-    let max_lba = if dev < MAX_HD {
-        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) }
+    let max_lba = if drive < MAX_HD {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[drive])) }
     } else { 0 };
-    if max_lba > 0 && sector + nr_sectors > max_lba {
-        crate::pr_warn!("hd: sector {} out of range (max {})\n", sector + nr_sectors, max_lba);
+    if max_lba > 0 && abs_sector + nr_sectors > max_lba {
+        crate::pr_warn!("hd: sector {} out of range (max {})\n", abs_sector + nr_sectors, max_lba);
         unsafe { end_request(major_num, false) };
         return;
     }
@@ -313,19 +343,19 @@ fn do_hd_request() {
 
     // sector is already in 512-byte LBA units from make_request
     for i in 0..nr_sectors {
-        let sector_lba = sector + i;
+        let sector_lba = abs_sector + i;
         let byte_off = (i * SECTOR_SIZE as u64) as usize;
 
         let ok = if cmd == READ {
-            unsafe { hd_read_sector(dev, sector_lba, buf.add(byte_off)) }
+            unsafe { hd_read_sector(drive, sector_lba, buf.add(byte_off)) }
         } else if cmd == WRITE {
-            unsafe { hd_write_sector(dev, sector_lba, buf.add(byte_off) as *const u8) }
+            unsafe { hd_write_sector(drive, sector_lba, buf.add(byte_off) as *const u8) }
         } else {
             false
         };
 
         if !ok {
-            crate::pr_warn!("hd: I/O error at sector {} drive {}\n", sector_lba, dev);
+            crate::pr_warn!("hd: I/O error at sector {} drive {}\n", sector_lba, drive);
             unsafe { end_request(major_num, false) };
             return;
         }
@@ -334,12 +364,32 @@ fn do_hd_request() {
     unsafe { end_request(major_num, true) };
     let _ = bh;
     let _ = major_num;
-    let _ = dev;
+    let _ = part_off;
 }
 
 /// 检查 IDE 设备是否就绪。
 fn is_ready() -> bool {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(INITIALIZED)) }
+}
+
+/// 某块 IDE 盘的容量（扇区数）。0 表示未探测到。供 root 设备选择用。
+pub fn drive_size(drive: usize) -> u64 {
+    if drive < MAX_HD {
+        // SAFETY: 只读 HD_SIZES，启动期 init 填好后只读。
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[drive])) }
+    } else {
+        0
+    }
+}
+
+/// 某块盘某分区的起始扇区偏移（512B 单位）。part==0 返回 0（整盘）。
+pub fn part_start(drive: usize, part: usize) -> u64 {
+    if drive < MAX_HD && part <= NR_PARTS {
+        // SAFETY: 只读 PART_START，启动期 init 填好后只读。
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PART_START[drive][part])) }
+    } else {
+        0
+    }
 }
 
 // ---- 初始化 ----
@@ -368,6 +418,38 @@ pub unsafe fn init() {
             }
             let size_mb = (sectors * 512) / (1024 * 1024);
             crate::kprintln!("hd: /dev/hd{} - {} MB ({} sectors)", dev as u8 + b'a', size_mb, sectors);
+
+            // 解析 MBR 分区表。读第 0 扇区，看 0x1FE 处的 0xAA55 签名与
+            // 0x1BE 起的 4 条 16 字节分区表项。对应原版 `hd.c`/`genhd.c`
+            // 的 `partition` 解析。
+            // SAFETY: dev 已识别；mbr 是栈缓冲，hd_read_sector 不并发。
+            let mut mbr = [0u8; 512];
+            if unsafe { hd_read_sector(dev, 0, mbr.as_mut_ptr()) } {
+                if &mbr[510..512] == &[0x55, 0xAA] {
+                    for p in 0..NR_PARTS {
+                        let base = 0x1BE + p * 16;
+                        let sys_ind = mbr[base + 4];
+                        // start_sect (u32 LE) 在偏移 8，nr_sects 在偏移 12
+                        let start_sect = u32::from_le_bytes([
+                            mbr[base + 8], mbr[base + 9], mbr[base + 10], mbr[base + 11],
+                        ]);
+                        // 只记非空分区（sys_ind!=0 且 start_sect!=0）
+                        if sys_ind != 0 && start_sect != 0 {
+                            // SAFETY: dev/p 在界内，启动期独占。
+                            unsafe {
+                                core::ptr::write_volatile(
+                                    core::ptr::addr_of_mut!(PART_START[dev][p + 1]),
+                                    start_sect as u64);
+                            }
+                            crate::kprintln!("hd: /dev/hd{}{} start={} type=0x{:02x}",
+                                             dev as u8 + b'a', p + 1, start_sect, sys_ind);
+                        }
+                    }
+                } else {
+                    // 没有 MBR 签名：整盘是裸文件系统（如 lfs.img），保持
+                    // PART_START 全 0，挂整盘(minor 0/16)即可。
+                }
+            }
             found += 1;
         }
     }

@@ -7,6 +7,7 @@
 #![no_main]
 
 pub mod console;
+pub mod boot;
 pub mod desc;
 pub mod drivers;
 pub mod e820;
@@ -78,6 +79,16 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     // 写入且在 long mode 恒等映射（低 1GB）范围内；BootParams 只有 8 字节
     // u16 字段，无对齐或有效性要求上的额外风险。
     let bp = unsafe { &*params };
+
+    // 解析启动命令行（root=/init=/console=/ro,rw）。对应原版 start_kernel
+    // 里 setup_arch() 之后 parse_options()。setup.S 已把命令行拷到 0x91000。
+    // SAFETY: 启动最早期单线程；0x91000 由 setup.S 写好、位于恒等映射低 1GB。
+    unsafe { boot::parse() };
+    let bc = boot::config();
+    if bc.cmdline_len > 0 {
+        let cl = &bc.cmdline[..bc.cmdline_len];
+        kprintln!("Command line: {}", core::str::from_utf8(cl).unwrap_or("<non-utf8>"));
+    }
 
     // 先铺 task[0] 静态栈的哨兵：链接器把 head.S 的栈排在 Rust 那些
     // static mut 表之后（地址更高），栈往下溢出会直接踩进 fs::buffer::BUFFERS。
@@ -166,9 +177,15 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     // 在不睡的执行流里从来不被走到，等于没测。
     //
     // 所以这里起一个内核线程当 init 用，主流程等它跑完。
-    let init_thread = sched::kernel_thread("fsinit", fs_init_thread, 0, 15);
+    // init 线程必须是 PID 1：用户态 init（busybox init）会 `getpid()==1`
+    // 自检，不是 1 就拒绝运行。sched_selftest 的 worker 已经退出（slot
+    // 释放），但 LAST_PID 已被它们推到 2，这里把 LAST_PID 重置成 0，
+    // 让 init 线程拿到 PID 1。worker 已不在任务表里，PID 不冲突。
+    // SAFETY: 关中断独占 LAST_PID；worker 已 exit 释放 slot。
+    unsafe { sched::reset_last_pid_for_init() };
+    let init_thread = sched::kernel_thread("init", fs_init_thread, 0, 15);
     if init_thread.is_err() {
-        panic!("cannot create fs init thread");
+        panic!("cannot create init thread");
     }
     // 等它把 FS_INIT_DONE 置位。形态同上面 sched_selftest 里的等待循环：
     // task[0] 只能轮询 need_resched + hlt（见那里的注释）。
@@ -703,70 +720,170 @@ static mut BIG_RBUF: [u8; 1024] = [0; 1024];
 /// `fs_init_thread` 跑完的标志。0 = 未完成，1 = 完成，2 = 失败。
 static mut FS_INIT_DONE: u8 = 0;
 
-/// 顶替原版 init 进程的内核线程：造根文件系统、挂载、跑自检。
+/// 顶替原版 init 进程的内核线程：挂载根文件系统、exec 用户态 init。
 ///
-/// 见 `start_kernel` 里创建它的地方那段注释：这些活都可能睡，不能在
-/// task[0] 里干。
-const LFS_BOOT: bool = true;
-
-/// Build a minimal /sbin/init ELF: write banner → ioctl → exit(0).
-fn build_sbin_init() -> (&'static [u8], usize) {
-    syscall::sys::build_init_elf()
-}
-
-/// Build a simple interactive /init ELF64: banner → read stdin → echo → exit on "exit".
-/// (For future shell testing; currently uses build_init_elf for basic boot test.)
-#[allow(dead_code)]
-fn build_shell_elf() -> (&'static [u8], usize) {
-    build_sbin_init() // placeholder
-}
+/// 对应原版 `init/main.c` 的 `init()` 函数：`mount_root()` 之后
+/// `execve("/sbin/init", ...)` 把自己变成 PID 1。这些活都可能睡，不能在
+/// task[0] 里干（见 `start_kernel` 里创建本线程那段注释）。
+///
+/// 命令行 `root=`/`init=`/`ro`/`rw` 由 [`boot`] 模块解析；找不到根设备时
+/// 回退到内存盘自检模式（保留开发期无 LFS 镜像的可启动性）。
 
 fn fs_init_thread(_arg: u64) {
-    if LFS_BOOT {
-        sprintln!("LFS: === LFS boot mode ===");
+    let bc = boot::config();
 
-        // 1. Wire fd 0/1/2 to TTY console (direct inode, no filesystem needed)
-        sprintln!("LFS: wiring fd 0/1/2 to console...");
-        unsafe {
-            let console_ino = crate::fs::inode::get_empty_inode();
-            if console_ino != crate::fs::inode::NIL {
-                let ino = crate::fs::inode::inode(console_ino);
-                ino.i_mode = crate::fs::mode::S_IFCHR | 0o666;
-                ino.i_op = crate::fs::inode::FsType::Chr;
-                ino.i_rdev = crate::fs::mkdev(drivers::block::major::TTY_MAJOR, 0);
-                ino.i_count = 3;
-                for fd in 0..3usize {
-                    let filp = crate::fs::file_table::get_empty_filp();
-                    if filp != crate::fs::inode::NIL {
-                        let f = crate::fs::file_table::filp(filp);
-                        f.f_mode = 3; // O_RDWR (bit0=read, bit1=write)
-                        f.f_inode = console_ino;
-                        crate::fs::open::set_task_fd(crate::sched::current_index(), fd, filp);
-                    }
-                }
-            }
-        }
+    // 1. 确定 root 设备号。优先用命令行 root=，否则探测到的第一块 IDE 盘
+    //    整盘（minor 0）；都没有则回退到内存盘自检。
+    let root_dev = if bc.root_dev != 0 {
+        bc.root_dev
+    } else {
+        // 没有 root=：挑第一块有容量的 IDE 盘的整盘
+        first_ide_dev().unwrap_or(0)
+    };
 
-        // 2. Mount root: try IDE, fallback to ramdisk
-        sprintln!("LFS: mounting root...");
-        let ide_dev = fs::mkdev(3, 1);
-        let mounted = unsafe { fs::mount_root(ide_dev, 0) };
-        unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
+    // 2. 把 fd 0/1/2 接到 TTY 控制台（init/getty 需要 stdio）。
+    //    对应原版 init 里 `open("/dev/console")` ×3。
+    sprintln!("init: wiring fd 0/1/2 to console");
+    wire_console_fds();
 
-        if mounted {
-            sprintln!("LFS: execve /bin/sh...");
-            let ret = unsafe {
-                syscall::syscall3(syscall::nr::EXECVE,
-                    b"/bin/sh\0".as_ptr() as u64, 0, 0)
-            };
-            sprintln!("LFS: /bin/sh returned {}", ret);
-        } else {
-            sprintln!("LFS: IDE not found — run with second drive for busybox shell");
-            sprintln!("LFS: (current boot continues to selftest mode)");
-        }
+    // 3. 挂载根文件系统。
+    let rdonly = bc.root_rdonly;
+    let flags = if rdonly { fs::MS_RDONLY } else { 0 };
+
+    let mounted = if root_dev != 0 {
+        sprintln!("init: mounting root dev {:#06x}{}", root_dev,
+                  if rdonly { " (ro)" } else { "" });
+        // SAFETY: fs 表已建好，且我们不是 task[0]。
+        unsafe { fs::mount_root(root_dev, flags) }
+    } else {
+        false
+    };
+
+    if !mounted {
+        // 没有可挂载的根设备：回退到内存盘自检模式（开发期用）。
+        sprintln!("init: no root device — falling back to ramdisk selftest");
+        ramdisk_selftest_path();
         return;
     }
 
+    // 通知 task[0] 根已挂好（它在此之后只负责 idle）。
+    // SAFETY: 单核，只有 task[0] 在轮询这个字节。
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
+
+    // 4. exec 用户态 init。对应原版 init() 末尾：
+    //    execve("/sbin/init", argv, envp);
+    //    成功则本线程的用户态映像被替换，永不再返回到这里。
+    let init_path = bc.init_str();
+    let init_path_z = ensure_nul(init_path);
+
+    // argv = [ "init", NULL ]。放在内核静态区，execve 会从恒等映射区读。
+    // argv[0] 用 basename 让 ps/proc 显示干净（同原版）。
+    let argv0 = basename(init_path);
+    let argv: [*const u8; 2] = [argv0.as_ptr(), core::ptr::null()];
+    // envp = NULL（init 不需要环境变量，靠自己的配置）。
+    let envp: *const *const u8 = core::ptr::null();
+
+    sprintln!("init: execve {} (argv0={})",
+              core::str::from_utf8(init_path).unwrap_or("<init>"),
+              core::str::from_utf8(argv0).unwrap_or("<argv0>"));
+
+    // SAFETY: IDT 与 syscall 表已就绪；init_path_z 是 NUL 结尾的内核静态串，
+    // argv 数组也在内核静态区，均在 check_range 接受的恒等映射范围内。
+    let ret = unsafe {
+        syscall::syscall3(syscall::nr::EXECVE,
+                          init_path_z.as_ptr() as u64,
+                          argv.as_ptr() as u64,
+                          envp as u64)
+    };
+
+    // execve 成功不会返回；到这说明 init 启动失败。
+    // 对应原版 "No init found.  Try passing init= option to kernel."
+    panic!("init: execve({}) failed (ret={}); no init found. Try init= option",
+           core::str::from_utf8(init_path).unwrap_or("<init>"), ret);
+}
+
+/// 第一块有容量的 IDE 盘的整盘设备号（minor 0）。
+fn first_ide_dev() -> Option<u16> {
+    #[cfg(feature = "extra-drivers")]
+    {
+        // SAFETY: 只读 HD_SIZES，启动期已由 hd::init 填好。
+        for drive in 0..drivers::block::hd::MAX_HD_DRIVES {
+            if drivers::block::hd::drive_size(drive) > 0 {
+                return Some(fs::mkdev(drivers::block::major::HD_MAJOR as u32, 0));
+            }
+        }
+    }
+    #[cfg(not(feature = "extra-drivers"))]
+    {
+        // 无 IDE 驱动：没有块设备可作根。
+    }
+    None
+}
+
+/// 把 fd 0/1/2 接到 TTY 控制台（直接 inode，不依赖文件系统）。
+fn wire_console_fds() {
+    unsafe {
+        let console_ino = crate::fs::inode::get_empty_inode();
+        if console_ino == crate::fs::inode::NIL {
+            return;
+        }
+        let ino = crate::fs::inode::inode(console_ino);
+        ino.i_mode = crate::fs::mode::S_IFCHR | 0o666;
+        ino.i_op = crate::fs::inode::FsType::Chr;
+        ino.i_rdev = crate::fs::mkdev(drivers::block::major::TTY_MAJOR, 0);
+        ino.i_count = 3;
+        for fd in 0..3usize {
+            let filp = crate::fs::file_table::get_empty_filp();
+            if filp != crate::fs::inode::NIL {
+                let f = crate::fs::file_table::filp(filp);
+                f.f_mode = 3; // O_RDWR (bit0=read, bit1=write)
+                f.f_inode = console_ino;
+                crate::fs::open::set_task_fd(crate::sched::current_index(), fd, filp);
+            }
+        }
+    }
+}
+
+/// 给一个字节切片补一个 NUL，返回带 NUL 的静态切片（用于当 C 字符串）。
+/// 切片末尾本来就有 NUL 时直接返回。
+fn ensure_nul(s: &[u8]) -> &'static [u8] {
+    if !s.is_empty() && s[s.len() - 1] == 0 {
+        // SAFETY: 调用方保证来源是静态串（init_path 来自 BootConfig 静态区）。
+        unsafe { core::slice::from_raw_parts(s.as_ptr(), s.len()) }
+    } else {
+        // 末尾没 NUL：拷到静态缓冲补一个。
+        unsafe {
+            let buf = &mut *core::ptr::addr_of_mut!(INIT_PATH_BUF);
+            let n = s.len().min(buf.len() - 1);
+            buf[..n].copy_from_slice(&s[..n]);
+            buf[n] = 0;
+            core::slice::from_raw_parts(buf.as_ptr(), n + 1)
+        }
+    }
+}
+
+static mut INIT_PATH_BUF: [u8; 80] = [0; 80];
+
+/// 取路径的 basename（最后一个 '/' 之后的部分），失败返回整个路径。
+fn basename(path: &[u8]) -> &'static [u8] {
+    let start = match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => i + 1,
+        None => 0,
+    };
+    let name = &path[start..];
+    // 拷到静态缓冲并补 NUL
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(ARGV0_BUF);
+        let n = name.len().min(buf.len() - 1);
+        buf[..n].copy_from_slice(&name[..n]);
+        buf[n] = 0;
+        core::slice::from_raw_parts(buf.as_ptr(), n + 1)
+    }
+}
+static mut ARGV0_BUF: [u8; 32] = [0; 32];
+
+/// 无根设备时的回退：在内存盘上造 ext4、挂载、跑开发期自检。
+fn ramdisk_selftest_path() {
     // 造根文件系统。原版这一步是 rd_load() 从软驱读现成映像，
     // 我们在内存里现造（见 src/fs/minix/mkfs.rs 的模块文档）。
     // SAFETY: ramdisk 已 init，缓冲缓存里还没有本设备的块。
@@ -774,7 +891,6 @@ fn fs_init_thread(_arg: u64) {
         panic!("mkfs.ext4 failed");
     }
 
-    // 对应原版 start_kernel 末尾的 mount_root()
     // SAFETY: 根设备可读，fs 表已建好，且我们不是 task[0]。
     let mounted = unsafe { fs::mount_root(drivers::block::ramdisk::RAMDISK_DEV, 0) };
     if !mounted {
@@ -795,9 +911,6 @@ fn fs_init_thread(_arg: u64) {
     // SAFETY: 同上；用户页表由 get_free_page 分配，不影响内核 BSS。
     unsafe { user_mode_selftest() };
 
-    // ELF64 execve：fork → execve(ELF64 binary) → exit(42) → wait4 收尸
-    // ⚠ 当前通过 fork+execve 进入子进程后 execve 返回 -EINVAL，
-    // 父进程 wait4 路径 crash（RIP=0），待排查。功能代码已就绪。
     // SAFETY: 同上。
     unsafe { mmap_selftest() };
     unsafe { execve_selftest() };
@@ -813,8 +926,6 @@ fn fs_init_thread(_arg: u64) {
 
     // SAFETY: 单核，只有 task[0] 在轮询这个字节。
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1) }
-    // 直接返回即可：kernel_thread 的蹦床会接住返回并调 do_kthread_exit
-    // （见 sched::kernel_thread 的文档）。
 }
 
 /// 两个测试线程各自的运行计数。
