@@ -74,6 +74,31 @@
 - `fs`: 修复了 super_block.rs 的 guard 位置 bug
 - `feat/networking-stack-rewrite`: 创建了网络栈骨架（已 push）
 - `feat/drivers-misc-rewrite`: 重写剩余驱动和杂项代码（新分支）
+- `feat/lfs-native-boot`: LFS 原生启动（已 push）：真实命令行解析、
+  IDE MBR 分区支持、PID 1 init。默认 `root=/dev/hda2 ro init=/sbin/init
+  console=tty0`（标准 LFS 布局）；构建期可用 `KERNEL_CMDLINE="..."` 覆盖。
+
+### LFS 原生启动（feat/lfs-native-boot）
+- 命令行：setup.S 把内置 `cmdline_default`（.rodata）拷到物理 0x91000；
+  Rust `src/boot.rs::parse()` 解析 root=/init=/console=/ro/rw。
+- 设备名解析：/dev/hdaN、/dev/hdbN → major 3, minor=drive*16+partition。
+- 分区：`hd.rs` init 时解析 MBR，存 PART_OFFSET[minor]，do_hd_request 加偏移。
+- init 线程必须是 PID 1（busybox init 会 `getpid()==1` 自检）：
+  `sched::reset_last_pid_for_init()` 在 sched_selftest 的 worker 退出后
+  把 LAST_PID 清 0，使下一个 kernel_thread 拿到 PID 1。
+- fs_init_thread：读 boot config → 定 root dev（cmdline 或 first_ide_dev 兜底）
+  → mount root（ro/rw）→ 接 fd 0/1/2 到 console → execve init（默认 /sbin/init）。
+  无 root 设备时回退内存盘自检，保留开发期可启动性。
+- 验证：cmdline 解析 ✓、IDE+MBR 分区 hdb1 检测 ✓、root 只读挂载 ✓、
+  /sbin/init 以 PID 1 execve ✓、init fork 子进程跑 rcS ✓。
+- 未通：`/bin/sh: Invalid argument`——busybox sh 的 job control
+  （setpgid/setsid/tcsetpgrp）走 tty/session syscall 层返回 EINVAL，
+  是既有 tty/会话层限制，非启动路径问题。
+- 构建/测试：`KERNEL_CMDLINE="root=/dev/hdb ro init=/sbin/init console=tty0"
+  bash scripts/build.sh --release --features extra-drivers`，再用第二块 IDE
+  盘挂 lfs3.img 跑 shell。lfs3.img 需自带 /etc/inittab、/etc/init.d/rcS、
+  /dev 下的设备节点（debugfs 写入；debugfs mknod 只建 inode 不建目录项，
+  需配合 link，或用 mkfs.ext4 + 真实 mknod）。
 
 ### 驱动和杂项重写计划
 
