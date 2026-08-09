@@ -217,28 +217,17 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     // 2. 从文件系统打开并读取 ELF（通过 VFS namei → read）
     let fd = unsafe { crate::fs::open::sys_open(path, crate::fs::oflags::O_RDONLY, 0) };
     if fd < 0 {
-        crate::serial::print("EXEC: open FAILED fd=");
-        crate::serial::raw_hex64_signed(fd);
-        crate::serial::putc(b'\n');
         return fd;
     }
     let fd = fd as usize;
 
-    crate::serial::print("EXEC: open ok fd=");
-    crate::serial::print_dec(fd as u64);
-    crate::serial::putc(b'\n');
-
     let buf = crate::mm::get_free_page();
     if buf == 0 {
-        crate::serial::print("EXEC: get_free_page for elf buf FAILED\n");
         unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOMEM as i64);
     }
     let page_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, crate::mm::PAGE_SIZE) };
     let n = unsafe { crate::fs::read_write::read(fd, page_slice) };
-    crate::serial::print("EXEC: read n=");
-    crate::serial::print_dec(n as u64);
-    crate::serial::putc(b'\n');
     // Don't close fd yet — we'll need it for segment data loading
     let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
 
@@ -246,14 +235,12 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     let header = match parse_elf64(elf_data) {
         Ok(h) => h,
         Err(_) => {
-            crate::serial::print("EXEC: parse_elf64 FAILED\n");
             crate::mm::free_page(buf);
             unsafe { crate::fs::open::sys_close(fd); }
             return -(ENOEXEC as i64);
         }
     };
     if is_executable64(&header).is_err() {
-        crate::serial::print("EXEC: is_executable64 FAILED\n");
         crate::mm::free_page(buf);
         unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOEXEC as i64);
@@ -271,12 +258,10 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     // 5. 分配新 PML4
     let new_pml4 = paging::alloc_pml4();
     if new_pml4 == 0 {
-        crate::serial::print("EXEC: alloc_pml4 FAILED\n");
         crate::mm::free_page(buf);
         return -(ENOMEM as i64);
     }
     if !paging::clone_kernel_pdpt(new_pml4) {
-        crate::serial::print("EXEC: clone_kernel_pdpt FAILED\n");
         free_page(new_pml4);
         crate::mm::free_page(buf);
         return -(ENOMEM as i64);
@@ -302,11 +287,6 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
             Err(_) => continue,
         };
         let ptype = phdr.p_type;
-        crate::serial::print("EXEC: phdr ");
-        crate::serial::print_dec(i as u64);
-        crate::serial::print(" type=");
-        crate::serial::print_dec(ptype as u64);
-        crate::serial::putc(b'\n');
         if ptype == 3 { // PT_INTERP
             let off = phdr.p_offset as usize;
             let sz = phdr.p_filesz as usize;
@@ -333,14 +313,8 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
 
     // 6a. 如果有 PT_INTERP，加载动态链接器
     if let Some(ipath) = interp_path {
-        crate::serial::print("EXEC: interp=");
-        crate::serial::print(core::str::from_utf8(ipath).unwrap_or("?"));
-        crate::serial::putc(b'\n');
         // 打开解释器文件
         let ifd = unsafe { crate::fs::open::sys_open(ipath, crate::fs::oflags::O_RDONLY, 0) };
-        crate::serial::print("EXEC: interp open ifd=");
-        crate::serial::print_dec(ifd as i64 as u64);
-        crate::serial::putc(b'\n');
         if ifd >= 0 {
             let ibuf = get_free_page();
             if ibuf != 0 {
@@ -385,11 +359,6 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                             }
                             // entry = 解释器入口 (relocated)
                             entry = ihdr.e_entry;
-                            crate::serial::print("EXEC: interp entry=");
-                            crate::serial::raw_hex64(entry);
-                            crate::serial::print(" base=");
-                            crate::serial::raw_hex64(interp_base);
-                            crate::serial::putc(b'\n');
                         }
                     }
                 }
@@ -404,16 +373,11 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         let pg = get_free_page();
         if pg != 0 {
             unsafe { paging::map_page(new_pml4, 0, pg, paging::flags::SHARED); }
-        } else {
-            crate::serial::print("EXEC: zero page alloc FAILED (non-fatal)\n");
         }
     }
 
     // 8. 加载主程序的 PT_LOAD 段
     let mut max_va: usize = 0;
-    crate::serial::print("EXEC: phnum=");
-    crate::serial::print_dec(phnum as u64);
-    crate::serial::putc(b'\n');
     for i in 0..phnum {
         let phdr = match parse_phdr64(elf_data, phoff + i * phentsize) {
             Ok(p) => p,
@@ -436,27 +400,16 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         let start_va = vaddr & !0xFFF;
         let extra = if phdr.p_flags & 2 != 0 { 2 * PAGE_SIZE } else { PAGE_SIZE };
         let end_va = page_align(vaddr + memsz) + extra;
-        crate::serial::print("EXEC: LOAD vaddr=");
-        crate::serial::raw_hex64(vaddr as u64);
-        crate::serial::print(" filesz=");
-        crate::serial::print_dec(filesz as u64);
-        crate::serial::print(" memsz=");
-        crate::serial::print_dec(memsz as u64);
-        crate::serial::print(" pages=");
-        crate::serial::print_dec(((end_va - start_va) / PAGE_SIZE) as u64);
-        crate::serial::putc(b'\n');
         if end_va > max_va { max_va = end_va; }
         let mut va = start_va;
         while va < end_va {
             let pg = get_free_page();
             if pg == 0 {
-                crate::serial::print("EXEC: get_free_page for PT_LOAD FAILED\n");
                 crate::mm::free_page(buf);
                 unsafe { crate::fs::open::sys_close(fd); }
                 return -(ENOMEM as i64);
             }
             if !unsafe { paging::map_page(new_pml4, va, pg, prot) } {
-                crate::serial::print("EXEC: map_page for PT_LOAD FAILED\n");
                 free_page(pg);
                 crate::mm::free_page(buf);
                 unsafe { crate::fs::open::sys_close(fd); }
@@ -526,7 +479,6 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         mapped += 1;
     }
     if mapped < STACK_PAGES {
-        crate::serial::print("EXEC: stack map partial FAILED\n");
         unsafe {
             for k in 0..mapped {
                 let va = stack_base_va + k * PAGE_SIZE;
@@ -660,11 +612,6 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         crate::fs::open::sys_close(fd);
     }
 
-    crate::serial::print("EXEC: success, iretq to entry=");
-    crate::serial::raw_hex64(entry);
-    crate::serial::print(" rsp=");
-    crate::serial::raw_hex64(user_rsp);
-    crate::serial::putc(b'\n');
     0
 }
 

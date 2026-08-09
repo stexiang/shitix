@@ -222,13 +222,33 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
                 let is_write = (error_code & 2) != 0;   // 写访问
                 let is_present = (error_code & 1) != 0;  // 页面已映射（只是缺 RW）
                 let is_user = (error_code & 4) != 0;     // CPL=3 触发
+                // bit4 = instruction fetch（err=0x15 表示在 present+user 且带 NX
+                // 的页上取指）。常见成因：cow_copy_page_table 用 PRESENT|USER
+                // 重写了 PTE，但 mprotect 之前给某些页落过 NO_EXEC，或动态
+                // 链接器对 RELRO 段 mprotect(PROT_READ) 连带把同页代码标成 NX。
+                let is_fetch = (error_code & 0x10) != 0;
 
-                if pml4 != 0 && is_write && is_present && is_user {
-                    // 尝试处理 COW 页面故障
-                    if let Some(handled) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
-                        if handled {
-                            crate::pr_debug!("COW page fault handled at {:#x}", fault_addr);
-                            return;  // 成功处理，恢复执行
+                if pml4 != 0 && is_present && is_user {
+                    // 写访问走 COW 路径。
+                    if is_write {
+                        if let Some(handled) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
+                            if handled {
+                                crate::pr_debug!("COW page fault handled at {:#x}", fault_addr);
+                                return;  // 成功处理，恢复执行
+                            }
+                        }
+                    }
+                    // 取指故障：页面已映射且属用户空间，仅因 NX 位被拒。
+                    // 用户态代码段本应可执行——直接清掉 NO_EXEC 让其继续。
+                    // set_page_flags 会保留 RW/USER/PRESENT，只重写低标志，
+                    // 用 get_page_flags 取当前标志再清 NO_EXEC 即可。
+                    if is_fetch {
+                        if let Some(f) = crate::mm::paging::get_page_flags(pml4, fault_addr as usize) {
+                            let exec_flags = f & !crate::mm::paging::flags::NO_EXEC;
+                            if crate::mm::paging::set_page_flags(pml4, fault_addr as usize, exec_flags) {
+                                crate::pr_debug!("exec page fault handled at {:#x}", fault_addr);
+                                return;
+                            }
                         }
                     }
                 }

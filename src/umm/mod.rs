@@ -859,10 +859,10 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
     // SAFETY: 调用者确保 pml4 有效，fault_addr 是用户空间地址
     if let Some(phys) = unsafe { crate::mm::paging::translate(pml4, fault_addr as usize) } {
         let pfn = page_ref::phys_to_pfn(phys);
-        
+
         // 检查页面引用计数
         let refs = page_ref::page_ref_count(pfn);
-        
+
         // 如果引用计数 > 1，说明是共享页面 (COW)
         if refs > 1 {
             // 需要复制页面
@@ -871,7 +871,7 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
                 crate::pr_warn!("COW: out of memory");
                 return None;
             }
-            
+
             // 复制页面内容
             let src = phys as *const u8;
             let dst = new_page as *mut u8;
@@ -879,7 +879,7 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
             unsafe {
                 core::ptr::copy_nonoverlapping(src, dst, crate::mm::page::PAGE_SIZE);
             }
-            
+
             // 更新页表
             // SAFETY: 映射新的物理页面
             let _ = unsafe { crate::mm::paging::unmap_page(pml4, fault_addr as usize) };
@@ -888,28 +888,33 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
                 crate::pr_warn!("COW: failed to map new page");
                 return None;
             }
-            
+
             // 减少原页面的引用计数
             page_ref::page_ref_dec(pfn);
-            
+
             // 释放新页面的引用计数（因为它现在是唯一引用）
             let new_pfn = page_ref::phys_to_pfn(new_page);
             page_ref::page_ref_set(new_pfn, 1);
-            
+
             crate::pr_debug!("COW: copied page from {:x} to {:x}", phys, new_page);
             return Some(true);
-        } else if refs == 1 {
-            // 引用计数为 1，只需要启用写权限
+        } else {
+            // 引用计数 <= 1：页面未被引用计数表跟踪（refs==0，execve/mmap
+            // 经 get_free_page 分配的页从未注册进 page_ref）或是单引用页。
+            // 两种情况下该页都只有一个所有者，安全地直接授予写权限即可，
+            // 否则 cow_copy_page_table 把父进程页标成只读后，父进程一旦
+            // 写栈/写数据就会因为「不是 COW 故障」落到 Some(false) 被杀
+            // （SIGSEGV）。保留原 NX 标志位，避免把只读代码段变成可写。
             let flags = crate::mm::paging::get_page_flags(pml4, fault_addr as usize);
             if let Some(flags) = flags {
-                // 设置写权限
-                if !crate::mm::paging::set_page_flags(pml4, fault_addr as usize, 
-                    flags | crate::mm::paging::flags::RW) {
+                if !crate::mm::paging::set_page_flags(pml4, fault_addr as usize,
+                    flags | crate::mm::paging::flags::RW)
+                {
                     crate::pr_warn!("COW: failed to set write flags");
                     return None;
                 }
             }
-            crate::pr_debug!("COW: enabled write for single-reference page");
+            crate::pr_debug!("COW: enabled write for single-reference page (refs={})", refs);
             return Some(true);
         }
     }
