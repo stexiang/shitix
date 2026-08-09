@@ -170,6 +170,12 @@ pub struct Task {
     pub pwd: usize,
     /// 根目录 inode。原版 `struct inode * root`
     pub root: usize,
+
+    /// CLONE_CHILD_SETTID 的用户地址：子进程在 ret_from_fork 里把自己的 pid
+    /// 写到这里（对应 Linux 的 `p->set_child_tid` + `ret_from_fork` 的
+    /// `put_user`）。不能在 clone 父进程上下文里写——COW 下那会改穿父进程
+    /// 的页。0 表示无 SETTID 请求。
+    pub set_child_tid: u64,
 }
 
 impl Task {
@@ -203,6 +209,7 @@ impl Task {
             exit_code: 0,
             pwd: usize::MAX,
             root: usize::MAX,
+            set_child_tid: 0,
         }
     }
 

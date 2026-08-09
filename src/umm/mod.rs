@@ -849,12 +849,25 @@ mod tests {
 /// * `None` - 错误发生
 pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool> {
     use crate::mm::page_ref;
-    
-    // 确保地址在用户空间
-    if fault_addr < USERSPACE_START as u64 || fault_addr >= USERSPACE_END as u64 {
+
+    // 用户空间 = x86_64 规范地址低半区（0..0x0000_7FFF_FFFF_FFFF）。
+    // 不能用 USERSPACE_START(0x4000_0000)：那是栈/堆的布局基址，ELF 文本
+    // 与数据段装在 0x400000，写它们触发的 COW 故障地址低于该基址，会被
+    // 误判成「非用户空间」而落到 SIGSEGV。
+    if fault_addr >= 0x0000_8000_0000_0000 {
         return Some(false);
     }
-    
+
+    // 必须是真正的**用户可访问**页（最终 PTE 含 PRESENT|USER）。不能只用
+    // translate：它只看 PRESENT，会把内核低地址恒等映射（含第 0 页）拆出的
+    // present-but-not-user 表项也当成已映射。那样用户态对近 NULL 地址的写
+    // （如 0x2d8，NULL+结构体偏移）会被当成 COW 改成可写/直接放行，写穿第
+    // 0 页、把本该 SIGSEGV 的空指针解引用静默吞掉，后续 malloc 取到腐败
+    // chunk 而 #GP。is_user_mapped 要求末级 PTE 带 USER，把内核页挡在外面。
+    if !unsafe { crate::mm::paging::is_user_mapped(pml4, fault_addr as usize) } {
+        return Some(false);
+    }
+
     // 检查页面是否存在且是只读
     // SAFETY: 调用者确保 pml4 有效，fault_addr 是用户空间地址
     if let Some(phys) = unsafe { crate::mm::paging::translate(pml4, fault_addr as usize) } {
@@ -863,8 +876,13 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
         // 检查页面引用计数
         let refs = page_ref::page_ref_count(pfn);
 
-        // 如果引用计数 > 1，说明是共享页面 (COW)
+        // 引用计数 > 1：页面被多个进程共享（fork 时 cow_copy_page_table 已 inc），
+        // 真正的写时复制——分配新页、拷贝内容、改映射。
         if refs > 1 {
+            // 先取原页标志（含 NX），unmap 后 PTE 被清就取不到了。
+            // 写时复制落到的都是可写数据页，但保留 NX 仍是正确做法。
+            let orig_flags = crate::mm::paging::get_page_flags(pml4, fault_addr as usize)
+                .unwrap_or(crate::mm::paging::flags::SHARED);
             // 需要复制页面
             let new_page = crate::mm::get_free_page();
             if new_page == 0 {
@@ -880,31 +898,24 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
                 core::ptr::copy_nonoverlapping(src, dst, crate::mm::page::PAGE_SIZE);
             }
 
-            // 更新页表
+            // 更新页表：原标志 + RW（get_free_page 已把新页 page_ref 设为 1）。
             // SAFETY: 映射新的物理页面
             let _ = unsafe { crate::mm::paging::unmap_page(pml4, fault_addr as usize) };
-            let prot = crate::mm::paging::flags::SHARED; // present + rw + user
+            let prot = orig_flags | crate::mm::paging::flags::RW;
             if !unsafe { crate::mm::paging::map_page(pml4, fault_addr as usize, new_page, prot) } {
                 crate::pr_warn!("COW: failed to map new page");
                 return None;
             }
 
-            // 减少原页面的引用计数
+            // 减少原页面的引用计数（它少了一个共享者）
             page_ref::page_ref_dec(pfn);
 
-            // 释放新页面的引用计数（因为它现在是唯一引用）
-            let new_pfn = page_ref::phys_to_pfn(new_page);
-            page_ref::page_ref_set(new_pfn, 1);
-
-            crate::pr_debug!("COW: copied page from {:x} to {:x}", phys, new_page);
+            crate::pr_debug!("COW: copied page from {:x} to {:x} (refs was {})", phys, new_page, refs);
             return Some(true);
         } else {
-            // 引用计数 <= 1：页面未被引用计数表跟踪（refs==0，execve/mmap
-            // 经 get_free_page 分配的页从未注册进 page_ref）或是单引用页。
-            // 两种情况下该页都只有一个所有者，安全地直接授予写权限即可，
-            // 否则 cow_copy_page_table 把父进程页标成只读后，父进程一旦
-            // 写栈/写数据就会因为「不是 COW 故障」落到 Some(false) 被杀
-            // （SIGSEGV）。保留原 NX 标志位，避免把只读代码段变成可写。
+            // 引用计数 <= 1：单一所有者（refs==1 是正常单页；refs==0 是未进
+            // page_ref 表的页，如 zero page）。直接授予写权限即可，无需复制。
+            // 保留原 NX 标志位，避免把只读代码段变成可写可执行。
             let flags = crate::mm::paging::get_page_flags(pml4, fault_addr as usize);
             if let Some(flags) = flags {
                 if !crate::mm::paging::set_page_flags(pml4, fault_addr as usize,
@@ -918,7 +929,7 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
             return Some(true);
         }
     }
-    
+
     // 不是 COW 故障
     Some(false)
 }

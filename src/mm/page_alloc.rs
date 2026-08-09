@@ -465,6 +465,11 @@ unsafe fn get_free_page_locked() -> usize {
         // 「重复 free」检查漏判。
         core::ptr::write_volatile((page + 8) as *mut usize, 0);
         *mm_ent(nr) = 1;
+        // COW 引用计数：新派发的页归单一所有者，初始化为 1。
+        // 这样 fork 时 cow_copy_page_table 的 page_ref_inc 会把它抬到 2，
+        // 写时复制缺页处理程序据此判断「共享 → 复制」。page_ref 表与
+        // mem_map 独立，这里不影响分配器自身的计数。
+        super::page_ref::page_ref_set(nr, 1);
         page
     }
 }
@@ -524,6 +529,8 @@ unsafe fn free_page_locked(addr: usize) {
             // SAFETY: 引用计数归零，这一页已无使用者，可复用其头 8 字节做链表指针。
             push_free(base);
             NR_FREE_PAGES.fetch_add(1, Ordering::Relaxed);
+            // 清掉 COW 引用计数，避免下一任主人看到上一任的残留计数。
+            super::page_ref::page_ref_set(nr, 0);
         }
     }
 }

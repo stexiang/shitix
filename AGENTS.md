@@ -23,6 +23,28 @@
   已改为 refs<=1 直接授予写权限（保留 NX 位）。
 - ~~取指故障（err bit4）在 present+user 页上未处理~~：traps.rs 现在对
   instruction-fetch 故障清除 NO_EXEC，避免代码页被误标 NX 后 SIGSEGV。
+- ~~fork 后子进程取指故障 err=0x15（NX instruction-fetch）~~（bug-cow-scan）：
+  `cow_copy_page_table` 旧实现按 `0x4000_0000..0xFFFF_FFFF` 线性扫描虚拟地址，
+  但 BusyBox/glibc 把 ELF 装在 `0x400000`（低于 1GB），文本/数据段整段被跳过，
+  fork 后子进程没有代码映射，一返回用户态即 NX 取指缺页。已改为遍历页表树
+  （PML4 低半区 0..256），并对每个共享用户页 `page_ref_inc`（对应原版
+  `mem_map[MAP_NR(page)]++`）。配套：`get_page_flags` 用 `e & !ADDR_MASK`
+  保留 NX bit 63（旧 `e & 0xFFF` 丢 NX）；`get_free_page_locked` 把 page_ref
+  初始化为 1，`free_page_locked` 归零；`try_handle_cow_fault` 边界改为规范
+  用户地址 `0..0x0000_7FFF_FFFF_FFFF`，COW 复制保留原页 NX 标志。
+  验证：`err=0x15` 消失；`echo`/`true`（fork+execve）正常工作。
+- ~~execve 残留父进程 TLS（fs_base）~~：fork 的子进程继承 shell 的 fs_base，
+  execve 重建地址空间后该值指向已失效的旧页，新程序首次 `%fs` 访问即 #GP。
+  execve 现在把 `fs_base`/`gs_base` 清 0 并同步写 MSR（新程序靠 arch_prctl
+  重新建 TLS）。
+
+### 已知未解决问题
+- `ls`/`cat`（exec 后做较多 malloc 的命令）在 `rip=0x42c08e` 触发
+  `general protection: sig 11 err=0x0`（#GP，非 #PF）。故障指令
+  `mov -0x8(%rdi),%rax`，rdi 为非规范垃圾指针（如 `0x7410473b4838772b`），
+  是 glibc malloc fastbin/tcache 取到腐败 chunk。`true`（几乎不 malloc）
+  正常，故 fork+execve+COW 链路本身没问题；这是 brk/malloc 堆布局或
+  glibc 交互的独立 bug，COW 修复后才暴露出来（之前子进程死在 err=0x15）。
 
 ### 调试输出规范
 - 写路径/系统调用路径的调试串口打印必须用 `pr_debug!`/`pr_warn!` 等
@@ -115,3 +137,25 @@ TODO:
 - [ ] 完成协议处理器
 - [ ] 添加设备驱动
 - [ ] 集成 syscall 层
+
+### COW / WP / fork 正确性修复（2026-08-09）
+
+#### 已落地的修复
+- **CR0.WP=1**（boot/setup.S）：原 setup.S 进 long mode 时只置 PG|PE，没置 WP（bit 16）。WP=0 时内核态写忽略页表 R/W 位，fork 后所有用户页被 cow_copy_page_table 标成只读，此时内核的 copy_to_user（read 等）与 clone 的 SETTID/CLEARTID 会直接写穿共享物理页、绕过写时复制。Linux 在 start_kernel 早期就置 WP=1，这里对齐。
+- **内核态 COW 缺页处理**（src/traps.rs）：WP=1 后内核对 COW 只读用户页的写会以 supervisor write-protect 缺页（err P=1 W=1 U=0）。do_trap 在 die_if_kernel 之前加了这条路径：调用 try_handle_cow_fault 复制出私有页后重试写。
+- **CLONE_CHILD_SETTID 延迟到子进程**（src/sched/task.rs 加 set_child_tid 字段，src/sched/mod.rs:schedule_tail 写入）：原 clone 在父进程上下文里 write_volatile(child_tidptr, pid)，COW 下会改穿父进程的页。改为存地址、由子进程在 ret_from_fork 路径自己 put_user，对齐 Linux。
+- **CLONE_SETTLS 不再 wrmsr 父进程**（src/syscall/sys.rs）：原 clone 在父进程上下文 wrmsr 写子进程的 FS_BASE，立即破坏父进程 TLS。改为存 child.fs_base，由 switch_to 切到子进程时写 MSR。
+- **COW 只处理真正的用户页**（src/umm/mod.rs:try_handle_cow_fault）：加 is_user_mapped 门槛。translate 只看 PRESENT，会把内核低地址恒等映射拆出的 present-but-not-user 表项也当已映射，导致用户态对近 NULL 地址的写被当成 COW 改成可写/放行，把本该 SIGSEGV 的空指针解引用静默吞掉。
+
+#### ls/cat 仍未通的根因（待办）
+ls/cat 在 fork 子进程的 glibc __libc_malloc 里 #GP（rip=0x42c08e）。根因链：
+1. execve 映了第 0 页 USER|RW（src/syscall/sys.rs 第 7 步），为让 busybox 静态 glibc 早期 init 的空指针访问不 SIGSEGV 的临时缓解。
+2. fork 子进程 glibc robust-list 初始化读 %%fs:0x10（pthread 自指针）为 0，随后 movups %%xmm0,0x2d8(%%rax) 写到 NULL+0x2d8，写穿第 0 页，级联腐败 malloc arena。
+3. 不映第 0 页时该写正常 SIGSEGV，但又会暴露父进程在子进程退出后 RIP 被打成 0（疑似 SIGCHLD 投递，signal.c 未移植）。
+
+根治需要：(a) 排查 glibc TLS 自指针 %%fs:0x10 为何为 0（execve auxv/TLS 布局）；(b) 移植 signal.c。两项做完即可删掉第 0 页映射、恢复 NULL 保护。
+
+#### 验证状态
+- selftest 全过，boot ok，echo/true 正常。
+- ls/cat 仍 #GP（见上）。
+- 调试打印（W: rw_ret / CHR: major / TTY_W:）已全部移除（commits a123e6d / a66def9），boot 输出 grep 计数为 0。

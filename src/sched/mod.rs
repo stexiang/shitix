@@ -370,6 +370,24 @@ pub unsafe extern "C" fn schedule_tail() {
     // 但它自己的栈上没有配对的 restore_flags，所以在这里显式恢复。
     // SAFETY: IDT/PIC 已就绪；新任务预期运行在开中断状态。
     unsafe { irq::sti() }
+
+    // CLONE_CHILD_SETTID：子进程把自己的 pid 写到 set_child_tid 指向的
+    // 用户地址（对应 Linux ret_from_fork 的 `put_user(tsk->pid, ...)`）。
+    // 必须在子进程上下文做：写自己的地址空间，COW 缺页会正确复制出私有页，
+    // 不会改穿父进程。在 clone 父进程上下文里写会腐败父进程的堆。
+    // SAFETY: current 在子进程上下文里有效；set_child_tid 为 0 时跳过。
+    unsafe {
+        let cur = current();
+        let tid = cur.pid;
+        let addr = cur.set_child_tid;
+        if addr != 0 {
+            // 写用户地址：若该页是 COW 只读，supervisor 写会触发 #PF，
+            // 由 traps.rs 的内核态 COW 处理路径复制后重试。
+            core::ptr::write_volatile(addr as *mut i32, tid);
+            // 一次性：写完即清，避免后续 fork 的子进程重复写老地址。
+            cur.set_child_tid = 0;
+        }
+    }
 }
 
 // ---- 时钟中断（原版 do_timer）----

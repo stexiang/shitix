@@ -368,7 +368,18 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         }
     }
 
-    // 7. Map zero page writable (busybox reads/writes NULL during early init)
+    // 7. Map zero page writable.
+    //
+    // 历史：busybox 静态 glibc 早期 init 会经空指针读写/取指 NULL（观察到
+    // fork 子进程 robust-list 初始化读 %fs:0x10 为 0 后写 *(0+0x2d8)）。
+    // 不映第 0 页时这些访问直接 SIGSEGV，子进程起不来；映成 USER|RW 能让
+    // shell 与 echo/true 跑通。代价是 fork 子进程会把空指针写穿第 0 页、
+    // 级联腐败 malloc arena，导致 ls/cat 在 __libc_malloc 里 #GP（rip=0x42c08e）。
+    //
+    // 这是临时缓解，根治需要：(a) 排查 glibc TLS 自指针 %fs:0x10 为何为 0
+    //    （多半是 execve 的 auxv/TLS 布局与 glibc 预期不符）；
+    // (b) 移植 signal.c，让 SIGCHLD 等信号正确投递而非把父进程 RIP 打成 0。
+    // 两项做完即可删掉本块、恢复 NULL 保护。
     {
         let pg = get_free_page();
         if pg != 0 {
@@ -596,6 +607,18 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         if old_pml4 != 0 && old_pml4 != new_pml4 {
             crate::mm::free_page(old_pml4);
         }
+        // 清掉 TLS：新程序从「无 TLS」状态开始，父进程遗留的 fs_base/gs_base
+        // 指向已随 exec 失效的旧地址空间，留着会让新程序在第一次 %fs 访问
+        // （glibc 启动早期）就 #GP。arch_prctl(ARCH_SET_FS) 会在新 TLS 建立
+        // 时重新写入。同步写 MSR，因为本次 execve 不经过 switch_to_task。
+        (*me).fs_base = 0;
+        (*me).gs_base = 0;
+        core::arch::asm!("wrmsr",
+            in("ecx") 0xC000_0100u64, in("eax") 0u32, in("edx") 0u32,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("wrmsr",
+            in("ecx") 0xC000_0101u64, in("eax") 0u32, in("edx") 0u32,
+            options(nomem, nostack, preserves_flags));
     }
 
     // 9. 改写 pt_regs：下次 iretq 到新程序入口
@@ -2863,33 +2886,30 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
             crate::fs::open::clone_fds(parent_nr, child_nr);
         }
 
-        // CLONE_SETTLS: 为新线程设 TLS（FS base）
+        // CLONE_SETTLS: 为新线程设 TLS（FS base）。
+        // 不能在这里 wrmsr——clone 运行在父进程上下文，wrmsr 会把父进程的
+        // FS_BASE 改成子进程的 TLS 地址，立即破坏父进程的 TLS 访问。正确
+        // 做法：把 new_tls 存进子进程的 fs_base 字段，等 switch_to 切到子进程
+        // 时由它写 MSR_FS_BASE（与 arch_prctl/ret_from_fork 路径一致）。
         if flags & CLONE_SETTLS != 0 && new_tls != 0 {
-            // Write MSR_FS_BASE for the child thread
-            // This will take effect when the child is first scheduled
-            unsafe {
-                core::arch::asm!(
-                    "wrmsr",
-                    in("ecx") 0xC0000100u32, // MSR_FS_BASE
-                    in("eax") (new_tls as u32),
-                    in("edx") (new_tls >> 32) as u32,
-                );
-            }
+            (*child).fs_base = new_tls;
         }
 
-        // CLONE_CHILD_CLEARTID: 子进程退出时清零 child_tidptr
-        if flags & CLONE_CHILD_CLEARTID != 0 && child_tidptr != 0 {
-            // Store the clear_tid address so do_exit can clear it
-            // For now, clear it immediately (child hasn't started yet)
-            core::ptr::write_volatile(child_tidptr as *mut i32, 0);
-        }
+        // CLONE_CHILD_CLEARTID / CLONE_CHILD_SETTID：不能在 clone 的父进程
+        // 上下文里写 child_tidptr——fork 后该页是父子共享的 COW 只读页，
+        // 在父进程里写会改穿共享物理页（WP=0 时）或触发父进程的 COW（WP=1
+        // 时），两种都把子进程的 tid 写进了父进程的数据，腐败父进程的堆。
+        // Linux 的做法是把地址存进 task，由子进程在 ret_from_fork 里自己
+        // put_user（写到自己的地址空间，COW 正确）。这里记下地址，CLEARTID
+        // 的清零则留给 do_exit 将来实现。
+        (*child).set_child_tid = if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+            child_tidptr
+        } else {
+            0
+        };
 
-        // CLONE_CHILD_SETTID: 在子进程的 child_tidptr 处写入 tid
-        if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
-            core::ptr::write_volatile(child_tidptr as *mut i32, (*child).pid as i32);
-        }
-
-        // CLONE_PARENT_SETTID: 在父进程的 parent_tidptr 处写入子进程 tid
+        // CLONE_PARENT_SETTID: 在父进程的 parent_tidptr 处写入子进程 tid。
+        // 这里写的是父进程自己的页（当前 CR3 就是父进程），不涉及 COW 穿透。
         if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
             core::ptr::write_volatile(parent_tidptr as *mut i32, (*child).pid as i32);
         }

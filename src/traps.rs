@@ -262,6 +262,27 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
         return;
     }
 
+    // 内核态缺页。CR0.WP=1 后，内核对 COW 只读用户页的写（copy_to_user，
+    // 如 read() 把数据拷进子进程缓冲区）会以 supervisor write-protect 形式
+    // 缺页（err: P=1 W=1 U=0）。按 COW 复制后重试写即可——这正是 WP=1
+    // 相对 WP=0 的关键收益：内核写不再穿透共享页 corrupt 父进程。
+    if v == 14 {
+        if let Some(fault_addr) = cr2 {
+            let is_write = (error_code & 2) != 0;
+            let is_present = (error_code & 1) != 0;
+            let is_user_page = (error_code & 4) == 0;  // supervisor 访问用户页
+            if is_write && is_present && is_user_page {
+                let pml4 = unsafe { (*sched::task_ptr(sched::current_index())).pml4 };
+                if pml4 != 0 {
+                    if let Some(true) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
+                        crate::pr_debug!("COW supervisor fault handled at {:#x}", fault_addr);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     die_if_kernel(name, regs, error_code, cr2, v);
 }
 

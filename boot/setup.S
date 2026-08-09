@@ -174,9 +174,15 @@ e820_done:
     orl     $0x901, %eax
     wrmsr
 
-/* 同时开 PG 和 PE，直接进入 long mode 的 compatibility 状态 */
+/* 同时开 PG 和 PE，直接进入 long mode 的 compatibility 状态。
+ * 必须同时置位 WP（CR0 bit 16）：WP=0 时内核态写忽略页表 R/W 位，
+ * fork 后所有用户页都被 cow_copy_page_table 标成只读，此时内核的
+ * copy_to_user（read 等）与 clone 的 CLONE_CHILD_SETTID/CLEARTID
+ * 会直接写到共享物理页、绕过写时复制，把父或子的堆/TLS 数据写穿，
+ * 表现为 fork 出的子进程（ls/cat）在 glibc malloc 里取到腐败 chunk 而 #GP。
+ * Linux 在 start_kernel 早期就置 WP=1，这里对齐。 */
     movl    %cr0, %eax
-    orl     $0x80000001, %eax
+    orl     $0x80010001, %eax
     movl    %eax, %cr0
 
 /* 远跳进 64 位代码段，落到 system (物理 0x10000) */
