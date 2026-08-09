@@ -18,6 +18,32 @@
 ### 已解决的历史问题
 - ~~LLVM noalias 优化导致 super block 数据竞争~~（bug-023）
 - ~~内存溢出（OOM）导致 panic~~
+- ~~COW 页面故障未处理导致 SIGSEGV~~（bug-cow）：`try_handle_cow_fault` 对
+  引用计数为 0（未跟踪）的页返回 `Some(false)`，fork 后父进程写栈即被杀。
+  已改为 refs<=1 直接授予写权限（保留 NX 位）。
+- ~~取指故障（err bit4）在 present+user 页上未处理~~：traps.rs 现在对
+  instruction-fetch 故障清除 NO_EXEC，避免代码页被误标 NX 后 SIGSEGV。
+
+### 调试输出规范
+- 写路径/系统调用路径的调试串口打印必须用 `pr_debug!`/`pr_warn!` 等
+  分级宏，不要直接 `serial::print` 留 `0xNN(a0,a1)=ret` 之类的 trace。
+- execve 里不要留 `EXEC: phdr/interp/LOAD/success` 之类的 trace 打印。
+
+### 构建与运行（含 LFS busybox 测试）
+- 默认 `scripts/build.sh` 不含 IDE 驱动（`extra-drivers` feature），
+  LFS 模式会报「IDE not found」。
+- 要跑 busybox shell：`bash scripts/build.sh --release --features extra-drivers`
+  （debug+extra-drivers 会让 system 超过 0x9F000 安全区，链接 ASSERT 失败，
+  必须用 release）。
+- 用第二块 IDE 盘挂 lfs3.img 跑 shell：
+  ```
+  qemu-system-x86_64 \
+    -drive format=raw,file=target/boot/shitix.img,if=ide \
+    -drive format=raw,file=lfs3.img,if=ide \
+    -m 256M -no-reboot -no-shutdown -display none -serial mon:stdio
+  ```
+- 环境需 nightly Rust（`rustup` 安装）+ `x86_64-unknown-none` target，
+  以及 `as`/`ld`/`objcopy`（binutils）和 `qemu-system-x86_64`。
 
 ### 分支状态
 - `fs`: 修复了 super_block.rs 的 guard 位置 bug
