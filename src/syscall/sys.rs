@@ -507,20 +507,25 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     let top_page = unsafe { paging::translate(new_pml4, stack_top_va - PAGE_SIZE) }.unwrap_or(0);
 
     // 用户栈初始布局（自顶向下，与 glibc _dl_setup_stack / SysV ABI 一致）：
-    //   [字符串区：AT_EXECFN/AT_PLATFORM/argv[0]/AT_RANDOM]  ← 页最顶
+    //   [字符串区：AT_RANDOM / AT_PLATFORM / argv[*] / envp[*] / AT_EXECFN]  ← 页最顶
     //   [auxv: AT_NULL..AT_*]
-    //   [envp: NULL]
-    //   [argv: argv[0], NULL]
+    //   [envp: ...NULL]
+    //   [argv: ...NULL]
     //   [argc]
-    // 旧实现把字符串写在页顶、auxv 又从最高槽(n_slots-1=top-8)往下写，
-    // 两者重叠：AT_NULL 把 "/bin/sh\0"/"sh\0" 清零，argv[0] 变成空串，
-    // BusyBox 取 basename 为空 → ": applet not found"。下面用游标正确分隔。
+    // 早先这里把 argv 硬编码成 argc=1/argv[0]="/bin/sh"，导致 cat 等程序拿不到
+    // 命令行参数（永远只读 stdin）。现在从用户空间读真正的 argv/envp。
     let n_slots = PAGE_SIZE / 8;
     let argc_slot: usize;
     let execfn_va: u64;
     let platform_va: u64;
     let argv0_va: u64;
     let random_va: u64;
+    // 收集 argv/envp 字符串的虚拟地址（最多各 64 项）。
+    const MAX_ARGS: usize = 64;
+    let mut argv_vas: [u64; MAX_ARGS] = [0; MAX_ARGS];
+    let mut envp_vas: [u64; MAX_ARGS] = [0; MAX_ARGS];
+    let mut argc: usize = 0;
+    let mut envc: usize = 0;
     // SAFETY: top_page 在恒等映射内，独占。
     unsafe {
         let base = top_page as *mut u8;
@@ -533,18 +538,82 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         core::ptr::write_bytes(rp, 0, 16);
         random_va = (stack_top_va - (top as usize - rp as usize)) as u64;
         cur = rp;
-        // 普通字符串：argv[0]/AT_EXECFN/AT_PLATFORM（游标递减，不重叠）。
-        let mut put = |s: &[u8]| -> u64 {
-            let len = s.len() + 1; // 含 NUL
+        // 把一条用户字符串拷到栈字符串区，返回它的虚拟地址。
+        // 失败（坏指针）时跳过该项（写一个空串占位），不致命。
+        let mut put_user = |uptr: u64, cur: &mut *mut u8| -> u64 {
+            if uptr == 0 || !check_range(uptr, 1) {
+                // 空串占位
+                let p = cur.sub(1);
+                *p = 0;
+                *cur = p;
+                return (stack_top_va - (top as usize - p as usize)) as u64;
+            }
+            // 量长度（上限 4096，防坏指针）
+            let n = crate::klib::string::strnlen(uptr as *const u8, 4096);
+            let len = if n >= 4096 { 0 } else { n + 1 };
+            if len == 0 {
+                let p = cur.sub(1);
+                *p = 0;
+                *cur = p;
+                return (stack_top_va - (top as usize - p as usize)) as u64;
+            }
+            // 对齐：保证后续 8 字节槽位区从 8 对齐开始（字符串区任意对齐都行，
+            // 但 aux_top 算法要求字符串区结束后能 &!7）。
+            let p = cur.sub(len);
+            if check_range(uptr, n as u64) {
+                core::ptr::copy_nonoverlapping(uptr as *const u8, p, n);
+            }
+            *p.add(n) = 0;
+            *cur = p;
+            (stack_top_va - (top as usize - p as usize)) as u64
+        };
+        // 普通定长字符串（AT_PLATFORM）
+        let mut put_const = |s: &[u8], cur: &mut *mut u8| -> u64 {
+            let len = s.len() + 1;
             let p = cur.sub(len);
             core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
             *p.add(s.len()) = 0;
-            cur = p;
+            *cur = p;
             (stack_top_va - (top as usize - p as usize)) as u64
         };
-        argv0_va = put(b"/bin/sh");
-        execfn_va = argv0_va; // AT_EXECFN 与 argv[0] 共用同一字符串
-        platform_va = put(b"x86_64");
+        platform_va = put_const(b"x86_64", &mut cur);
+
+        // argv：args.a1 是 char*[]（NULL 终止）。逐项拷字符串。
+        let argv_arr = args.a1;
+        if argv_arr != 0 {
+            loop {
+                if argc >= MAX_ARGS { break; }
+                if !check_range(argv_arr + (argc as u64) * 8, 8) { break; }
+                let p = core::ptr::read_volatile((argv_arr + (argc as u64) * 8) as *const u64);
+                if p == 0 { break; } // NULL 终止
+                let va = put_user(p, &mut cur);
+                argv_vas[argc] = va;
+                argc += 1;
+            }
+        }
+        // argv[0] 可能为空（execve 无 argv）→ 用 filename 补 argv[0]
+        if argc == 0 {
+            let va = put_user(filename_ptr, &mut cur);
+            argv_vas[0] = va;
+            argc = 1;
+        }
+        argv0_va = argv_vas[0];
+
+        // envp：args.a2 是 char*[]（NULL 终止）。
+        let envp_arr = args.a2;
+        if envp_arr != 0 {
+            loop {
+                if envc >= MAX_ARGS { break; }
+                if !check_range(envp_arr + (envc as u64) * 8, 8) { break; }
+                let p = core::ptr::read_volatile((envp_arr + (envc as u64) * 8) as *const u64);
+                if p == 0 { break; }
+                let va = put_user(p, &mut cur);
+                envp_vas[envc] = va;
+                envc += 1;
+            }
+        }
+        // AT_EXECFN：用 exec 的 filename（用户可见的程序路径）
+        execfn_va = put_user(filename_ptr, &mut cur);
 
         // 2) auxv/argv/argc 槽位区：从字符串区下方往下写。
         let aux_top = (cur as usize) & !0x7; // 8 对齐
@@ -586,10 +655,20 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         s.add(i).write_volatile(11); i -= 1;   // AT_UID key
         s.add(i).write_volatile(0); i -= 1;    // AT_SECURE(23) val
         s.add(i).write_volatile(23); i -= 1;   // AT_SECURE key
-        s.add(i).write_volatile(0); i -= 1;    // NULL envp
-        s.add(i).write_volatile(0); i -= 1;    // argv 终止 NULL
-        s.add(i).write_volatile(argv0_va); i -= 1; // argv[0]
-        s.add(i).write_volatile(1);             // argc=1
+        // envp 终止 NULL
+        s.add(i).write_volatile(0); i -= 1;
+        // envp[envc-1 .. 0]（逆序写）
+        for k in (0..envc).rev() {
+            s.add(i).write_volatile(envp_vas[k]); i -= 1;
+        }
+        // argv 终止 NULL
+        s.add(i).write_volatile(0); i -= 1;
+        // argv[argc-1 .. 0]（逆序写）
+        for k in (0..argc).rev() {
+            s.add(i).write_volatile(argv_vas[k]); i -= 1;
+        }
+        // argc
+        s.add(i).write_volatile(argc as u64);
         argc_slot = i;
     }
     // user_rsp 指向 argc 槽的虚拟地址。
@@ -1822,7 +1901,7 @@ pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
     // 一次只返回一项：fs 层的 readdir 就是单项语义（原版 1.0.9 的
     // `sys_readdir` 同样一次一项，getdents 是 1.2 之后才有的批量接口）。
-    let mut d = crate::fs::Dirent { d_ino: 0, d_off: 0, d_reclen: need as u16, d_name: [0; 32] };
+    let mut d = crate::fs::Dirent { d_ino: 0, d_off: 0, d_reclen: need as u16, d_type: 0, d_name: [0; 32] };
     // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
     let r = unsafe { crate::fs::read_write::readdir(fd as usize, &mut d) };
     if r <= 0 {
@@ -2126,6 +2205,20 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
                 (*crate::fs::inode::inode_ptr((*child).root)).i_count += 1;
             }
 
+            // 复制 fd 表（旁路数组 TASK_FILP，不在 Task 里，clone 不会带过去）。
+            // 每个被共享的打开文件表项 f_count++（原版 copy_process 里
+            // `for (i=0; i<NR_OPEN; i++) if (f=p->filp[i]) f->f_count++;`）。
+            // 不做这步的话子进程没有 stdin/stdout/stderr，cat 这类外部命令
+            // 一 openat 就拿到 fd 0、write(1) 直接 EBADF。
+            crate::fs::open::clone_fds(parent_nr, child_nr);
+            for fd in 0..crate::fs::NR_OPEN {
+                let fi = crate::fs::open::task_fd(child_nr, fd);
+                if fi != crate::fs::inode::NIL {
+                    // SAFETY: fi 是有效的 file_table 下标。
+                    (*crate::fs::file_table::filp(fi)).f_count += 1;
+                }
+            }
+
             // ---- 布置子进程内核栈 ----
             // 布局和 sched::kernel_thread 一致，只是 ret 地址上方放的不是
             // fn/arg 而是一整份 pt_regs：
@@ -2329,7 +2422,25 @@ pub fn pipe2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 pub fn fchmodat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn fchownat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn openat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn openat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::EBADF;
+    // openat(dirfd, path, flags, mode)。AT_FDCWD 与绝对路径退化为普通 open。
+    let dirfd = args.a0 as i32;
+    let path = match unsafe { user_path(args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if dirfd != -100 && path.first() != Some(&b'/') {
+        // 相对路径 + 具体 dirfd：目前按 CWD 解析，但先确认 fd 有效，
+        // 避免静默打开错的文件。真正的 dirfd 相对解析留待 VFS 完善。
+        if crate::fs::open::fd_to_filp(dirfd as usize) == crate::fs::inode::NIL {
+            return -(EBADF as i64);
+        }
+    }
+    // SAFETY: 同 sys_open。
+    let r = unsafe { crate::fs::open::sys_open(path, args.a2 as u32, args.a3 as u16) };
+    r
+}
 pub fn mkdirat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn mknodat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn unlinkat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -2780,7 +2891,103 @@ pub fn pread64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 指定偏移写，不改 f_pos。同 [`pread64`]。
 pub fn pwrite64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 内核内文件到文件的搬运。需要 fs 层的 splice 基础设施。
-pub fn sendfile(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn sendfile(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::{EBADF, EINVAL, ENOMEM, EOVERFLOW};
+    use crate::mm::{get_free_page, free_page, PAGE_SIZE};
+
+    let out_fd = args.a0 as usize;
+    let in_fd = args.a1 as usize;
+    let off_ptr = args.a2;
+    let count = args.a3;
+
+    if in_fd == out_fd {
+        return -(EINVAL as i64);
+    }
+
+    let mut fpos: i64;
+    let mut update_fpos = false;
+    if off_ptr != 0 {
+        if !check_range(off_ptr, 8) {
+            return -(EINVAL as i64);
+        }
+        // SAFETY: check_range 已确认可读。
+        fpos = unsafe { core::ptr::read_unaligned(off_ptr as *const i64) };
+        if fpos < 0 {
+            return -(EINVAL as i64);
+        }
+    } else {
+        // 用 in_fd 当前 f_pos，读完推进
+        let f = crate::fs::open::fd_to_filp(in_fd);
+        if f == crate::fs::inode::NIL {
+            return -(EBADF as i64);
+        }
+        // SAFETY: f 有效
+        fpos = unsafe { crate::fs::file_table::filp(f).f_pos } as i64;
+        update_fpos = true;
+    }
+
+    let buf = get_free_page();
+    if buf == 0 {
+        return -(ENOMEM as i64);
+    }
+
+    let mut sent: i64 = 0;
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = core::cmp::min(remaining as usize, PAGE_SIZE);
+        let dest = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, chunk) };
+        // SAFETY: 系统调用上下文，read 会睡。
+        let n = if off_ptr != 0 {
+            // 偏移读：lseek 到 fpos 再读，读完恢复（in_fd 的 f_pos 可能被别处用）
+            unsafe {
+                let saved = crate::fs::read_write::lseek(in_fd, 0, crate::fs::SEEK_CUR);
+                crate::fs::read_write::lseek(in_fd, fpos, crate::fs::SEEK_SET);
+                let r = crate::fs::read_write::read(in_fd, dest);
+                crate::fs::read_write::lseek(in_fd, saved, crate::fs::SEEK_SET);
+                r
+            }
+        } else {
+            unsafe { crate::fs::read_write::read(in_fd, dest) }
+        };
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        // SAFETY: 同上。
+        let w = unsafe { crate::fs::read_write::write(out_fd, &dest[..n]) };
+        if w <= 0 {
+            break;
+        }
+        let w = w as usize;
+        sent += w as i64;
+        fpos += w as i64;
+        if (w as u64) < remaining {
+            // out_fd 没接住全部，停
+            remaining = 0;
+        } else {
+            remaining -= w as u64;
+        }
+        if fpos < 0 {
+            sent = -(EOVERFLOW as i64);
+            break;
+        }
+    }
+
+    free_page(buf);
+
+    if update_fpos {
+        let f = crate::fs::open::fd_to_filp(in_fd);
+        if f != crate::fs::inode::NIL {
+            // SAFETY: f 有效
+            unsafe { crate::fs::file_table::filp(f).f_pos = fpos as u64 };
+        }
+    }
+    if off_ptr != 0 && sent >= 0 {
+        // SAFETY: check_range 已确认可写。
+        unsafe { core::ptr::write_unaligned(off_ptr as *mut i64, fpos) };
+    }
+    sent
+}
 /// 创建进程/线程。`sys_fork` 已有，clone 的 flags 语义（共享地址空间/文件表）还没有。
 /// clone syscall — 创建进程/线程。flags 控制资源共享。
 pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
@@ -2881,10 +3088,20 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
             (*child).parent = (*parent).parent;
         }
 
-        // CLONE_FILES: share fd table with parent
-        if flags & CLONE_FILES != 0 {
-            crate::fs::open::clone_fds(parent_nr, child_nr);
+        // CLONE_FILES: 线程共享 fd 表。我们的 fd 表是 per-task 旁路数组，
+        // 没有真正的共享语义，所以无论是否 CLONE_FILES 都把父表复制给子进程。
+        // 关键：fork 语义（clone(SIGCHLD)，不带 CLONE_FILES）必须复制 fd 表，
+        // 否则子进程没有 stdin/stdout/stderr，cat 等外部命令 write(1) → EBADF。
+        // 每个被继承的打开文件表项 f_count++（原版 copy_process 的语义）。
+        crate::fs::open::clone_fds(parent_nr, child_nr);
+        for fd in 0..crate::fs::NR_OPEN {
+            let fi = crate::fs::open::task_fd(child_nr, fd);
+            if fi != crate::fs::inode::NIL {
+                // SAFETY: fi 是有效的 file_table 下标。
+                (*crate::fs::file_table::filp(fi)).f_count += 1;
+            }
         }
+        let _ = flags & CLONE_FILES;
 
         // CLONE_SETTLS: 为新线程设 TLS（FS base）。
         // 不能在这里 wrmsr——clone 运行在父进程上下文，wrmsr 会把父进程的
@@ -3328,7 +3545,6 @@ pub fn ioprio_set(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn ioprio_get(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// `fstatat` 的正式名。需要 dirfd 相对解析。
 pub fn newfstatat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    use crate::fs::stat::Stat64;
     use crate::klib::errno::{EBADF, EFAULT, EINVAL};
 
     let dirfd = args.a0 as i32;
@@ -3338,37 +3554,54 @@ pub fn newfstatat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
     if stat_ptr == 0 { return -(EFAULT as i64); }
 
-    let result = if dirfd == -100 && path_ptr != 0 {
-        // AT_FDCWD：按路径 stat
+    // namei / f_inode 返回的是 VFS inode 下标（已 iget），必须用
+    // cp_new_stat 直接读该槽位；早先这里走 Stat64::from_inode，后者内部
+    // iget(inr, 0) 把下标当超级块号、把 ino 当 0，读出磁盘 inode 0
+    // （ext2 里 ino 1 才是第一个有效 inode），导致 st_mode 落到垃圾上、
+    // ls 把目录当字符设备只打印名字。
+    //
+    // glibc 的 fstat(fd) 走 newfstatat(fd, "", st, AT_EMPTY_PATH)：
+    // path 是指向 '\0' 的非空指针（空串），dirfd 是具体 fd。空串要当 fstat(dirfd)。
+    // user_path 对空串返回 Err(EINVAL)，所以这里直接看首字节判空。
+    let path_empty = path_ptr != 0
+        && check_range(path_ptr, 1)
+        && unsafe { core::ptr::read_volatile(path_ptr as *const u8) } == 0;
+
+    let inr = if path_ptr != 0 && !path_empty && dirfd == -100 {
+        // AT_FDCWD + 非空路径：按路径 stat
         let path = unsafe { user_path(path_ptr) };
         match path {
-            Ok(p) => {
-                // SAFETY: p 是有效路径切片
-                match unsafe { crate::fs::namei::namei(p) } {
-                    Ok(inr) => unsafe { Stat64::from_inode(inr) },
-                    Err(e) => { return e as i64; }
-                }
-            }
-            Err(e) => { return e; }
+            Ok(p) => match unsafe { crate::fs::namei::namei(p) } {
+                Ok(n) => n,
+                Err(e) => return e as i64,
+            },
+            Err(e) => return e,
         }
-    } else if path_ptr == 0 {
-        // fd 路径为空：fstat(dirfd)
+    } else if path_ptr == 0 || path_empty {
+        // NULL 路径或空串（AT_EMPTY_PATH）：fstat(dirfd)
         let filp_idx = crate::fs::open::fd_to_filp(dirfd as usize);
         if filp_idx == crate::fs::inode::NIL { return -(EBADF as i64); }
         // SAFETY: filp_idx 有效
-        let inr = unsafe { (*crate::fs::file_table::filp(filp_idx)).f_inode };
-        unsafe { Stat64::from_inode(inr) }
+        unsafe { (*crate::fs::file_table::filp(filp_idx)).f_inode }
     } else {
+        // dirfd 非 AT_FDCWD 且路径非空：相对路径解析暂不支持
         return -(EINVAL as i64);
     };
 
-    match result {
-        Some(s) => {
-            unsafe { core::ptr::write_unaligned(stat_ptr as *mut Stat64, s) };
-            0
-        }
-        None => -(crate::klib::errno::ENOENT as i64),
+    // SAFETY: check_range 已确认目标可写。
+    if !check_range(stat_ptr, core::mem::size_of::<crate::fs::stat::Stat64>() as u64) {
+        // 即便越界也要 iput，避免泄漏 inode 引用。
+        // SAFETY: inr 是已 iget 的下标（namei/filp 都增了引用）。
+        unsafe { crate::fs::inode::iput(inr); }
+        return -(EFAULT as i64);
     }
+    let mut s = crate::fs::stat::Stat64::zeroed();
+    // SAFETY: inr 是有效 inode 下标。
+    unsafe { crate::fs::stat::cp_new_stat(inr, &mut s); }
+    unsafe { crate::fs::inode::iput(inr); }
+    // SAFETY: check_range 通过。
+    unsafe { core::ptr::write_unaligned(stat_ptr as *mut crate::fs::stat::Stat64, s) };
+    0
 }
 /// 带信号屏蔽的 select。转 [`select`] 前要先接上信号。
 pub fn pselect6(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }

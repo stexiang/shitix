@@ -142,7 +142,7 @@ impl Stat {
 ///
 /// # Safety
 /// `n` 必须是有效 inode 下标。
-unsafe fn cp_new_stat(n: usize, out: &mut Stat64) {
+pub unsafe fn cp_new_stat(n: usize, out: &mut Stat64) {
     // SAFETY: 契约转交。
     unsafe {
         let i = inode::inode(n);

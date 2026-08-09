@@ -1234,6 +1234,7 @@ pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
     cur.errno = 0;
 
     let args = SysArgs::from_regs(regs);
+
     let ret = SYS_CALL_TABLE[call_nr](&args, regs);
 
     // 原版：先写返回值，再看 errno 是否要覆盖

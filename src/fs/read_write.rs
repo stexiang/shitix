@@ -209,10 +209,16 @@ pub unsafe fn readdir(fd: usize, out: &mut Dirent) -> i64 {
             return -(EBADF as i64);
         }
         let ip = inode::inode_ptr(n);
-        if (*ip).i_op != FsType::Minix || !mode::is_dir((*ip).i_mode) {
+        let i_op = unsafe { core::ptr::addr_of!((*ip).i_op).read_volatile() };
+        if !mode::is_dir(unsafe { core::ptr::addr_of!((*ip).i_mode).read_volatile() }) {
             return -(ENOTDIR as i64);
         }
-        let r = super::minix::dir::fill_dirent(n, pos, out);
+        let r = match i_op {
+            FsType::Minix => super::minix::dir::fill_dirent(n, pos, out),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::dir::fill_dirent(n, pos, out),
+            _ => -(ENOTDIR as i64),
+        };
         if r > 0 {
             filp(f).f_pos = r as u64;
             // 原版 readdir 成功返回 1（读到一项）
