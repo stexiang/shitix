@@ -1,7 +1,13 @@
 #!/bin/bash
 # Full LFS build — all packages in dependency order
 # This builds against musl (Alpine's libc) for the shitix kernel target
+# Sources are optional: packages are installed via Alpine apk.
+# Download sources first with: bash scripts/full/download.sh
 set -e
+
+# Check if sources exist, skip builds that need missing tarballs
+SRC=/lfs/usr/src
+SKIP_MISSING=1
 
 SRC=/lfs/usr/src
 DEST=/lfs
