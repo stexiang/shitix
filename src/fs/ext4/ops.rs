@@ -269,6 +269,71 @@ pub mod full {
         }
     }
 
+    /// 读符号链接的目标路径。
+    ///
+    /// ext4 把短链接（目标 ≤ 60 字节且 `i_blocks==0`）直接存在 inode 的
+    /// `i_block` 区（快速符号链接）；长链接分配数据块，目标存在块里。
+    /// 对应原版 `ext2_follow_link` 里 `inode->i_blocks ? bread : i_data`
+    /// 的二分。返回目标的字节切片（不含 NUL），最长 255。
+    ///
+    /// # Safety
+    /// 只能在进程上下文调用。`ip` 是已 `iget` 的符号链接 inode。
+    pub unsafe fn read_symlink(ip: usize) -> Option<([u8; 256], usize)> {
+        unsafe {
+            let i = inode::inode(ip);
+            let sb_nr = i.i_sb;
+            if sb_nr == NIL { return None; }
+            let info = ext4_info(sb_nr);
+            if !info.valid { return None; }
+            let dev = sb(sb_nr).s_dev;
+            let ino = i.i_ino;
+            let inode_table = inode_table_for_inode(sb_nr, ino)? as u64;
+            let group_base = ((ino as u64 - 1) / info.inodes_per_group as u64)
+                * info.inodes_per_group as u64;
+            let byte_off = (ino as u64 - 1 - group_base) * info.inode_size as u64;
+            let block = inode_table + byte_off / info.block_size as u64;
+            let block_off = (byte_off % info.block_size as u64) as usize;
+            let b = buffer::bread(dev, block as u32, info.block_size)?;
+            let data = bh(b).data();
+            if block_off + info.inode_size as usize > data.len() {
+                buffer::brelse(b);
+                return None;
+            }
+            let raw = &data[block_off..block_off + info.inode_size as usize];
+            let ei = Ext4Inode::from_bytes(raw)?;
+            let fast = ei.is_fast_symlink();
+            // i_block 区起自偏移 40，长 60 字节。
+            const IB_OFF: usize = 40;
+            if fast {
+                // 快速链接：目标内联在 i_block 前 i_size 字节
+                let len = (ei.i_size() as usize).min(60).min(255);
+                let mut o = [0u8; 256];
+                o[..len].copy_from_slice(&raw[IB_OFF..IB_OFF + len]);
+                buffer::brelse(b);
+                return Some((o, len));
+            }
+            // 慢链接：bmap_phys（独立读盘，不依赖 b）求第一块物理号。先释放
+            // inode 块缓冲再读数据块，避免同时占两块。
+            let phys_1k = bmap_phys(ip, 0);
+            buffer::brelse(b);
+            if phys_1k == 0 {
+                return None;
+            }
+            let scale = (info.block_size / 1024) as u32;
+            let phys_fs = phys_1k / scale;
+            let db = buffer::bread(dev, phys_fs, info.block_size)?;
+            let d = bh(db).data();
+            let mut len = 0;
+            while len < d.len() && len < 255 && d[len] != 0 {
+                len += 1;
+            }
+            let mut o = [0u8; 256];
+            o[..len].copy_from_slice(&d[..len]);
+            buffer::brelse(db);
+            Some((o, len))
+        }
+    }
+
     /// bmap: 逻辑块 → 物理块映射。
     ///
     /// `block` 以 1024 字节为单位（与 `ext4_file_read` 的 `bs = block_size = 1024`
