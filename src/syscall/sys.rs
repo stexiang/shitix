@@ -1578,8 +1578,8 @@ pub fn readlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return 0;
     }
 
-    // 真实路径：用 namei 找到 inode
-    let inr = match unsafe { crate::fs::namei::namei(path) } {
+    // 真实路径：用 lnamei 找到符号链接自身的 inode（不跟随末尾链接）
+    let inr = match unsafe { crate::fs::namei::lnamei(path) } {
         Ok(i) => i, Err(e) => return e as i64,
     };
     let ip = unsafe { crate::fs::inode::inode(inr) };

@@ -190,6 +190,11 @@ pub struct Task {
     /// 文件创建掩码。`umask(2)` 设置，`open(O_CREAT)`/`mkdir` 时
     /// 实际权限 = mode & !umask。
     pub umask: u16,
+
+    /// 符号链接解析深度计数。原版 `current->link_count`，`follow_link`
+    /// 每下探一层自增，超过 5 层返回 `-ELOOP`。任务级而非全局，避免
+    /// 不同任务的解析互相干扰。
+    pub link_count: u32,
 }
 
 impl Task {
@@ -228,6 +233,7 @@ impl Task {
             exe_path: [0u8; 128],
             close_on_exec: 0,
             umask: 0o022,
+            link_count: 0,
         }
     }
 

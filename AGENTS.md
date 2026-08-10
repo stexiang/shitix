@@ -162,3 +162,35 @@ ls/cat 在 fork 子进程的 glibc __libc_malloc 里 #GP（rip=0x42c08e）。根
 - selftest 全过，boot ok，echo/true 正常。
 - ls/cat 仍 #GP（见上）。
 - 调试打印（W: rw_ret / CHR: major / TTY_W:）已全部移除（commits a123e6d / a66def9），boot 输出 grep 计数为 0。
+
+### 符号链接（symlink）支持（2026-08-10）
+
+LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接，
+内核缺 `follow_link` 导致 execve 对 `/sbin/init`、`/bin/sh` 返回 ENOTDIR(-20)。
+
+#### 已落地的修复
+- per-task `link_count: u8`（src/sched/task.rs，empty() 置 0）：防环守卫，
+  超过 5 层返回 -ELOOP（同原版 current->link_count）。
+- ext4 symlink target reader（src/fs/ext4/ops.rs:read_symlink）：
+  读 raw inode，用 Ext4Inode::is_fast_symlink()（i_blocks==0 && size<=60）
+  区分快速链接（目标内联在 i_block 前 i_size 字节）与慢链接（bmap_phys
+  求第一块物理号后 bread 读数据块）。注意：判快速链接必须用 is_fast_symlink()
+  而非 bmap_phys!=0——快速链接的 i_block 区存的是目标文本（如 "usr/sbin"），
+  不是 extent 树，bmap_phys 会按经典 direct-block 解释 ib[0..4] 得到天文数字块号，
+  bread 挂死。
+- follow_link + _namei/dir_namei_base 跟随符号链接（src/fs/namei.rs）：
+  port 自 linux-1.0.9 namei.c。中间分量与末尾分量都跟随；lnamei（follow_links=false）
+  给 lstat/readlink 用，不跟随末尾。相对链接以链接所在目录为解析起点。
+- sys_lstat 改用 lnamei（src/fs/stat.rs）：原 lstat 直接转调 stat，现在正确返回链接自身 inode。
+- readlink 改用 lnamei（src/syscall/sys.rs）：取链接自身而非目标。
+
+#### 验证
+- merged.img（merged-usr，含 /sbin->usr/sbin、/bin->usr/bin、/lib64->usr/lib，
+  及 loopa<->loopb 环链）：/sbin/init 经 symlink 解析后 execve 成功
+  （busybox init 输出 "init: must be run as PID 1"）；/loopa 返回 -40 (ELOOP)。
+- lfs3.img（真实目录布局）回归：/sbin/init 正常 execve，无回归。
+- 默认 ramdisk 引导：全部 selftest 通过，boot ok。
+
+#### 限制
+- minix 符号链接未移植：read_symlink_target 对 minix 链接返回 None -> -EIO。
+- O_NOFOLLOW 未移植：open_namei 对已存在的末尾链接统一跟随（同原版 1.0.9）。
