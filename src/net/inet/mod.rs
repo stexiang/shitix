@@ -41,3 +41,4 @@ pub mod eth;
 pub mod dev;
 pub mod route;
 pub mod protocol;
+pub mod netif;

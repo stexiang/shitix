@@ -18,6 +18,9 @@
 
 pub mod block;
 pub mod char_dev;
+pub mod net;
+#[cfg(feature = "extra-drivers")]
+pub mod sound;
 
 /// 初始化所有驱动。对应原版 `init/main.c` 里那串 `*_init()` 调用，
 /// 以及 `blk_dev_init()`/`chr_dev_init()`。
@@ -31,6 +34,15 @@ pub unsafe fn init() {
     unsafe {
         block::ll_rw::init();
         block::ramdisk::init();
+        #[cfg(feature = "extra-drivers")]
+        block::hd::init();
         char_dev::init();
+        // IDE 硬盘和声卡子系统默认不启用：debug 构建镜像偏大。
+        // 可通过 `cargo build --features extra-drivers` 启用，或直接使用 release 构建。
+        #[cfg(feature = "extra-drivers")]
+        {
+            block::hd::init();
+            sound::init();
+        }
     }
 }

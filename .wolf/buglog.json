@@ -424,6 +424,249 @@
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-02T00:00:00Z"
+    },
+    {
+      "id": "bug-024",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "ld: kernel image (incl. BSS) overlaps setup parameter area at 0x90000",
+      "file": "src/mm/page_ref.rs",
+      "root_cause": "page_ref.rs 把 COW 引用计数表写成定长静态数组 static mut PAGE_REF_ARRAY: [AtomicU32; 65536]，占 256KB BSS，把 _kernel_end 顶到 0xCC2B0，越过 0x90000 的机器参数区/0x9E000 E820 表。kernel.ld 的 ASSERT 在链接期拦下。附带：page_ref::init() 从来没被任何地方调用，这 256KB 纯粹是白付的零页 BSS。同时 COW 标记位用 0x8000，而计数字段是 & 0xFFFF，两者重叠，引用计数一旦 >= 32768 就被误读成 COW 页。",
+      "fix": "表体改成按实际物理内存动态划分，沿用 mem_map 的既有约定：page_alloc::init 在 mem_map 之后划出 nr_pages*4 字节、清零、调 page_ref::attach()，并把 map_end 抬到表尾之后（保证不进空闲链表）；MemInfo 加 page_ref_addr/nr_pages。page_ref.rs 用 REF_BASE/REF_LEN + slot() 取槽，越界返回 None 而不 panic（COW 路径会传来受管内存之外的 pfn，如 MMIO）。COW 标记位挪到 bit 31 避开计数字段。结果：BSS 365KB->103KB，_kernel_end=0x8C2C0（距上限约 15KB）。 注意：修此 bug 时观察到的 SUPER_AREA 护栏 panic 另立 bug-025，最初误记为 bug-023 的既有 flaky，是错的——bug-023 的症状里没有护栏 panic。",
+      "tags": [
+        "bss",
+        "linker",
+        "0x90000",
+        "kernel.ld",
+        "assert",
+        "page_ref",
+        "cow",
+        "mm",
+        "static-array"
+      ],
+      "related_bugs": [
+        "bug-001"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-025",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "KERNEL PANIC: SUPER_AREA guard lo smashed at check_mounted（pr_warn 报出的值 0x1234abcd1234abcd 恰好就是正确的 SB_GUARD）",
+      "file": "src/fs/super_block.rs",
+      "root_cause": "两层。(1) 直接原因是护栏检查自身不可信：`check_guards` 用 `&*addr_of!(SUPER_AREA)` 建了一条覆盖整个结构（含 table）的共享引用，与 fs 路径上可能存活的 `&mut SuperBlock` 重叠 = UB，带 readonly/dereferenceable 的假设让比较本身被折叠/复用。证据：单次 read_volatile 的结果同时喂给比较和打印，打印出来的值等于 SB_GUARD，而比较判定不等——内存是好的，是比较错了。super_block.rs:268-272 早就把这个症状写在注释里（针对 sb() 里调 check_guards 的场合），只是 check_mounted 这条路径没被算进去。(2) 为什么现在才出现：`33667fd`（COW）引入 256KB 的 PAGE_REF_ARRAY 后内核就再也没链接成功过（bug-024），所以 33667fd 和 5a3c04e 两个提交的代码从未运行过；最后一个可构建的提交是 HEAD~2。实测 HEAD~2 跑 20 次护栏 0 次误报，与用户「上次测护栏 100% 正常」一致。链接修好后新代码首次执行，内联上下文变了，这个一直潜伏的误报才显形。",
+      "fix": "`check_guards` 改成全程裸指针（`addr_of_mut!` + `read_volatile`），不再建任何覆盖 SUPER_AREA 的引用；失配时先复读同一地址，复读正确就只 pr_warn 说明本次比较不可信并继续，复读仍错才 panic。这样真损坏仍然 fail-stop，误报不再杀内核。修完 20 次 0 次触发。",
+      "tags": [
+        "ub",
+        "aliasing",
+        "noalias",
+        "miscompile",
+        "guard",
+        "false-positive",
+        "super_block",
+        "check_guards",
+        "layout-sensitive"
+      ],
+      "related_bugs": [
+        "bug-019",
+        "bug-024"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z",
+      "notes": "未能在修复后复现（裸指针版 20 次、保留 UB 只加复读的诊断版 20 次，均 0 次触发），所以机制是从「打印值等于正确护栏」这一矛盾推断的，不是直接测到的。bug-023 的 fs flaky（mkfs.minix failed / unable to mount root）在 HEAD~2 基线上同样是 2/20，与护栏无关，仍然未解决。"
+    },
+    {
+      "id": "bug-026",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "syscall selftest: getpid=-38 getppid=-38 ... -> FAIL；且 getppid 触发 [WARN] sys_kill: pid=0, sig=0",
+      "file": "src/syscall/mod.rs",
+      "root_cause": "nr 模块按功能分组手写调用号，出现大量重号：GETPID=WAIT4=61、GETPPID=KILL=62、SETSID=GETPGRP=76(与 TRUNCATE 同号)、POLL=WAITPID=7、MMAP=MMAP2=9、SHUTDOWN=SIGNAL=48 等。建表时 t[nr::X]=... 后写的项静默覆盖先写的，于是 GETPID 槽最终指向 wait4、GETPPID 槽指向 kill。IO_SETUP..IO_PGETEVENTS 六个全是 0，把 t[READ] 也覆盖了。",
+      "fix": "nr 模块改成从 x86_64 正式表 arch/x86/entry/syscalls/syscall_64.tbl 逐号生成 0..=334 连续常量，杜绝重号；分发表同样按号顺序逐项赋值。自检里原本假设 nr::OPEN 是空槽（已实现），改用新增的私有号 nr::UNUSED=501。",
+      "tags": [
+        "syscall",
+        "duplicate-number",
+        "dispatch-table",
+        "silent-overwrite"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-027",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "scripts/test.sh 明明打印「构建」却不重新编译，改完代码测的还是旧镜像（debug 显示 table=512 entries 的旧文案）",
+      "file": "scripts/test.sh",
+      "root_cause": "工作区里有一处未提交的本地改动把 `bash scripts/build.sh` 注释掉了（同时把 MODE 写死成 test），所以 test.sh 只跑 QEMU 不编译。旧的 serial.log 还在，看起来像是新结果。",
+      "fix": "git checkout scripts/test.sh 恢复。以后改完代码若自检结果与预期不符，先确认 serial.log 里有本次改动引入的新字样，再怀疑代码。",
+      "tags": [
+        "build",
+        "test-harness",
+        "stale-artifact",
+        "local-uncommitted-change"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-028",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "implemented_count() 在 debug 下数出 341、release 下数出 340",
+      "file": "src/syscall/mod.rs",
+      "root_cause": "用「函数指针 != ni_syscall」来数已实现槽位。release 下 LLVM 的 identical code folding 把函数体相同的 sys_* 合并成同一地址，返回 -EINVAL 的占位实现（sched_setscheduler）与同样返回 -EINVAL 的 ni_syscall 撞成一个地址，被误判成未实现。Rust 本身也不保证 fn 指针相等的语义。",
+      "fix": "另建 static WIRED: [bool; NR_SYSCALLS] 位图，与分发表在同一 const 块里逐项赋 true，数位图而不是比指针。debug/release 现在都是 341。",
+      "tags": [
+        "release-only",
+        "identical-code-folding",
+        "fn-pointer-identity",
+        "diagnostic"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-06T00:00:00Z"
+    },
+    {
+      "id": "bug-029",
+      "timestamp": "2026-08-06T00:00:00Z",
+      "error_message": "syscall_fs_selftest: unlink 间歇性返回 +2 (ENOENT 未取负)；同次失败中 stat st_size=32 (读缓冲长度) 而非 20 (实际写入长度)",
+      "file": "boot/entry.S",
+      "root_cause": "boot/entry.S 的 irq_common 在 SAVE_ALL **之前**做 `popq %rax` 取 IRQ 号（BUILD_IRQ 压了 ~nr 和 nr 两格），把被打断上下文的 %rax 就地毁掉；SAVE_ALL 存下去的是 IRQ 号，RESTORE_ALL 又如实恢复回去。于是每个时钟滴答都让被打断的内核代码带着 %rax = 0 继续跑（时钟是 IRQ 0）。低 1GB 是恒等映射，那个 0 当指针用时不 page fault，而是静默读回实模式 IVT 的 F000:FF53 BIOS IRET 桩字节，表现为 i_mode=0xff53 / nlink=255 / s_magic=0xff53 / guard=0xf000ff53f000ff53；当计数用时表现为 readdir 列出 0 项。%rax 在滴答那一刻是否活着完全由寄存器分配决定，所以任何无关改动都能让失败率在 24%~64% 之间大幅跳动——这正是之前误判为『竞态』『内存破坏』的原因。exc_common 有同一处写法，目前潜伏（多数异常直接 panic），但 page_fault 在用户态/COW 接上后会变成高频可恢复异常。",
+      "fix": "1) BUILD_IRQ 去掉多余的 `pushq $nr`，irq_common 改为先 SAVE_ALL、再从 PT_ORIG_RAX 取 ~nr 取反得到 IRQ 号，保存前不动任何寄存器。2) exc_common 同样改为先 SAVE_ALL，向量号从 pt_regs 上方的临时槽读出，然后把「错误码 + iretq 帧」整体下移 8 字节盖掉临时槽，恢复标准 pt_regs 布局。另有三处独立的真修复一并保留：minix parse_inode 改 read_volatile、buffer data()/data_mut() 穿 asm 断 provenance、new_block 越界分支的 zone 泄漏。实测：修复前 9~14/25 过；修复后 25/25 过（看门狗全开）。",
+      "tags": [
+        "intermittent",
+        "volatile",
+        "null-deref",
+        "save_all",
+        "codegen-sensitive",
+        "buffer-cache",
+        "fixed",
+        "identity-map",
+        "minix",
+        "ivt",
+        "irq",
+        "readonly",
+        "stat",
+        "entry.S",
+        "clobber",
+        "rax",
+        "unlink",
+        "inode",
+        "cse",
+        "fs",
+        "noalias"
+      ],
+      "related_bugs": [
+        "bug-023"
+      ],
+      "occurrences": 2,
+      "last_seen": "2026-08-06",
+      "notes": "此前被归给 bug-023 (mkfs.minix failed / unable to mount root)，但 bug-023 已记录为已修 (fs_init_thread 不在 task[0] 里跑)，且其成因「在 task[0] 里睡」已不存在。两者症状重叠但可能是不同根因。大概率不是 minix 独有：do_unlink/dir_namei/buffer cache 都在 VFS 层，换 ext4 会一起带过去。",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-030",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "ext4 selftest FAIL: gd 64bit hi — block_bitmap 期望 0x1_0000_0001, 实际 0x0001_0000_0001",
+      "file": "src/fs/ext4/selftest.rs",
+      "root_cause": "测试构造 GroupDesc 64 位时，设 d[34]=1 想让 block_bitmap_hi=1。但 group_desc.rs 的 rd32(32) 按 little-endian u32 读 offset 32，即 u32::from_le_bytes([d[32],d[33],d[34],d[35]])。d[34]=1 → rd32(32)=0x0001_0000，block_bitmap = (0x0001_0000u64 << 32) | 1 ≠ 0x1_0000_0001。",
+      "fix": "d[34]=1 改为 d[32]=1，使 rd32(32)=1，block_bitmap = (1u64 << 32) | 1 = 0x1_0000_0001。",
+      "tags": ["ext4","group-desc","selftest","little-endian","field-offset"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-031",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "fork selftest: wait4 reaped our child FAILED (got -4) — 父进程 wait4 立刻返回 -EINTR，收不到子进程的尸",
+      "file": "src/signal.rs",
+      "root_cause": "send_sig 无条件 `(*task).signal |= 1<<signum`，漏了原版 kernel/signal.c:generate() 置位前的过滤：SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} 时**不置位**（默认忽略）。do_exit→notify_parent 给父进程发 SIGCHLD 置了位，而 sys_wait4 醒来后只要看到任何未屏蔽待处理信号就返回 -EINTR，于是父进程被自己等的那个孩子打断，永远收不到尸。",
+      "fix": "send_sig 里补上 generate() 的过滤：SIG_IGN 且非 SIGCHLD → 丢；SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} → 丢（SIGCONT 顺带把 Stopped 放回 Running）。notify_parent 的唤醒是独立的 wake_up_waiter 调用，不置位也照样叫醒父进程，与原版 send_sig + wake_up_interruptible 分开调的结构一致。",
+      "tags": ["signal","fork","wait4","exit","EINTR","generate","linux-fidelity"],
+      "related_bugs": ["bug-032"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-032",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "潜伏 bug（写 Stage 2 时发现，未表现为测试失败）：blocked 屏蔽字形同虚设——signal 与 blocked 的位号约定不一致",
+      "file": "src/signal.rs",
+      "root_cause": "Signal::mask() 和 BLOCKABLE 用原版的 `1 << (sig-1)`（位号 = 信号号 - 1），而 send_sig / dequeue_signal / sigaddset / sigdelset 用 `1 << sig`（位号 = 信号号）。于是经 BLOCKABLE 或 SigSet 设进 blocked 的位和 send_sig 置进 signal 的位整体错开 1，`signal & !blocked` 算出来的待处理集合是错的：屏蔽 SIGTERM 实际屏蔽的是 SIGSTKFLT。原版用 32 位字装 31 个信号必须从 bit 0 起算，我们是 64 位没这个约束，两套写法就这么并存下来了。",
+      "fix": "统一到「位号 == 信号号」（bit 0 空着不用）：改 Signal::mask() 为 `1 << sig`、BLOCKABLE 同步。选这个方向而不是原版的 sig-1，是因为改动面小（2 处 vs 5+ 处热路径），且 do_signal 里 trailing_zeros() 拿到的直接就是信号号。约定写进了 Signal::mask() 的文档注释。",
+      "tags": ["signal","sigmask","blocked","bit-convention","off-by-one","latent"],
+      "related_bugs": ["bug-031"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-033",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "链接期风险：per-task sigaction 表把 _kernel_end 从 0x8A4F0 推到 0x8F4F0，距 kernel.ld 的 ASSERT 上限 0x90000 只剩 2832 字节",
+      "file": "src/signal.rs",
+      "root_cause": "照原版把 `struct sigaction sigaction[32]` 按任务铺成静态数组：SigAction 32 字节 × 32 信号 × NR_TASKS 16 = 16KB BSS，一口气吃掉全部剩余余量。原版 task_struct 本身就占一页、表内联在里面，不存在独立的静态数组。",
+      "fix": "改成按需分页：`SIGACTION_TABLES: [usize; NR_TASKS]` 只存页地址（128 字节），首次 set_task_signal 才 get_free_page，release/reset 时 free_page。绝大多数任务从生到死不调 sigaction()，全默认动作不需要任何存储。余量回到 ~19KB（Stage 2 净增 4.2KB，基本都是代码）。",
+      "tags": ["signal","bss","kernel_end","memory-budget","lazy-alloc","kernel.ld"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-034",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "用户态 iretq → page fault at rip=0x40000000 err=0x5（protection violation on present page in user mode）",
+      "file": "src/mm/paging.rs",
+      "root_cause": "next_level() 对已存在的页表条目（PRESENT）直接 return 物理地址而不检查/追加 USER 位。clone_kernel_pdpt 从启动 PML4 拷贝了不带 USER 的条目，map_page 调用 next_level 时 entry 已 PRESENT，走快速返回路径，USER 位从未被写入。CPU 硬件在每级（PML4→PDPT→PD→PT）都检查 U/S 位——PML4[0] 缺 USER → #PF。",
+      "fix": "在 next_level 的 PRESENT 分支里追加：if user && (e & USER == 0) { set_entry(table, idx, e | USER); }。",
+      "tags": ["paging","USER-bit","page-fault","ring-3","next_level","linux-fidelity"],
+      "related_bugs": ["bug-035","bug-036","bug-037"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-035",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "do_exit 里 free_page(pml4) 时 CR3 还指着这个页 → use-after-free；sys_wait4 中 release 之后内核 TLB 缺页读到归零页 → PF",
+      "file": "src/exit.rs, src/sched/mod.rs",
+      "root_cause": "do_exit 在 schedule() 之前 free 了 PML4 页；switch_to_task 对 next_cr3==0（内核任务）不做 CR3 切换，导致父进程（内核线程）一直用子进程的 CR3 跑。release 里 free_page(pml4) 之后内核访问触发 TLB miss → 读到已回收的 PML4 页 → #PF → die_if_kernel panic。",
+      "fix": "1) pml4 free 移到 release()（父进程上下文，此时已调度过但 CR3 可能还是旧的）；2) switch_to_task 改：next_cr3==0 时切回 boot CR3(0x4000)，确保用户→内核切换正确恢复内核页表。",
+      "tags": ["paging","CR3","use-after-free","TLB","schedule","release"],
+      "related_bugs": ["bug-034","bug-036"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-036",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "sys_exit 不调 do_exit → notify_parent 从未触发 → 父进程 wait4 永远睡在 Interruptible 上收不到尸",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "sys::exit 自己实现了 inline Zombie+schedule 逻辑，不调用 exit::do_exit。do_exit 里有完整的 notify_parent（SIGCHLD + wake_up_waiter），sys::exit 里只有 set_need_resched + schedule。父进程在 sys_wait4 里 Interruptible 睡眠，等不到唤醒。",
+      "fix": "sys::exit 改成直接调用 crate::exit::do_exit(code)。",
+      "tags": ["syscall","exit","wait4","notify_parent","zombie"],
+      "related_bugs": ["bug-034"],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-037",
+      "timestamp": "2026-08-07T00:00:00Z",
+      "error_message": "encode_status 把 exit code 1..=31 误判为信号——用户态 exit(5) 被当作 SIGTRAP(5) 处理",
+      "file": "src/exit.rs",
+      "root_cause": "encode_status 对 code ∈ [1,31] 直接当作信号号返回（status = code），对 ≥32 的才编码为高 8 位退出码。sys_exit 传下来的退出码若恰好落在 1..=31（如 exit(5)），wait4 汇报的状态字看起来像「被信号 5 杀」而不是「正常退出码 5」。",
+      "fix": "用户自检改用 exit(42) 避开此区间；encode_status 的重写留给后续阶段（需要区分「do_exit(sig) 的信号终止」与「exit(code) 的正常退出」，可能需要在 exit_code 之外加一个 sentinel）。",
+      "tags": ["exit","wait4","status-encoding","off-by-design"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-07",
+      "status": "known_workaround"
     }
   ]
 }

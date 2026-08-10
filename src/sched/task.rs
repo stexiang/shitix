@@ -14,8 +14,8 @@
 use crate::klib::printk::Level;
 
 /// 最大任务数。对应原版 `include/linux/tasks.h` 的 `NR_TASKS 128`。
-/// 我们暂时只需要少量任务，取 16 省一点 BSS。
-pub const NR_TASKS: usize = 16;
+/// 取 6 省 BSS。
+pub const NR_TASKS: usize = 6;
 
 /// 进程名长度。对应原版 `char comm[16]`。
 pub const COMM_LEN: usize = 16;
@@ -94,6 +94,7 @@ impl Tss {
 }
 
 /// 进程控制块。对应原版 `struct task_struct`（见模块文档说明取舍）。
+#[derive(Clone)]
 #[repr(C)]
 pub struct Task {
     // ---- 原版注释说 "these are hardcoded - don't touch" 的那几个 ----
@@ -147,9 +148,28 @@ pub struct Task {
     pub kernel_stack: u64,
     /// 原版 `struct tss_struct tss`
     pub tss: Tss,
+    /// 数据段结束地址（原版 `unsigned long brk`）。用于 brk() 系统调用。
+    pub brk: usize,
+
+    /// 用户态页表根物理地址（原版 `tss.cr3`：`mm->pgd`）。
+    /// 0 表示共用内核页表（纯内核任务 / swapper）。
+    /// 非 0 时 `switch_to_task` 会在切任务时改写 CR3。
+    pub pml4: usize,
+
+    /// FS 段基址（原版没有，x86_64 TLS 用 MSR IA32_FS_BASE）。
+    /// `arch_prctl(ARCH_SET_FS)` 写入，`switch_to_task` 恢复。
+    pub fs_base: u64,
+
+    /// GS 段基址。同上。
+    pub gs_base: u64,
 
     /// 退出码。原版 `int exit_code`
     pub exit_code: i32,
+
+    /// 当前工作目录 inode。原版 `struct inode * pwd`
+    pub pwd: usize,
+    /// 根目录 inode。原版 `struct inode * root`
+    pub root: usize,
 }
 
 impl Task {
@@ -176,7 +196,13 @@ impl Task {
             timeout: 0,
             kernel_stack: 0,
             tss: Tss::new(),
+            brk: 0,
+            pml4: 0,
+            fs_base: 0,
+            gs_base: 0,
             exit_code: 0,
+            pwd: usize::MAX,
+            root: usize::MAX,
         }
     }
 

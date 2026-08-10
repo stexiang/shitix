@@ -34,6 +34,14 @@ _head_start:
     leaq    stack_top(%rip), %rsp
     xorq    %rbp, %rbp
 
+    /*
+     * 清 BSS 之前先把 setup.S 写在 0x90000 的机器参数保存到寄存器，
+     * 因为 _kernel_end 可能超过 0x90000（由 kernel.ld ASSERT 控制上限）。
+     * BootParams 只有 8 字节，E820 条目数在 0x901E0。
+     */
+    movq    0x90000, %r12        /* cursor(2) + ext_mem_k(2) + video_page(2) + video_mode(2) */
+    movl    0x901E0, %r13d       /* e820 条目数 */
+
     /* 清 BSS —— Rust 侧的 static mut 和 idt 表都依赖这一步 */
     leaq    __bss_start(%rip), %rdi
     leaq    __bss_end(%rip), %rcx
@@ -41,6 +49,10 @@ _head_start:
     xorb    %al, %al
     cld
     rep     stosb
+
+    /* 恢复 setup.S 留在 0x90000 的机器参数 */
+    movq    %r12, 0x90000
+    movl    %r13d, 0x901E0
 
     /*
      * 早期兜底 IDT：256 个门全指向 ignore_int。

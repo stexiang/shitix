@@ -114,6 +114,17 @@ pub unsafe fn new_block(sb_nr: usize) -> u32 {
             let block = j + i as u32 * BITS_PER_BLOCK + sb(sb_nr).s_firstdatazone as u32 - 1;
             let (fdz, nz) = { let p = sb(sb_nr); (p.s_firstdatazone as u32, p.s_nzones as u32) };
             if block < fdz || block >= nz {
+                // 原版这里直接 `return 0`，位却已经置上、缓冲已标脏——那一位
+                // 从此再没人能分配也没人会释放，是个真泄漏。位图尾部超出
+                // `s_nzones` 的那些位如果没被 mkfs 标成已用，就会反复走到这条
+                // 分支，每次漏一个 zone（症状：空闲 zone 计数只减不回、
+                // 随后 write 报 -ENOSPC）。所以这里把位还回去。
+                pr_warn!(
+                    "new_block: out of range i={} j={} -> block {} not in [{}, {})",
+                    i, j, block, fdz, nz
+                );
+                clear_bit(bh(map).data_mut(), j);
+                buffer::mark_buffer_dirty(map);
                 return 0;
             }
 

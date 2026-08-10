@@ -12,6 +12,10 @@ crate-type = ["staticlib"]
 [dependencies]
 x86_64 = { version = "0.15", default-features = false, features = ["instructions", "const_fn"] }
 
+[features]
+default = []
+extra-drivers = []
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

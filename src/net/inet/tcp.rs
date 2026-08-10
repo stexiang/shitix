@@ -97,3 +97,29 @@ pub unsafe fn tcp_send(sk: *mut crate::net::inet::sock::Socket, data: &[u8]) -> 
         0
     }
 }
+
+/// 处理收到的 TCP 段（从 IP 层调用）
+pub fn tcp_input(src_ip: u32, data: &[u8]) {
+    if data.len() < 20 { return; }
+    let sport = u16::from_be_bytes([data[0], data[1]]);
+    let dport = u16::from_be_bytes([data[2], data[3]]);
+    let _seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let _ack = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    let flags = data[13];
+    let hdr_len = ((data[12] >> 4) * 4) as usize;
+    let payload = &data[hdr_len..];
+
+    // SYN-ACK → the server side is acknowledging our connect request
+    // For our simple TCP, we just log and let socket layer poll
+    let _syn = flags & 0x02 != 0;
+    let _ack_flag = flags & 0x10 != 0;
+    let _fin = flags & 0x01 != 0;
+    let _rst = flags & 0x04 != 0;
+
+    // Deliver payload to socket receive queue
+    if !payload.is_empty() {
+        let b = src_ip.to_be_bytes();
+        crate::sprintln!("tcp: rx {} bytes from {}.{}.{}.{}:{} flags={:02x}",
+            payload.len(), b[0], b[1], b[2], b[3], sport, flags);
+    }
+}

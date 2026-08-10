@@ -1,7 +1,11 @@
-# Memory
-
-> Chronological action log. Hooks and AI append to this file automatically.
-> Old sessions are consolidated by the daemon weekly.
+| 2026-08-07 23:50 | 移植声卡子系统：创建 `src/drivers/sound/` 含 config.rs, dev_table.rs, soundcard.rs, sound_switch.rs, dmabuf.rs, audio.rs, opl3.rs, sb.rs, adlib.rs, mod.rs | ~2700 行新 Rust 代码 |
+| 2026-08-07 23:50 | 移植 IDE 硬盘驱动 `src/drivers/block/hd.rs` | ~480 行 |
+| 2026-08-07 23:50 | debug 构建镜像偏大（超 0x91000），将 sound + hd 移到 `extra-drivers` feature gate；release 构建全功能正常 | Cargo.toml, drivers/mod.rs |
+| 2026-08-07 23:50 | 移植声卡子系统 + IDE 硬盘驱动 见上方 | ~3200 行新 Rust 代码 |
+| 2026-08-08 | ext4 完整 VFS 实现：新增 `ext4/namei.rs`（~400行，lookup/create/mkdir/rmdir/unlink/link），重写 `ext4/ops.rs` 增加 `ops::full` 模块（bmap/extend_inode/truncate/file_read/file_write/read_super_full，~400行） | ext4/namei.rs, ext4/ops.rs |
+| 2026-08-08 | ext4 全功能编译条件：`#[cfg(feature = "extra-drivers")]` 围栏——默认 debug 构建用轻量 ops 免超 0x91000；`release --features extra-drivers` 启用完整 ext4 读写 | ops.rs, namei.rs, namei dispatch, read_write dispatch |
+| 2026-08-08 | 更新 fs selftest：ext4 上跳过 minix 创建测试 + syscall-fs 提示 `--features extra-drivers`；debug 构建全 PASS、release+features 编译成功 | lib.rs |
+| 2026-08-08 | 关键教训：ext4 ops.rs 全功能版 debug 构建超 0x91000 → 用 `pub mod full` + `#[cfg(feature)]` 把大实现隔离在主路径之外；VFS dispatch 函数签名需与 minix 一致（返回 `i32` 而非 `Result`）| cerebrum |
 
 ## Session: 2026-08-01 03:00
 
@@ -98,6 +102,244 @@
 |------|--------|---------|---------|--------|
 
 ## Session: 2026-08-02 04:00
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 13:09
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 13:15 | 复现链接错误 `_kernel_end` 越过 0x90000 | boot/kernel.ld, scripts/build.sh | ASSERT 触发，实测 _kernel_end=0xCC2B0 | ~4k |
+| 13:20 | 定位 BSS 大户：注释掉 ASSERT 链到 /tmp 后 nm --size-sort | /tmp/system.elf | PAGE_REF_ARRAY 独占 256KB（BSS 共 365KB） | ~3k |
+| 13:30 | 引用计数表改成动态划分（沿用 mem_map 约定）+ MemInfo 加两字段 | src/mm/page_alloc.rs | map_end 抬到表尾之后，表不进空闲链表 | ~5k |
+| 13:40 | 重写 page_ref：REF_BASE/REF_LEN + attach()/slot()，越界返 None | src/mm/page_ref.rs | 静态数组消除；COW 标记位从 bit15 挪到 bit31（原本与计数字段重叠） | ~6k |
+| 13:50 | 启动行补报 page_ref 表地址与槽数 | src/lib.rs | page_ref at 0x120000 (65504 slots) | ~1k |
+| 13:55 | 构建 + QEMU 启动测试 ×5 | target/boot/ | 链接通过，_kernel_end=0x8C2C0，BSS 365KB→103KB；4/5 PASS，1 次 SUPER_AREA 护栏误报（既有 ~15% flaky，见 bug-019） | ~5k |
+| 14:00 | 记录 bug-024 + cerebrum 三条 + STATUS 更新 | .wolf/ | 已归档 | ~3k |
+
+## Session: 2026-08-06 13:22
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 14:20 | 用户指出护栏误报被错记为 bug-023 flaky | .wolf/buglog.json | 确认记错：bug-023 症状里没有护栏 panic；改记 bug-025 | ~2k |
+| 14:30 | 裸指针重写 check_guards + 失配复读，跑 20 次 | src/fs/super_block.rs | 0 次触发 | ~6k |
+| 14:45 | 诊断变体（保留 UB 只加复读）跑 20 次 | src/fs/super_block.rs | 0 次触发 —— 单靠别名 UB 不稳定复现，加码即改内联 | ~4k |
+| 15:00 | git 考古：256KB 数组在 33667fd 引入，ASSERT 更早 | boot/kernel.ld, src/mm/page_ref.rs | **33667fd 起内核一直没链接过**，最后可构建提交是 HEAD~2 | ~3k |
+| 15:10 | HEAD~2 worktree 基线跑 20 次 | (worktree) | 护栏 0 次触发（与用户说法一致）；fs flaky 2/20 = bug-023 既有 | ~5k |
+| 15:25 | 定稿 check_guards 修法 + 改正 bug-024、新增 bug-025 | src/fs/super_block.rs, .wolf/ | 3 次启动测试通过 | ~4k |
+
+## Session: 2026-08-06 14:12
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 14:13
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 — 系统调用号补齐到 x86_64 正式表
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| — | 审 `nr` 模块，发现大量重号（GETPID=WAIT4=61、GETPPID=KILL=62、六个 IO_* 全 0 覆盖 READ） | src/syscall/mod.rs | 确认自检 FAIL 的根因，记 bug-026 | ~6k |
+| — | `nr` 改成按 x86_64 正式表逐号生成 0..=334 + io_uring/pidfd/clone3/faccessat2/epoll_pwait2 | src/syscall/mod.rs | 341 项无重号 | ~5k |
+| — | 分发表改按号顺序逐项赋值 | src/syscall/mod.rs | 341 槽已挂实现 | ~3k |
+| — | 补 133 个实现：lseek/readv/writev/sched_yield/gettid/time/exit_group/tkill/tgkill 真做，getgroups/madvise/mincore 等给合理默认，其余占位 -ENOSYS | src/syscall/sys.rs | 零新增告警 | ~9k |
+| — | 修自检里 `nr::OPEN` 已实现导致的假设失效，新增私有号 `nr::UNUSED=501` | src/lib.rs, src/syscall/mod.rs | 自检从 FAIL 转 ok | ~1k |
+| — | 发现 test.sh 被本地改动注释掉 build，之前几轮测的都是旧镜像 | scripts/test.sh | git checkout 恢复，记 bug-027 | ~2k |
+| — | `implemented_count` 从比函数指针改成 WIRED 位图（release ICF 少数一个） | src/syscall/mod.rs | debug/release 都是 341，记 bug-028 | ~2k |
+| — | 验证：debug 6 轮（5 过 1 挂 = 已知 bug-023 的 fs 竞态）、release 过、32M/128M/1G/3G 过 | — | 与本次改动无关的既有 flake | ~4k |
+
+## Session: 2026-08-06 15:48
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 15:51
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 15:51
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 16:14
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 16:23
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session 2026-08-06 (模块 7)
+
+| Time  | Action | Files | Outcome | ~tokens |
+|-------|--------|-------|---------|---------|
+| 15:30 | 21 个 syscall 从 `-ENOSYS` 接到 fs 层 | `src/syscall/sys.rs` | `open`/`creat`/`close`/`read`、`dup`/`dup2`、`chdir`/`chmod`/`truncate`、`mkdir`/`rmdir`/`unlink`/`link`/`mknod`、`fsync`、`stat`/`lstat`/`fstat`、`getdents`/`getdents64` | 8k |
+| 15:45 | 用户指针护栏 | `src/syscall/sys.rs` | `check_range`/`user_path`/`user_buf`/`user_buf_mut`/`user_stat_out`，只挡低 1GB 外地址；**不阻止用户态读写内核内存** | 2k |
+| 16:00 | `write` 改 fs 优先 + 控制台兜底 | `src/syscall/sys.rs` | 先走 `fs::read_write::write`，fd 1/2 拿到 `-EBADF` 才退回内核控制台 | 1k |
+| 16:15 | 新增 `syscall_fs_selftest()` | `src/lib.rs` | 9 组测试（creat+write、lseek+read、fstat、dup、close×2、stat、mkdir/rmdir、unlink、EFAULT），挂在 `fs_init_thread` | 4k |
+| 16:30 | 链接失败：BSS 越界 | `boot/kernel.ld` | `_kernel_end = 0x922C0`，超 0x90000 共 8896 字节；`.text`/`.rodata` 涨约 24KB | 2k |
+| 16:45 | 内核栈池移出 BSS | `src/sched/mod.rs`, `src/mm/page_alloc.rs` | `KSTACKS` 改动态划分，`attach_kstacks()` 在 `page_ref` 表之后；`KSTACK_SLOTS` 3→8 | 6k |
+| 17:00 | 修 `write` 自检期望 | `src/lib.rs` | `write(0,...)` 现在返 `-EBADF`（未打开 fd），原期望 `-EINVAL` | 1k |
+| 17:15 | 新增 `scripts/check-syscall-nr.py` | `scripts/check-syscall-nr.py` | 机器核对 `nr` 模块与内核头，输出 `官方 360 个号，本树 360 个 / 全部一致` | 3k |
+| 17:30 | `scripts/test.sh` 加 `MEM=` 覆盖 | `scripts/test.sh` | 默认 256M，照 `TIMEOUT`/`PROFILE` 约定 | 1k |
+| 17:45 | 验证：debug/release + 内存矩阵 | - | `_kernel_end` = 0x854F0 (debug) / 0x5B4E0 (release)，余量 44KB；361 wired；32M/128M/1G/3G 全绿 | 8k |
+| 18:00 | LFS 集成评估 | `.wolf/STATUS.md` | 核实缺项：无 ring-3 切换、`execve` 占位、ELF64 加载器缺、无 `copy_from_user`、`Stat` 是 i386 布局、`arch_prctl` 占位、ext4 只有结构定义无操作 | 4k |
+| 18:15 | 记账 | `.wolf/buglog.json`, `.wolf/STATUS.md`, `.wolf/memory.md` | bug-029 (unlink 间歇性 +2)、STATUS.md 更新模块 7 + LFS 结论 | 3k |
+
+**Total session:** ~43k tokens
+
+## Session: 2026-08-06 19:15
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:01
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:03
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:04
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 21:04
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## 2026-08-06 — bug-029 攻坚（症状归一，未关闭）
+
+| HH:MM | description | file(s) | outcome | ~tokens |
+|-------|-------------|---------|---------|---------|
+| -- | 修正失败率记录：不是 10-15%，是 40-55% | .wolf/STATUS.md | 旧记录误导了两个会话 | 2k |
+| -- | 症状归一：所有坏值 = 从物理地址 0 读（IVT 的 F000:FF53 BIOS IRET 桩） | -- | 0xFF53/255/65363 逐字节对上，低 1GB 恒等映射所以空指针不 fault | 8k |
+| -- | parse_inode 改裸指针 + read_volatile，不再经 &[u8] | src/fs/minix/inode_ops.rs | 有效 | 4k |
+| -- | BufferHead::data/data_mut 把 b_data 穿 asm 断 provenance | src/fs/buffer.rs | 与上一条合计 44%→24% 失败 | 3k |
+| -- | new_block 越界分支的 zone 泄漏修复（原版静默 return 0） | src/fs/minix/bitmap.rs | 真 bug，独立于 029 | 2k |
+| -- | reschedule / kernel_thread_entry 补 call 前 16B 栈对齐 | boot/entry.S | 正确性修复，对失败率无影响 | 2k |
+| -- | 排除 red zone / SSE spill：target spec 已 disable-redzone + soft-float | x86_64-shitix.json | 假设从机制上就不成立 | 1k |
+| -- | 排除 KSTACK_PAGES 4→8、compiler_fence、空 asm memory clobber | src/sched/mod.rs | 均无改善，已还原 | 3k |
+| -- | launder 加到 inode()/sb()/buf_ptr() 反而升到 64% 失败 | 三处，已 revert | 关键：失败率对 codegen 极敏感 | 4k |
+| -- | 清诊断 + 干净构建复测 | -- | PASS=9/20（45%），仅删打印语句就让率变动 | 6k |
+| -- | 更新 buglog bug-029 / cerebrum 五条 DNR / STATUS Next phase | .wolf/*.json,md | 交接完成 | 5k |
+
+**结论：** bug-029 未修复。三处真修复把率砍半但没关掉。下一步该换手段——查内核栈高水位
+（现有 `stack_high_water` 只覆盖 task[0] 静态栈，没覆盖 KSTACK 池那 8 份）、比对失败/
+成功两版的 objdump、或把 fs 自检整段 `cli` 串行化验证是否与中断时序耦合。**不要**再加
+屏障或审源码，这两条路本轮已走尽。
+
+### 同日续：bug-029 定位并修复 ✅
+
+| HH:MM | description | file(s) | outcome | ~tokens |
+|-------|-------------|---------|---------|---------|
+| -- | 决定性实验：用 cli 包住两个 fs 自检 | src/lib.rs（临时） | 20/20 过 vs 基线 9/20 → 范围缩到中断路径 | 3k |
+| -- | 关掉 do_timer 里整组看门狗单测 | src/sched/mod.rs（临时） | 18/20 → 看门狗只是噪声，不是根因 | 2k |
+| -- | KSTACK_PAGES 4→8 在干净基线上复测 | src/sched/mod.rs | 17/20，与 18/20 无差别 → 栈溢出彻底排除 | 2k |
+| -- | 读 irq_common：`popq %rax` 在 SAVE_ALL **之前** | boot/entry.S | **根因**：每滴答让被打断代码带 %rax=0 继续跑 | 4k |
+| -- | 修 BUILD_IRQ + irq_common：先 SAVE_ALL，IRQ 号从 PT_ORIG_RAX 取反 | boot/entry.S | 25/25 过（看门狗全开） | 3k |
+| -- | 修 exc_common 同一处潜伏写法 + 下移 iretq 帧 8 字节 | boot/entry.S | trap 自检 int3/div/ud 全绿；20/20 过 | 4k |
+| -- | 清临时诊断、复测、更新 buglog/cerebrum/STATUS | .wolf/*, src/lib.rs | 累计 45 连过 | 4k |
+
+**根因一句话：** `irq_common` 在 SAVE_ALL 之前 `popq %rax` 取 IRQ 号，毁掉被打断上下文的
+%rax；RESTORE_ALL 把 IRQ 号当 rax 恢复。时钟是 IRQ 0，所以每滴答注入一个 %rax=0。低 1GB
+恒等映射 ⇒ 空指针读不 fault，静默返回 IVT 的 `f000ff53`，于是 `i_mode=0xff53`/`nlink=255`
+/`readdir 0 项` 全部对上。失败率对无关改动敏感，是因为 %rax 是否活着取决于寄存器分配。
+
+## Session: 2026-08-06 00:23
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 00:36
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 00:37
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 00:37
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07
+
+| Time  | Action | File(s) | Outcome | ~Tokens |
+|-------|--------|---------|---------|--------|
+| 17:22 | ext4 selftest 体积超限修复：_kernel_end 0x934F0→0x8A4F0（23KB 余量）；selftest.rs 重写为零 format_args!（42KB→8KB 对象文件）；新增 Ext4SuperBlock::from_slice(&[u8])；修 gd 64bit hi 字节偏移；51/51 全通过 | src/fs/ext4/selftest.rs, src/fs/ext4/super_block.rs | PASS | ~25k |
+| 22:15 | Stage 2 完成：signal/exit/fork/wait4 | src/signal.rs, src/exit.rs, src/syscall/sys.rs, boot/entry.S, src/traps.rs, src/lib.rs | fork selftest ok + 全自检绿色 | ~38k |
+| 23:50 | Stage 3 完成：用户态 ring-3 往返 | src/mm/paging.rs, src/mm/area.rs, src/umm/mod.rs, src/sched/task.rs, src/syscall/sys.rs, src/exit.rs, src/sched/mod.rs, src/traps.rs, src/lib.rs | iretq→user code→int 0x80→exit(42)→wait4 全链条通过，SHITIX_BOOT_OK | ~50k |
+| 15:30 | Stage 4 完成：ELF64+execve+完整用户态ABI | src/elf/mod.rs, src/fs/stat.rs, src/fs/open.rs, src/fs/mod.rs, src/mm/paging.rs, src/sched/task.rs, src/sched/mod.rs, src/signal.rs, src/syscall/sys.rs, src/lib.rs | ELF64解析+execve加载+ring3运行+exit(0)；brk/mmap/arch_prctl/rt_sig*/Stat64实现；per-task FD；信号帧setup_frame；_kernel_end=0x8F530(2.7KB) | ~65k |
+| 22:15 | Stage 2 完成：signal/exit/fork/wait4 | src/signal.rs, src/exit.rs, src/syscall/sys.rs, boot/entry.S, src/traps.rs, src/lib.rs | fork selftest ok + 全自检绿色 | ~38k |
+
+## Session: 2026-08-06 02:12
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 02:18
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 02:21
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-06 04:36
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:24
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:25
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:26
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 16:28
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 17:17
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 18:06
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-07 18:07
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|

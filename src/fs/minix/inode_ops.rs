@@ -292,34 +292,83 @@ pub unsafe fn put_super(n: usize) {
 /// 1 号 inode。少减这个 1 会整体错开一个 inode。
 fn inode_location(sb_nr: usize, ino: u32) -> (u32, usize) {
     // SAFETY: sb_nr 由调用方保证有效；只读几个 u16。
-    let (imap, zmap) =
-        unsafe { let p = sb(sb_nr); (p.s_imap_blocks as u32, p.s_zmap_blocks as u32) };
+    let (imap, zmap, ninodes, first_data) = unsafe {
+        let p = sb(sb_nr);
+        (
+            p.s_imap_blocks as u32,
+            p.s_zmap_blocks as u32,
+            p.s_ninodes as u32,
+            p.s_firstdatazone as u32,
+        )
+    };
     let block = 2 + imap + zmap + (ino - 1) / MINIX_INODES_PER_BLOCK;
+    // 算出来的块必须落在 inode 表里：`2 + imap + zmap` 是表首块，
+    // `s_firstdatazone` 是表后第一个数据块。越界说明超级块的
+    // imap/zmap 字段被写坏了——那时这个块号会指到位图块上，读回来是
+    // 一整块 0xFF，被 parse_inode 解成 `i_mode=0o177523`、`i_nlink=255`
+    // 这种垃圾（bug-029 的直接成因）。在这里挡住，坏值本身就指明了源头；
+    // 放到上层看只能看到「根 inode 的 mode 不对」，离原因很远。
+    let table_first = 2 + imap + zmap;
+    let table_last = table_first + ninodes.div_ceil(MINIX_INODES_PER_BLOCK);
+    assert!(
+        block >= table_first && block < table_last,
+        "inode_location: ino {} -> block {} outside inode table [{}, {}) \
+         (imap={} zmap={} ninodes={} firstdatazone={})",
+        ino, block, table_first, table_last, imap, zmap, ninodes, first_data
+    );
     let idx = ((ino - 1) % MINIX_INODES_PER_BLOCK) as usize;
     (block, idx)
 }
 
 /// 从缓冲里解析一个磁盘 inode。
-fn parse_inode(data: &[u8], idx: usize) -> MinixInode {
+///
+/// 收裸指针而不是 `&[u8]`，并且逐字节 `read_volatile`——这是 bug-029 的修法。
+///
+/// 之前的版本收 `&[u8]`（来自 `BufferHead::data()`）。实测：驱动写进
+/// 0xffdbc00 的是 `ed 41`（0o40755），紧挨着用 `read_volatile` 从同一个
+/// 地址抓的快照也是 `ed 41`，两次取到的切片指针一模一样，而这个函数却
+/// 解出 `i_mode=0o177523`（0xFF53，一整块 0xFF 的形态，即这个缓冲上一轮
+/// 装位图块时的内容）。内存从头到尾都是对的。
+///
+/// 原因是 `&[u8]` 带 `noalias` + `readonly`：缓冲数据区实际是驱动用裸指针
+/// memcpy 填的，LLVM 看不到那次写，于是认为切片存活期间这段内存不会变，
+/// 把上一次读同一个缓冲的载入结果沿用了下来。`compiler_fence` 挡不住
+/// （它只约束原子操作），空 `asm!` 的 memory clobber 也挡不住（引用是在
+/// 屏障之后新建的，`readonly` 推断照样成立）。唯一可靠的做法是根本不建
+/// 这个引用，直接 volatile 读。
+///
+/// # Safety
+/// `base` 必须指向一个至少 `MINIX_INODE_SIZE * (idx + 1)` 字节的缓冲数据区，
+/// 且当前没有 I/O 在改它。
+unsafe fn parse_inode(base: *const u8, len: usize, idx: usize) -> MinixInode {
     let o = idx * super::MINIX_INODE_SIZE;
     assert!(
-        o + super::MINIX_INODE_SIZE <= data.len(),
+        o + super::MINIX_INODE_SIZE <= len,
         "parse_inode: idx {} out of block (buf {} bytes)",
         idx,
-        data.len()
+        len
     );
-    let mut zone = [0u16; 9];
-    for (k, z) in zone.iter_mut().enumerate() {
-        *z = read_u16(data, o + 14 + k * 2);
-    }
-    MinixInode {
-        i_mode: read_u16(data, o),
-        i_uid: read_u16(data, o + 2),
-        i_size: u32::from_le_bytes([data[o + 4], data[o + 5], data[o + 6], data[o + 7]]),
-        i_time: u32::from_le_bytes([data[o + 8], data[o + 9], data[o + 10], data[o + 11]]),
-        i_gid: data[o + 12],
-        i_nlinks: data[o + 13],
-        i_zone: zone,
+    // SAFETY: 契约保证 base + o + MINIX_INODE_SIZE 在缓冲内。
+    unsafe {
+        let p = base.add(o);
+        let rd8 = |k: usize| core::ptr::read_volatile(p.add(k));
+        let rd16 = |k: usize| u16::from_le_bytes([rd8(k), rd8(k + 1)]);
+        let rd32 = |k: usize| {
+            u32::from_le_bytes([rd8(k), rd8(k + 1), rd8(k + 2), rd8(k + 3)])
+        };
+        let mut zone = [0u16; 9];
+        for (k, z) in zone.iter_mut().enumerate() {
+            *z = rd16(14 + k * 2);
+        }
+        MinixInode {
+            i_mode: rd16(0),
+            i_uid: rd16(2),
+            i_size: rd32(4),
+            i_time: rd32(8),
+            i_gid: rd8(12),
+            i_nlinks: rd8(13),
+            i_zone: zone,
+        }
     }
 }
 
@@ -380,7 +429,10 @@ pub unsafe fn read_inode(n: usize) {
                 return;
             }
         };
-        let raw = parse_inode(bh(b).data(), idx);
+        let raw = {
+            let (p, len) = { let h = bh(b); (h.b_data as *const u8, h.b_size) };
+            parse_inode(p, len, idx)
+        };
         buffer::brelse(b);
 
         let i = inode::inode(n);
@@ -451,11 +503,11 @@ pub unsafe fn write_inode(n: usize) {
 
         let raw = {
             let i = inode::inode(n);
-            let mut zone = i.data;
-            // 设备文件把 rdev 写回 i_zone[0]（与 read_inode 对称）
+            let mut zone = [0u16; 9];
             if mode::is_chr(i.i_mode) || mode::is_blk(i.i_mode) {
-                zone = [0; 9];
                 zone[0] = i.i_rdev;
+            } else {
+                zone = i.data;
             }
             MinixInode {
                 i_mode: i.i_mode,

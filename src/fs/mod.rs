@@ -17,22 +17,35 @@
 
 pub mod buffer;
 pub mod devices;
+pub mod ext2;        // ext2 filesystem support
+pub mod ext4;        // ext4 filesystem support
 pub mod file_table;
 pub mod inode;
 pub mod minix;
 pub mod namei;
 pub mod open;
+pub mod pipe;
 pub mod read_write;
 pub mod stat;
 pub mod super_block;
 
 pub use buffer::{BLOCK_SIZE, bread, brelse, getblk, sync_dev};
 pub use devices::{block_read, block_write, chrdev_read, chrdev_write};
+pub use ext2::{
+    Ext2SuperBlock,     // ext2 superblock
+    Ext2Inode,          // ext2 inode structure
+    Ext2GroupDesc,       // ext2 block group descriptor
+};
+pub use ext4::{
+    Ext4SuperBlock,      // ext4 superblock
+    Ext4Inode,           // ext4 inode structure
+    Ext4FeatureFlags,    // ext4 feature flags
+};
 pub use file_table::{File, get_empty_filp};
 pub use inode::{Inode, iget, iput};
 pub use super_block::{SuperBlock, mount_root};
 
-/// 原版 `NR_OPEN 256`。每进程 fd 上限；我们的 `Task` 目前只装 16 个。
+/// 原版 `NR_OPEN 256`。每进程 fd 上限。与 Task 的 filp 数组大小一致。
 pub const NR_OPEN: usize = 16;
 /// 原版 `NR_INODE 2048`，缩到 64。
 pub const NR_INODE: usize = 64;

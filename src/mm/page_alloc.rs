@@ -121,6 +121,12 @@ pub struct MemInfo {
     pub reserved_pages: usize,
     /// `mem_map` 表体所在物理地址，便于启动期核对布局
     pub mem_map_addr: usize,
+    /// `page_ref` 引用计数表所在物理地址（紧跟 `mem_map`）
+    pub page_ref_addr: usize,
+    /// 内核栈池所在物理地址（紧跟 `page_ref`）
+    pub kstack_addr: usize,
+    /// 两张表各自的条目数（= `map_nr(high_memory)`）
+    pub nr_pages: usize,
 }
 
 /// 取 `mem_map` 的可变切片。
@@ -204,8 +210,36 @@ where
         }
     }
 
-    // 空闲页的下界：既要越过 mem_map 自身，也要越过低 1MB 的启动期结构。
-    let map_end = page_align(map_addr + map_bytes).max(MIN_USABLE_PHYS);
+    // COW 引用计数表紧跟 mem_map，同样按实际内存量定长。放在这里（而不是
+    // 做成静态数组）是因为按最大内存静态开表要 256KB BSS，会把 _kernel_end
+    // 顶过 0x90000 盖掉参数区——同类事故已经发生过三次，见 buglog。
+    let ref_addr = page_align(map_addr + map_bytes);
+    let ref_bytes = nr_pages * core::mem::size_of::<u32>();
+    // SAFETY: ref_addr 落在 mem_map 之后、high 之下的恒等映射低端 RAM，
+    // 且下面的 map_end 把这块算进保留区，不会被派发出去。
+    unsafe {
+        core::ptr::write_bytes(ref_addr as *mut u8, 0, ref_bytes);
+        super::page_ref::attach(ref_addr, nr_pages);
+    }
+
+    // 内核栈池紧跟引用计数表。同样不能做成 BSS 静态数组：
+    // `KSTACK_PAGES * KSTACK_SLOTS` 页（当前 4*8 = 128KB）会把 _kernel_end
+    // 顶过 0x90000 盖掉 setup.S 的参数区——这类事故已经发生过四次，见 buglog。
+    // 页分配器只给单页且不保证相邻，而内核栈必须是连续对齐的一段，所以
+    // 在这里一次性划出来（在空闲链表建立**之前**，所以这块地永远不会被派发）。
+    let kstack_addr = page_align(ref_addr + ref_bytes).max(MIN_USABLE_PHYS);
+    let kstack_bytes = crate::sched::KSTACK_POOL_BYTES;
+    // SAFETY: kstack_addr 落在引用计数表之后、high 之下的恒等映射低端 RAM，
+    // 且下面的 map_end 把这块算进保留区，不会被派发出去。清零是
+    // `kstack_high_water` 的前提（它靠「从栈底往上找第一个非零 8 字节」测高水位）。
+    unsafe {
+        core::ptr::write_bytes(kstack_addr as *mut u8, 0, kstack_bytes);
+        crate::sched::attach_kstacks(kstack_addr);
+    }
+
+    // 空闲页的下界：既要越过 mem_map、引用计数表、内核栈池自身，
+    // 也要越过低 1MB 的启动期结构。
+    let map_end = page_align(kstack_addr + kstack_bytes).max(MIN_USABLE_PHYS);
 
     // 把 E820 的 usable 区间中、位于 map_end 之上的页放开（清掉 RESERVED）。
     // 对应原版那两个 while 循环（放开低端内存和 start_mem..end_mem）。
@@ -253,6 +287,9 @@ where
         kernel_pages: map_nr(map_end),
         reserved_pages: reserved,
         mem_map_addr: map_addr,
+        page_ref_addr: ref_addr,
+        kstack_addr,
+        nr_pages,
     }
 }
 

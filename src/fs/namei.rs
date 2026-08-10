@@ -27,7 +27,7 @@ use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::super_block;
 use crate::fs::{MAY_EXEC, MAY_READ, MAY_WRITE, MS_RDONLY, mode, oflags};
 use crate::klib::errno::{
-    EACCES, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM, EROFS,
+    EACCES, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, ENOTDIR, EPERM, EROFS,
 };
 
 /// 路径分量的最大长度。对应原版 `include/linux/limits.h` 的 `NAME_MAX 255`，
@@ -106,7 +106,9 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
                 inode::iput(cur);
                 return Err(ENAMETOOLONG);
             }
-            if !mode::is_dir(inode::inode(cur).i_mode) {
+            // 用裸指针避免多个 &mut 别名
+            let cur_mode = core::ptr::addr_of!((*inode::inode_ptr(cur)).i_mode).read_volatile();
+            if !mode::is_dir(cur_mode) {
                 inode::iput(cur);
                 return Err(ENOTDIR);
             }
@@ -124,7 +126,8 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
             inode::iput(cur);
             cur = next;
         }
-        if !mode::is_dir(inode::inode(cur).i_mode) {
+        let final_mode = core::ptr::addr_of!((*inode::inode_ptr(cur)).i_mode).read_volatile();
+        if !mode::is_dir(final_mode) {
             inode::iput(cur);
             return Err(ENOTDIR);
         }
@@ -145,7 +148,9 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
 pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
     // SAFETY: 契约转交。
     unsafe {
-        if !mode::is_dir(inode::inode(dir).i_mode) {
+        // 用裸指针避免多个 &mut 别名
+        let dir_mode = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_mode).read_volatile();
+        if !mode::is_dir(dir_mode) {
             return Err(ENOTDIR);
         }
         // "." → 自己
@@ -184,8 +189,13 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
             return Err(EACCES);
         }
         // 原版是 dir->i_op->lookup(dir, name, len, &result)
-        match inode::inode(dir).i_op {
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        match dir_op {
             FsType::Minix => super::minix::namei::lookup(dir, name),
+                        #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::lookup(dir, name),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::lookup(dir, name),
             _ => Err(ENOTDIR),
         }
     }
@@ -272,6 +282,10 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
                 }
                 let r = match inode::inode(dir).i_op {
                     FsType::Minix => super::minix::namei::create(dir, last, m),
+                    #[cfg(feature = "extra-drivers")]
+                    FsType::Ext2 => super::ext4::namei::create(dir, last, m),
+                    #[cfg(not(feature = "extra-drivers"))]
+                    FsType::Ext2 => super::minix::namei::create(dir, last, m),
                     _ => Err(ENOTDIR),
                 };
                 inode::iput(dir);
@@ -282,7 +296,9 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
         };
 
         // 目录不能以写方式打开
-        if mode::is_dir(inode::inode(n).i_mode) && mask & MAY_WRITE != 0 {
+        let i_ptr = inode::inode_ptr(n);
+        let i_mode = core::ptr::addr_of!((*i_ptr).i_mode).read_volatile();
+        if mode::is_dir(i_mode) && mask & MAY_WRITE != 0 {
             inode::iput(n);
             return Err(EISDIR);
         }
@@ -291,19 +307,21 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
             return Err(EACCES);
         }
         // 只读文件系统（设备文件例外，见 permission 的注释）
-        let ip = inode::inode_ptr(n);
-        if mask & MAY_WRITE != 0 && (*ip).is_rdonly() && !(*ip).is_device() {
+        let is_rdonly = (*i_ptr).is_rdonly();
+        let is_device = (*i_ptr).is_device();
+        if mask & MAY_WRITE != 0 && is_rdonly && !is_device {
             inode::iput(n);
             return Err(EROFS);
         }
 
-        // O_TRUNC：截断到 0
-        if flags & oflags::O_TRUNC != 0 && mode::is_reg(inode::inode(n).i_mode) {
-            inode::inode(n).i_size = 0;
-            if (*inode::inode_ptr(n)).i_op == FsType::Minix {
+        // O_TRUNC：截断到 0（全程裸指针，避免 &mut 别名 UB，bug-029）
+        if flags & oflags::O_TRUNC != 0 && mode::is_reg(i_mode) {
+            let i_op = core::ptr::addr_of!((*i_ptr).i_op).read_volatile();
+            core::ptr::addr_of_mut!((*i_ptr).i_size).write_volatile(0);
+            core::ptr::addr_of_mut!((*i_ptr).i_dirt).write_volatile(true);
+            if i_op == FsType::Minix {
                 super::minix::truncate::truncate(n);
             }
-            inode::inode(n).i_dirt = true;
         }
         Ok(n)
     }
@@ -328,8 +346,13 @@ pub unsafe fn do_mknod(path: &[u8], m: u16, rdev: u16) -> i64 {
             inode::iput(dir);
             return -(EACCES as i64);
         }
-        let r = match inode::inode(dir).i_op {
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        let r = match dir_op {
             FsType::Minix => super::minix::namei::mknod(dir, last, m, rdev),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::mknod(dir, last, m, rdev),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::mknod(dir, last, m, rdev),
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -362,8 +385,13 @@ pub unsafe fn do_mkdir(path: &[u8], m: u16) -> i64 {
             inode::iput(dir);
             return -(EACCES as i64);
         }
-        let r = match inode::inode(dir).i_op {
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        let r = match dir_op {
             FsType::Minix => super::minix::namei::mkdir(dir, last, m),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::mkdir(dir, last, m),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::mkdir(dir, last, m),
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);
@@ -396,8 +424,13 @@ pub unsafe fn do_rmdir(path: &[u8]) -> i64 {
             inode::iput(dir);
             return -(EACCES as i64);
         }
-        let r = match inode::inode(dir).i_op {
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        let r = match dir_op {
             FsType::Minix => super::minix::namei::rmdir(dir, last),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::rmdir(dir, last),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::rmdir(dir, last),
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -424,8 +457,13 @@ pub unsafe fn do_unlink(path: &[u8]) -> i64 {
             inode::iput(dir);
             return -(EACCES as i64);
         }
-        let r = match inode::inode(dir).i_op {
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        let r = match dir_op {
             FsType::Minix => super::minix::namei::unlink(dir, last),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::unlink(dir, last),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::unlink(dir, last),
             _ => ENOTDIR,
         };
         inode::iput(dir);
@@ -445,7 +483,8 @@ pub unsafe fn do_link(oldpath: &[u8], newpath: &[u8]) -> i64 {
             Err(e) => return -(e as i64),
         };
         // 原版：不许给目录建硬链接（会造出环，fsck 修不了）
-        if mode::is_dir(inode::inode(target).i_mode) {
+        let target_mode = core::ptr::addr_of!((*inode::inode_ptr(target)).i_mode).read_volatile();
+        if mode::is_dir(target_mode) {
             inode::iput(target);
             return -(EPERM as i64);
         }
@@ -473,8 +512,13 @@ pub unsafe fn do_link(oldpath: &[u8], newpath: &[u8]) -> i64 {
             inode::iput(dir);
             return -(EACCES as i64);
         }
-        let r = match inode::inode(dir).i_op {
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        let r = match dir_op {
             FsType::Minix => super::minix::namei::link(target, dir, last),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::link(target, dir, last),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::link(target, dir, last),
             _ => ENOTDIR,
         };
         inode::iput(target);

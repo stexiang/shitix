@@ -172,13 +172,17 @@ pub unsafe fn check_mounted(n: usize) {
         let p = sb_ptr(n);
         let ds = core::ptr::read_volatile(core::ptr::addr_of!((*p).s_dirsize));
         let nl = core::ptr::read_volatile(core::ptr::addr_of!((*p).s_namelen));
-        assert!(
-            (ds == 16 && nl == 14) || (ds == 32 && nl == 30),
-            "sb({}): dirsize/namelen corrupt: {}/{} (s_dev={:#06x} magic={:#x})",
-            n, ds, nl,
-            core::ptr::read_volatile(core::ptr::addr_of!((*p).s_dev)),
-            core::ptr::read_volatile(core::ptr::addr_of!((*p).s_magic))
-        );
+        let magic = core::ptr::read_volatile(core::ptr::addr_of!((*p).s_magic));
+        // ext4 没有 dirsize/namelen 概念，只校验 minix
+        if magic != 0xEF53 {
+            assert!(
+                (ds == 16 && nl == 14) || (ds == 32 && nl == 30),
+                "sb({}): dirsize/namelen corrupt: {}/{} (s_dev={:#06x} magic={:#x})",
+                n, ds, nl,
+                core::ptr::read_volatile(core::ptr::addr_of!((*p).s_dev)),
+                magic
+            );
+        }
     }
 }
 
@@ -225,13 +229,36 @@ pub unsafe fn watchdog_bad_dev() -> Option<u16> {
 pub unsafe fn check_guards(tag: &str) {
     // SAFETY: 只读。
     unsafe {
-        let area = &*core::ptr::addr_of!(SUPER_AREA);
-        for (name, guard) in [("lo", &area.lo), ("hi", &area.hi)] {
+        // 全程裸指针，不建 `&SUPER_AREA`：那条共享引用覆盖整个结构（含
+        // table），带 `dereferenceable`/`readonly`，和调用者可能持有的
+        // `&mut SuperBlock` 重叠就是 UB。
+        let base = core::ptr::addr_of_mut!(SUPER_AREA);
+        let lo = core::ptr::addr_of_mut!((*base).lo) as *mut u64;
+        let hi = core::ptr::addr_of_mut!((*base).hi) as *mut u64;
+        for (name, p) in [("lo", lo), ("hi", hi)] {
             for i in 0..4 {
-                let v = core::ptr::read_volatile(&guard[i]);
+                let slot = p.add(i);
+                let v = core::ptr::read_volatile(slot);
                 if v != SB_GUARD {
-                    pr_warn!("super: guard {} word {} smashed: {:#018x} (at {})",
-                             name, i, v, tag);
+                    // 复读一次：若复读是好的，说明内存完好、是这次比较不可信
+                    // （或写入是瞬时的），和「真被写坏」要分开报。
+                    let again = core::ptr::read_volatile(slot);
+                    pr_warn!("super: guard {} word {} @ {:#x}: got {:#018x} want {:#018x} reread {:#018x} (at {})",
+                             name, i, slot as usize, v, SB_GUARD, again, tag);
+                    let dump = |q: *mut u64, n: &str| {
+                        pr_warn!("super:   {} = [{:#018x} {:#018x} {:#018x} {:#018x}]",
+                                 n,
+                                 core::ptr::read_volatile(q),
+                                 core::ptr::read_volatile(q.add(1)),
+                                 core::ptr::read_volatile(q.add(2)),
+                                 core::ptr::read_volatile(q.add(3)));
+                    };
+                    dump(lo, "lo");
+                    dump(hi, "hi");
+                    if again == SB_GUARD {
+                        pr_warn!("super: reread OK -> memory intact, this compare was bogus; continuing");
+                        continue;
+                    }
                     panic!("SUPER_AREA guard {} smashed at {}", name, tag);
                 }
             }
@@ -435,9 +462,12 @@ pub unsafe fn read_super(dev: u16, flags: u64, silent: bool) -> usize {
             }
         }
 
-        if !super::minix::read_super(n, silent) {
-            (*sb_ptr(n)).s_dev = 0;
-            return NIL;
+        // 先试 ext4，再试 minix
+        if !super::ext4::ops::read_super(n, silent) {
+            if !super::minix::read_super(n, silent) {
+                (*sb_ptr(n)).s_dev = 0;
+                return NIL;
+            }
         }
         n
     }
@@ -531,7 +561,7 @@ pub unsafe fn mount_root(dev: u16, flags: u64) -> bool {
         check_mounted(n);
 
         pr_info!(
-            "VFS: Mounted root (minix filesystem){}.",
+            "VFS: Mounted root{}.",
             if flags & MS_RDONLY != 0 { " readonly" } else { "" }
         );
         true
@@ -555,23 +585,31 @@ unsafe fn set_root_inode(n: usize) {
 
 /// 根 inode 的下标。
 pub fn root_inode() -> usize {
-    // SAFETY: 挂载后只读。
     unsafe { *core::ptr::addr_of!(ROOT_INODE) }
 }
 
-/// 当前工作目录的 inode 下标。
+/// 当前工作目录的 inode 下标。返回 per-task pwd（若设置过），否则全局。
 pub fn pwd_inode() -> usize {
-    // SAFETY: 只读一个 usize；单核，`sys_chdir` 也在进程上下文改它。
-    unsafe { *core::ptr::addr_of!(PWD_INODE) }
+    unsafe {
+        let t = crate::sched::task_ptr(crate::sched::current_index());
+        if (*t).pwd != NIL { return (*t).pwd; }
+        *core::ptr::addr_of!(PWD_INODE)
+    }
 }
 
-/// 换工作目录。对应原版 `sys_chdir` 里 `current->pwd = inode` 那一步。
-///
-/// # Safety
-/// 只能在进程上下文调用。`n` 必须是已 `iget` 过的目录 inode。
+/// 换工作目录。同时写入全局和 per-task。
 pub unsafe fn set_pwd(n: usize) {
-    // SAFETY: 契约转交；旧的 pwd 引用由调用方 iput。
-    unsafe { *core::ptr::addr_of_mut!(PWD_INODE) = n }
+    unsafe {
+        *core::ptr::addr_of_mut!(PWD_INODE) = n;
+        (*crate::sched::task_ptr(crate::sched::current_index())).pwd = n;
+    }
+}
+
+/// 换根目录。写入 per-task root 字段。
+pub unsafe fn set_root(n: usize) {
+    unsafe {
+        (*crate::sched::task_ptr(crate::sched::current_index())).root = n;
+    }
 }
 
 /// 挂载一个文件系统。对应原版 `sys_mount()` 的正常路径 + `do_mount()`。

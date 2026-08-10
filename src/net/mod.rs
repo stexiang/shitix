@@ -64,6 +64,7 @@
 //! | SOCK_RAW | 原始套接字（跳过传输层）|
 
 pub mod inet;
+pub mod socket;
 pub mod unix;
 
 // 测试模块（始终可用，在内核启动时自检）

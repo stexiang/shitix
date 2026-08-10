@@ -22,42 +22,49 @@
 
 use crate::console::{self, Color};
 
-/// 转义序列解析状态。对应原版 `console.c` 的 `enum { ESnormal, ESesc,
-/// ESsquare, ESgetpars, ESfunckey, … }`，但只保留前三个。
+/// 转义序列解析状态。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EsState {
-    /// 普通字符。原版 `ESnormal`
     Normal,
-    /// 刚吃了一个 ESC。原版 `ESesc`
     Esc,
-    /// 在 `ESC [` 之后收参数。原版 `ESsquare` + `ESgetpars` 合并
     Square,
 }
 
-/// 解析状态。原版存在每个 `vc_data` 里（`vc_state`）。
 static mut ES_STATE: EsState = EsState::Normal;
+/// 最多 4 个 CSI 参数（NPAR=4，绝大多数序列用不到更多）
+static mut CSI_PAR: [u32; 4] = [0; 4];
+static mut CSI_PAR_N: usize = 0;
+/// 保存的光标位置
+static mut SAVED_ROW: usize = 0;
+static mut SAVED_COL: usize = 0;
 
-/// CSI 参数缓冲。原版 `par[NPAR]`，NPAR=16；我们只用得到第一个参数
-/// （`2J` 的那个 2），但保留累加逻辑以便正确吃掉多参数序列。
-static mut CSI_PAR: u32 = 0;
+/// 累加当前参数
+unsafe fn csi_add_digit(d: u8) {
+    let i = *core::ptr::addr_of!(CSI_PAR_N);
+    let p = &mut *core::ptr::addr_of_mut!(CSI_PAR[i]);
+    *p = p.wrapping_mul(10).wrapping_add(d as u32);
+}
 
-/// 往控制台写一串字符。对应原版 `con_write()`。
-///
-/// 原版是从 `tty->write_q` 里取字符（签名是 `con_write(struct tty_struct*)`），
-/// 我们直接收切片：tty 层的 `write_q` 只是过路（见 `tty.rs` 的
-/// [`super::tty::tty_write`] 注释）。
-///
-/// # Safety
-/// 可在中断上下文调用（`printk` 与键盘回显都会调）。只碰 VGA 显存、
-/// 光标端口和本模块的三个静态量。
-///
-/// 注意：这里**没有**关中断保护。原版 `con_write` 同样不关中断
-/// （它跑在 bottom half 里，与键盘中断天然不并发）。我们的调用方
-/// 是回显（中断上下文）和 `tty_write`（进程上下文），两者会并发，
-/// 表现是屏幕上的字符可能交错——与原版在同一台机器上打字同时有输出时
-/// 的行为一致，不是内存安全问题。
+/// 下一个参数
+unsafe fn csi_next_param() {
+    let n = &mut *core::ptr::addr_of_mut!(CSI_PAR_N);
+    if *n < 3 { *n += 1; }
+}
+
+/// 取第 i 个参数，默认 def
+unsafe fn csi_par(i: usize, def: u32) -> u32 {
+    let v = *core::ptr::addr_of!(CSI_PAR[i]);
+    // 如果这个槽从未被写过（整个序列没给这个参数），返回默认值
+    if *core::ptr::addr_of!(CSI_PAR_N) < i { def } else { if v == 0 && i > 0 { def } else { v } }
+}
+
 pub unsafe fn con_write(buf: &[u8]) {
-    // SAFETY: 契约转交。
+    // Mirror plain text to serial for headless debugging
+    for &b in buf {
+        if b >= 0x20 && b < 0x7f || b == b'\n' || b == b'\r' || b == b'\t' {
+            crate::serial::putc(b);
+        }
+    }
     unsafe {
         for &c in buf {
             let st = *core::ptr::addr_of!(ES_STATE);
@@ -70,43 +77,123 @@ pub unsafe fn con_write(buf: &[u8]) {
                     }
                 }
                 EsState::Esc => {
-                    if c == b'[' {
-                        *core::ptr::addr_of_mut!(ES_STATE) = EsState::Square;
-                        *core::ptr::addr_of_mut!(CSI_PAR) = 0;
-                    } else {
-                        // 原版认 `ESC c`（全复位）、`ESC D`（下移）等等；
-                        // 我们只认 CSI，其余丢弃。
-                        *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                    match c {
+                        b'[' => {
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Square;
+                            for i in 0..4 { *core::ptr::addr_of_mut!(CSI_PAR[i]) = 0; }
+                            *core::ptr::addr_of_mut!(CSI_PAR_N) = 0;
+                        }
+                        b'c' => {
+                            // ESC c: full reset
+                            console::clear();
+                            console::set_color(Color::LightGray, Color::Black);
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'7' => {
+                            // ESC 7: save cursor
+                            *core::ptr::addr_of_mut!(SAVED_ROW) = console::cursor_row();
+                            *core::ptr::addr_of_mut!(SAVED_COL) = console::cursor_col();
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'8' => {
+                            // ESC 8: restore cursor
+                            console::set_cursor_pos(
+                                *core::ptr::addr_of!(SAVED_ROW),
+                                *core::ptr::addr_of!(SAVED_COL));
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        _ => { *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal; }
                     }
                 }
                 EsState::Square => {
                     match c {
-                        b'0'..=b'9' => {
-                            let p = &mut *core::ptr::addr_of_mut!(CSI_PAR);
-                            *p = p.wrapping_mul(10) + (c - b'0') as u32;
+                        b'0'..=b'9' => csi_add_digit(c - b'0'),
+                        b';' => csi_next_param(),
+                        b'?' => {} // private mode prefix, ignore
+                        b'A' => {
+                            let n = csi_par(0, 1) as usize;
+                            let w = console::writer();
+                            w.row = w.row.saturating_sub(n);
+                            crate::console::sync_cursor();
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
                         }
-                        b';' => {
-                            // 多参数：我们只用第一个，后续参数重新累加即可
-                            *core::ptr::addr_of_mut!(CSI_PAR) = 0;
+                        b'B' => {
+                            let n = csi_par(0, 1) as usize;
+                            let w = console::writer();
+                            w.row = (w.row + n).min(24);
+                            crate::console::sync_cursor();
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'C' => {
+                            let n = csi_par(0, 1) as usize;
+                            let w = console::writer();
+                            w.col = (w.col + n).min(79);
+                            crate::console::sync_cursor();
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'D' => {
+                            let n = csi_par(0, 1) as usize;
+                            let w = console::writer();
+                            w.col = w.col.saturating_sub(n);
+                            crate::console::sync_cursor();
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'H' | b'f' => {
+                            let row = csi_par(0, 1).saturating_sub(1) as usize;
+                            let col = csi_par(1, 1).saturating_sub(1) as usize;
+                            console::set_cursor_pos(row, col);
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
                         }
                         b'J' => {
-                            // 原版 csi_J(vc, par[0])：0=清到屏尾 1=清到屏首 2=全清。
-                            // 我们的 console 只有整屏清，所以只实现 2。
-                            if *core::ptr::addr_of!(CSI_PAR) == 2 {
-                                console::clear();
+                            match csi_par(0, 0) {
+                                0 => console::clear_to_end(),
+                                2 => console::clear(),
+                                _ => console::clear(),
+                            }
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'K' => {
+                            match csi_par(0, 0) {
+                                0 => console::clear_to_eol(),
+                                _ => console::clear_line(),
                             }
                             *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
                         }
                         b'm' => {
-                            // 原版 csi_m 支持 0-7 与 30-47 全套；这里只做
-                            // `0m`（复位成默认色），别的属性丢弃。
-                            if *core::ptr::addr_of!(CSI_PAR) == 0 {
-                                console::set_color(Color::LightGray, Color::Black);
+                            let par = csi_par(0, 0);
+                            match par {
+                                0 => { console::set_color(Color::LightGray, Color::Black); }
+                                1 => {} // bold (ignore in VGA text mode)
+                                4 => {} // underline (ignore)
+                                7 => { console::set_color(Color::Black, Color::LightGray); } // reverse
+                                30 => { console::set_color(Color::Black, Color::Black); }     // black fg
+                                31 => { console::set_color(Color::Red, Color::Black); }
+                                32 => { console::set_color(Color::Green, Color::Black); }
+                                33 => { console::set_color(Color::Yellow, Color::Black); }
+                                34 => { console::set_color(Color::Blue, Color::Black); }
+                                35 => { console::set_color(Color::Magenta, Color::Black); }
+                                36 => { console::set_color(Color::Cyan, Color::Black); }
+                                37 => { console::set_color(Color::LightGray, Color::Black); } // white
+                                40 => {} // black bg (default)
+                                41 => { console::set_color(Color::LightGray, Color::Red); }
+                                42 => { console::set_color(Color::Black, Color::Green); }
+                                43 => { console::set_color(Color::Black, Color::Yellow); }
+                                44 => { console::set_color(Color::Black, Color::Blue); }
+                                45 => { console::set_color(Color::Black, Color::Magenta); }
+                                46 => { console::set_color(Color::Black, Color::Cyan); }
+                                47 => { console::set_color(Color::Black, Color::LightGray); } // white bg
+                                _ => {}
                             }
                             *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
                         }
-                        // 其余 CSI 终止符（A/B/C/D 光标移动、H 定位、K 清行、
-                        // L/M 插删行…）：吃掉但不执行，见模块文档。
+                        b'h' => {
+                            // CSI ?25h: show cursor
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
+                        b'l' => {
+                            // CSI ?25l: hide cursor (ignore)
+                            *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
+                        }
                         0x40..=0x7e => {
                             *core::ptr::addr_of_mut!(ES_STATE) = EsState::Normal;
                         }
@@ -117,3 +204,4 @@ pub unsafe fn con_write(buf: &[u8]) {
         }
     }
 }
+

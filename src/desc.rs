@@ -421,4 +421,37 @@ pub unsafe fn init_idt() {
         core::arch::asm!("lidt [{}]", in(reg) &ptr,
                          options(readonly, nostack, preserves_flags));
     }
+
+    // 配置 syscall 指令的 MSR
+    // 配置 syscall 指令的 MSR
+    init_syscall_msrs();
+}
+
+/// 写 syscall 指令所需的 MSR（STAR/LSTAR/SFMASK）。
+fn init_syscall_msrs() {
+    // SAFETY: CPL=0，wrmsr 合法。
+    unsafe {
+        // IA32_STAR: [47:32]=KERNEL_CS(0x08)
+        core::arch::asm!("wrmsr",
+            in("ecx") 0xC000_0081u32,
+            in("eax") 0x0008_0000u32,
+            in("edx") 0u32,
+            options(nomem, nostack, preserves_flags));
+
+        // IA32_LSTAR: syscall_entry 地址
+        unsafe extern "C" { fn syscall_entry(); }
+        let lstar = syscall_entry as *const () as u64;
+        core::arch::asm!("wrmsr",
+            in("ecx") 0xC000_0082u32,
+            in("eax") lstar as u32,
+            in("edx") (lstar >> 32) as u32,
+            options(nomem, nostack, preserves_flags));
+
+        // IA32_SFMASK: 进入时自动清 IF(0x200)
+        core::arch::asm!("wrmsr",
+            in("ecx") 0xC000_0084u32,
+            in("eax") 0x200u32,
+            in("edx") 0u32,
+            options(nomem, nostack, preserves_flags));
+    }
 }

@@ -34,7 +34,7 @@ pub fn init() {
     }
 }
 
-fn putc(b: u8) {
+pub fn putc(b: u8) {
     // SAFETY: 内核态轮询 LSR 的 THRE 位后再写数据寄存器，符合 16550 时序。
     unsafe {
         while inb(PORT + 5) & 0x20 == 0 {}

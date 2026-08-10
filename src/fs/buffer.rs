@@ -140,9 +140,32 @@ impl BufferHead {
                    index_of(self), self.b_data as usize, self.b_size,
                    self.b_dev, self.b_blocknr, self.b_count, self.b_lock);
         }
+        // 数据区是驱动用裸指针 memcpy 填的，这里却把它当成 `&[u8]` 交出去。
+        // 共享引用带 noalias + readonly，LLVM 由此认为「这段内存在切片存活
+        // 期间没人写」，于是可以跨调用缓存住上一个使用者留下的值。
+        //
+        // bug-029 就是这么来的：`minix::read_inode` 里 `parse_inode` 从
+        // 0xffdbc00 读出 `i_mode=0o177523`（一整块 0xFF 的形态），而紧挨着
+        // 用 `read_volatile` 从同一个地址抓的快照是正确的 `ed 41`。
+        // 内存从头到尾都是对的，错的是编译器沿用了这个缓冲上一轮装位图块
+        // 时的载入结果。
+        //
+        // `compiler_fence` 在这里不够：它只约束原子操作之间的顺序，挡不住
+        // 基于 `readonly` 的 CSE。空的 `asm!` 默认带 memory clobber，会让
+        // LLVM 认为内存已被外部改写，从而作废所有缓存的载入——这正是需要的。
+        // 单核不需要 CPU 级屏障（没有别的核，ramdisk 也不是真 DMA），
+        // 所以不用 `mfence`，一条空 asm 就够。
+        // 单独一条 memory clobber 还不够：屏障之后新建的引用照样满足
+        // `readonly` 推断，LLVM 仍能证明「从这条引用建立到失效期间无人写」，
+        // 于是把上一轮的载入 CSE 过来。要断掉的是**来源**——把指针本身穿过
+        // 一条 asm，LLVM 就追不到它从哪来，只能老老实实每次都真读。
         // SAFETY: b_data 由 init 从页分配器取得，长度恰为 b_size；
-        // 契约保证没有并发 I/O 在改它。
-        unsafe { core::slice::from_raw_parts(self.b_data, self.b_size) }
+        // 契约保证没有并发 I/O 在改它。上面 data_ok() 已校验非空/对齐/在界。
+        unsafe {
+            let mut p = self.b_data;
+            core::arch::asm!("/* launder {0} */", inout(reg) p, options(nostack, preserves_flags));
+            core::slice::from_raw_parts(p, self.b_size)
+        }
     }
 
     /// 数据区的可写切片。改完必须置 `b_dirt = true`。
@@ -157,8 +180,14 @@ impl BufferHead {
                    index_of(self), self.b_data as usize, self.b_size,
                    self.b_dev, self.b_blocknr, self.b_count, self.b_lock);
         }
+        // 同 data()：把指针穿过 asm 断掉来源推断。`&mut` 上还多一层
+        // noalias，重排的余地比只读切片更大，更需要这一手。
         // SAFETY: 同 data；&mut self 保证 Rust 侧独占。
-        unsafe { core::slice::from_raw_parts_mut(self.b_data, self.b_size) }
+        unsafe {
+            let mut p = self.b_data;
+            core::arch::asm!("/* launder {0} */", inout(reg) p, options(nostack, preserves_flags));
+            core::slice::from_raw_parts_mut(p, self.b_size)
+        }
     }
 }
 
@@ -831,53 +860,51 @@ pub unsafe fn sync_buffers(dev: u16, wait: bool) -> bool {
     let mut pass = 0;
     // SAFETY: 契约转交。
     unsafe {
+        let used = *core::ptr::addr_of!(NR_BUFFERS_USED);
         loop {
             let mut retry = false;
-            let mut p = *core::ptr::addr_of!(FREE_LIST);
-            for _ in 0..*core::ptr::addr_of!(NR_BUFFERS_USED) {
-                if p == NIL {
-                    break;
-                }
-                let next = (*buf_ptr(p)).b_next_free;
-                let this = p;
-                p = next;
-
-                if dev != 0 && (*buf_ptr(this)).b_dev != dev {
+            // 遍历所有已分配的缓冲槽位（而非仅 free list）。
+            // free list 里只有 b_count==0 的缓冲，而调用方可能在
+            // brelse 之前就持有引用（b_count>=1），这些缓冲不在 free
+            // list 上，旧代码扫不到——脏数据永远写不回磁盘。
+            for slot in 0..NR_BUFFERS {
+                let bp = buf_ptr(slot);
+                // 跳过未初始化的槽位
+                if (*bp).b_size == 0 {
                     continue;
                 }
-                if (*buf_ptr(this)).b_lock {
-                    // 原版：不等就跳过并要求重来；等的话只在 pass>0 时真等
+                if used > 0 && slot >= used {
+                    break;
+                }
+                if dev != 0 && (*bp).b_dev != dev {
+                    continue;
+                }
+                if (*bp).b_lock {
                     if !wait || pass == 0 {
                         retry = true;
                         continue;
                     }
-                    wait_on_buffer(this);
+                    wait_on_buffer(slot);
                 }
-                // 解锁却不 uptodate 且不脏 = 发生过 I/O 错误。
-                // 用裸指针读这几个标志：`bh()` 的 `&mut` 在下面 `ll_rw_block`
-                // 里还会被再取一次（同一个缓冲），两条 `&mut` 重叠时
-                // `b_count += 1` / `-= 1` 这对读—改—写有可能各自读到过期值，
-                // 结果是计数不平衡（观察到 `b_count` 减到下溢 panic）。
                 {
-                    let bp = buf_ptr(this);
+                    let bp2 = buf_ptr(slot);
                     if wait
-                        && (*bp).b_req
-                        && !(*bp).b_lock
-                        && !(*bp).b_dirt
-                        && !(*bp).b_uptodate
+                        && (*bp2).b_req
+                        && !(*bp2).b_lock
+                        && !(*bp2).b_dirt
+                        && !(*bp2).b_uptodate
                     {
                         err = true;
                         continue;
                     }
-                    // 第三趟只等，不写
-                    if !(*bp).b_dirt || pass >= 2 {
+                    if !(*bp2).b_dirt || pass >= 2 {
                         continue;
                     }
                 }
-                // 原版在 ll_rw_block 前后 b_count++/-- 保护缓冲不被复用
-                (*buf_ptr(this)).b_count += 1;
-                ll_rw_block(WRITE, &mut [this]);
-                (*buf_ptr(this)).b_count -= 1;
+                // b_count++ 防止缓冲在 I/O 期间被复用
+                (*buf_ptr(slot)).b_count += 1;
+                ll_rw_block(WRITE, &mut [slot]);
+                (*buf_ptr(slot)).b_count -= 1;
                 retry = true;
             }
             if !(wait && retry && pass < 2) {
@@ -923,21 +950,16 @@ pub unsafe fn fsync_dev(dev: u16) -> bool {
 /// # Safety
 /// 不能在中断上下文调用。调用前应先 `sync_dev`，否则脏数据丢失。
 pub unsafe fn invalidate_buffers(dev: u16) {
-    // SAFETY: 契约转交。
+    // SAFETY: 契约转交。遍历所有缓冲槽位（同 sync_buffers 的修复）。
     unsafe {
-        let mut p = *core::ptr::addr_of!(FREE_LIST);
-        for _ in 0..*core::ptr::addr_of!(NR_BUFFERS_USED) {
-            if p == NIL {
-                break;
-            }
-            let this = p;
-            p = bh(this).b_next_free;
-            if (*buf_ptr(this)).b_dev != dev {
-                continue;
-            }
-            wait_on_buffer(this);
-            let b = bh(this);
-            // 原版这里再确认一次 b_dev（睡眠期间可能已被复用）
+        let used = *core::ptr::addr_of!(NR_BUFFERS_USED);
+        for slot in 0..NR_BUFFERS {
+            let bp = buf_ptr(slot);
+            if (*bp).b_size == 0 { continue; }
+            if used > 0 && slot >= used { break; }
+            if (*bp).b_dev != dev { continue; }
+            wait_on_buffer(slot);
+            let b = bh(slot);
             if b.b_dev == dev {
                 b.b_uptodate = false;
                 b.b_dirt = false;

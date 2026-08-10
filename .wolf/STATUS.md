@@ -1,9 +1,8 @@
-<!-- Last updated: 2026-08-02 -->
+<!-- Last updated: 2026-08-08 (TCP/IP netif bridge to e1000; per-task pwd/root with refcount; VESA framebuffer kernel side; all long-term module skeletons) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
 > Update this file at the end of every work phase so the next `/clear` resumes in 1 read.
-> Last updated (was): 2026-08-02 (模块 4 完成)
 
 ---
 
@@ -50,10 +49,59 @@
 - 验证：三个自检全绿 —— traps(int3/除零/无效opcode 都打印完整现场并恢复继续跑)、syscall(getpid/getppid/越界→-ENOSYS/未实现→-EINVAL/write 到控制台/uname)、sched(timer 21 ticks、两个内核线程各跑 14 轮、42 次上下文切换)；debug + release + `-m 32M/1G` 四轮均 PASS；零警告
 - 踩坑五个，全部记入 buglog bug-003..009：GDT 代码段 L&&D 非法组合→三重错误；`asm!` 的 nomem/nostack 谎报；jiffies/TRAP_COUNT 非 volatile 被提升；schedule 候选扫描没跳过 task[0]；do_timer 跳过 task[0] 导致 need_resched 永不置位
 
+**模块 8：ext4 磁盘结构解析器 + 51 项自检**（2026-08-07）
+- `src/fs/ext4/` 共 1291 行：超级块、GroupDesc（32B/64B）、inode、ExtentHeader/Idx/Extent、DirIter 等结构体及访问器
+- `src/fs/ext4/selftest.rs`：51 项覆盖超级块字段、GroupDesc 32B/64B、inode 类型/uid/gid/size、extent lookup（hit/hole/mid/unwritten/48bit phys）、DirIter、corruption dir、ino_to_group/disk；零 `format_args!` 节约约 35KB rodata
+- `src/fs/ext4/super_block.rs`：加 `from_slice(&[u8])` 变体，selftest 用 128 字节缓冲而不是 1024
+- 验证：QEMU `ext4: selftest 51/51 all ok`，`_kernel_end = 0x8A4F0`（23KB 余量）
+- 踩坑：`kprintln!` 双份 `format_args!` 让 selftest 对象涨 5× → 撞 ASSERT（详见 cerebrum 2026-08-07 条目）；block_bitmap_hi 字节偏移写错（bug-030）
+
+**Stage 2：进程生命周期——signal / exit / fork / wait4**（2026-08-07）
+- 接受标准全部达标（见 `exit::fork_selftest` 端到端）：
+  1. ✅ `send_sig(SIGSEGV, ...)` 真正投递：用户态异常不再只打日志，`traps.rs` 直接调 `signal::send_sig`，`entry.S:ret_from_sys_call` 钩子接 `do_signal` 在返回用户态前执行
+  2. ✅ `do_exit` 完整流程：close_all → reparent_children → state = Zombie → notify_parent(SIGCHLD + wake_up_waiter) → schedule()
+  3. ✅ `sys_fork` 真正复制：pt_regs 21 qwords 复制到子进程内核栈（rax=0），switch_to 帧（7 slots），挂进调度环，父返 child_pid 子返 0
+  4. ✅ `ret_from_sys_call` 接 `do_signal`：`signal_pending_c` 谓词 → `do_signal(regs)` 循环消费信号（SIG_DFL/SIG_IGN/自定义→terminate）
+- 变更文件：
+  | Type | File | What |
+  |------|------|------|
+  | edit | `src/signal.rs` | per-task sigaction 表（按需分页，128B 指针数组→get_free_page）、`do_signal`（SIG_DFL/SIG_IGN/STOP/CONT 全分支）、`send_sig` 补原版 `generate()` 过滤（SIG_DFL 默认忽略的不置位）|
+  | edit | `src/exit.rs` | `do_exit` 补齐（close_all + reparent_children + 正确退出码/信号编码）、`release` 补 `free_page`/`reset_sigactions`、`sys_wait4` 完整体（四种 pid 语义 + WNOHANG/WUNTRACED + Interruptible 睡眠 + 收尸 release）|
+  | edit | `src/syscall/sys.rs` | `fork` 重写（irq_save 临界区 + 栈魔数 + pt_regs 21 qwords 复制 + rax=0 + switch_to 帧 + 调度环插入）、`wait4` 接到 `exit::sys_wait4` |
+  | edit | `boot/entry.S` | `ret_from_sys_call` 插 `do_signal` 钩子（`call signal_pending_c` → `call do_signal` → 重回 `ret_check_resched`），在 CS 检查之后、need_resched 之前 |
+  | edit | `src/traps.rs` | `send_sig_stub`→真 `signal::send_sig`，swapper 保护（task[0] 收致命信号直接 panic）|
+  | edit | `src/lib.rs` | `fs_init_thread` 末尾挂 `exit::fork_selftest`（fork+wait4 端到端）|
+- 信号位号约定统一：位号 == 信号号，bit 0 空着（以前 mask/blocked 用 sig-1、send_sig 用 sig，错开 1 位→屏蔽字形同虚设，见 bug-032）
+- sigaction 表按需分页：避免 16KB 静态 BSS（见 bug-033），只存 `[usize; NR_TASKS]` 128 字节指针，首次 `set_task_signal` 才 `get_free_page`，`release`/`reset` 时 `free_page`
+- 验证：全部自检通过（traps/syscall/sched/fs/syscall-fs/ext4 51/51/fork），`_kernel_end = 0x8C570`（14.6KB 余量），`SHITIX_BOOT_OK`
+- 未做（留给后续阶段）：用户态栈上的信号帧（`setup_frame`/`sa_restorer`/`sigreturn`）、`copy_page_tables`（所有任务仍共用内核页表，tss.cr3=0）、PER-CS 的内核态跳过 do_signal（已正确实现，但当前没有 PER-CS 任务所以测不到这条分支）
+- 踩坑三个：bug-031（send_sig 漏 generate 过滤→notify_parent 的 SIGCHLD 让 wait4 被自己孩子打断）、bug-032（signal/blocked 位号约定不一致→屏蔽字形同虚设）、bug-033（per-task sigaction 16KB 静态数组吃光 BSS 余量→按需分页）
+- Key learnings 六条进 cerebrum：信号位号约定、send_sig 过滤、_kernel_end 硬约束、内核态 fork 的子进程现场、do_signal 钩子的内核态跳过、汇编不写死 Rust 结构体偏移
+
+**Stage 3：用户态 ring-3 切换**（2026-08-07）
+- 接受标准全部达标：
+  1. ✅ `iretq` 到 USER_CS(DPL=3)、执行用户代码（getpid→exit(42)）、int 0x80 回来
+  2. ✅ fork + per-task PML4：子进程有独立页表（共享内核 PDPT[0]，独立 user PDPT[1]），父 wait4 收尸
+  3. ✅ `copy_from_user`/`copy_to_user` + `verify_area`：新增 `src/mm/area.rs`（逐级查 USER 位），保留 `check_range` 兼容未迁移 syscall
+  4. ✅ 用户态缺页→信号路径：page_fault handler 已接 COW（umm::try_handle_cow_fault），非 COW→send_sig→do_signal→do_exit
+- 变更文件：
+  | Type | File | What |
+  |------|------|------|
+  | edit | `src/mm/paging.rs` | 修 copy_page_table bug（entry 首参数用错）；修复 next_level 缺「对已存在条目追加 USER」→ bug-034；alloc_pml4 + clone_kernel_pdpt；index/entry 函数改 pub |
+  | **new** | `src/mm/area.rs` | verify_area、copy_from_user、copy_to_user、strncpy_from_user（逐页 translate + 恒等映射拷贝） |
+  | edit | `src/umm/mod.rs` | create_user_process（分配 PML4+代码页+栈页，用 map_page 建映射） |
+  | edit | `src/sched/task.rs` | Task 加 pml4: usize（0=共享内核页表） |
+  | edit | `src/sched/mod.rs` | switch_to_task 纠正：next_cr3==0 时切回 0x4000（bug-035）；kernel_thread 用 pml4 替代 tss.cr3 |
+  | edit | `src/syscall/sys.rs` | fork 用 pml4；sys_exit→do_exit（bug-036） |
+  | edit | `src/exit.rs` | pml4 释放移到 release()（bug-035）；do_exit 删 debug_assert |
+  | edit | `src/traps.rs` | page_fault 用 pml4 字段，COW 条件补 is_user |
+  | edit | `src/lib.rs` | user_mode_selftest：fork→launch_user_task→wait4，验证 ring-3 往返 |
+- 踩坑四个（bug-034..037）：next_level 漏 USER 位追加、CR3 从用户切回内核不写、sys_exit 不通知父进程、encode_status 误判退出码为信号
+- `_kernel_end = 0x8D570`（10.6KB 余量），SHITIX_BOOT_OK，全部自检绿色
+
 ---
 
 
-### 模块 5：文件系统与设备驱动（2026-08-02）
 22 个新文件，约 5000 行：缓冲缓存（`fs/buffer.c`）、块请求队列
 （`ll_rw_blk.c`）、ramdisk、tty/console/keyboard/mem 字符设备、
 VFS（inode/file_table/super_block/devices/namei/open/read_write/stat）、
@@ -77,73 +125,111 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
   这是上阶段 STATUS 里记的已知缺口，本阶段补上
 - panic 信息只上 VGA 不上串口；`as_str()` 丢掉带格式的 assert 消息
 
+**模块 6：系统调用号补齐到 x86_64 正式表**（2026-08-06）
+- `nr` 模块原本按功能分组手写号，重号一大把：`GETPID`=`WAIT4`=61、`GETPPID`=`KILL`=62、六个 `IO_*` 全是 0（把 `t[READ]` 也覆盖了）。建表是顺序赋值，重号**静默覆盖**，编译器零警告。表现是 syscall 自检一直 `FAIL`（getppid 实际跑的是 sys_kill），此前被当成噪声
+- 改成从 `arch/x86/entry/syscalls/syscall_64.tbl` 逐号生成 `0..=334` 连续常量，之后补 io_uring(425-427)/pidfd_open(434)/clone3(435)/faccessat2(439)/epoll_pwait2(441)；自检私有号在 500 段（`IDLE=500`、`UNUSED=501`）。保留 `UMOUNT`/`PRLIMIT`/`SETMEMPOLICY` 等旧名作别名
+- 分发表改按号顺序逐项赋值，**341 个槽挂了实现**（原先看似 200 多项，实际有效的远少于此）
+- `src/syscall/sys.rs` 新增 133 个实现：
+  - 真做：`lseek`(转 fs 层)、`readv`/`writev`(拆成逐 iovec 调 read/write，短读即停)、`sched_yield`、`gettid`、`time`、`exit_group`、`tkill`/`tgkill`、`getpgid`/`getsid`、`getresuid`/`getresgid`、`sched_getaffinity`
+  - 合理默认：`madvise`/`mincore`/`readahead`/`fadvise64` 忽略即合法、`fdatasync`→`fsync`、`flock` 单进程无竞争、`getgroups` 返回 0、`utime` 系列忽略（无 RTC）、`sched_get*` 汇报 SCHED_OTHER
+  - 占位 `-ENOSYS` 89 个，每个文档注明**缺哪个子系统**（rt_sig* 缺信号栈帧、timer_* 缺 POSIX 定时器池、futex 缺 per-address 等待队列、mq_* 只有 SysV 队列、clone 缺 flags 语义…）
+- `implemented_count()` 用 `static WIRED: [bool; 512]` 位图而非比函数指针：release 下 LLVM 的 identical code folding 把返回 `-EINVAL` 的占位实现和 `ni_syscall` 折叠成同一地址，比指针会漏数（debug 341 / release 340）
+- 验证：syscall 自检**从 FAIL 转 ok**（`getpid=0 getppid=0 bad=-38 ni=-22`）；debug 6 轮 5 过、release 过、`-m 32M/128M/1G/3G` 过；`sys.rs` 新增段零编译告警
+- 踩坑三个，记入 buglog **bug-026..028**；另有一条 Do-Not-Repeat：不要用 `git stash` 做基线对比（这个树的改动都未提交）
+
+**COW 引用计数表改成动态划分**（2026-08-06，修 `ld: ... overlaps setup parameter area at 0x90000`）
+- `page_ref.rs` 原本按最大内存开 `[AtomicU32; 65536]` = 256KB BSS，`_kernel_end` 冲到 0xCC2B0，被 `kernel.ld` 的 ASSERT 拦下（该 ASSERT 第一次真正挡住事故）。另外 `page_ref::init()` 从来没被调用过，这 256KB 是白付的
+- 改成沿用 `mem_map` 的约定：`page_alloc::init` 在 `mem_map` 之后按实际内存划出 `nr_pages * 4` 字节、清零、调 `page_ref::attach()`，并把 `map_end` 抬到表尾之后确保不进空闲链表；`MemInfo` 加 `page_ref_addr` / `nr_pages`
+- `page_ref.rs` 用 `REF_BASE`/`REF_LEN` + `slot()` 取槽，越界返 `None` 不 panic（COW 路径会传来受管内存之外的 pfn）
+- 顺手修：COW 标记位从 bit15 挪到 bit31 —— 原本与 `& 0xFFFF` 的计数字段重叠，引用计数到 32768 会被误读成 COW 页
+- 验证：BSS 365KB→103KB，`_kernel_end`=0x8C2C0。详见 buglog **bug-024**
+- ⚠️ **`33667fd`（COW）之后内核一直没链接成功过**，所以 `33667fd` 和 `5a3c04e` 两个提交的代码在此之前从未运行。最后一个可构建的提交是 `HEAD~2`。链接修好后这两个提交的代码是第一次真正执行，冒出来的问题要按「新代码」看待，别默认归给既有 bug
+
+**修 `SUPER_AREA` 护栏误报**（2026-08-06，buglog **bug-025**）
+- 症状：`KERNEL PANIC: SUPER_AREA guard lo smashed at check_mounted`，而 `pr_warn` 打印的值 `0x1234abcd1234abcd` 恰好就是正确的 `SB_GUARD`
+- 判据：一次 `read_volatile` 的结果同时喂比较和打印；打印值正确而比较说不等 ⟹ 比较错了，内存是好的
+- 根因：`check_guards` 用 `&*addr_of!(SUPER_AREA)` 建了覆盖整个结构（含 `table`）的共享引用，与 fs 路径上存活的 `&mut SuperBlock` 重叠 = UB。`super_block.rs:268` 早写了这个症状，但只针对 `sb()` 那条路径，漏了 `check_mounted`
+- 为什么现在才冒出来：见上，新代码首次执行改变了内联上下文，让一直潜伏的误报显形。**HEAD~2 基线跑 20 次护栏 0 次触发**，与「上次测护栏 100% 正常」一致
+- 修法：`check_guards` 全程裸指针，不建任何覆盖 `SUPER_AREA` 的引用；失配先复读，复读正确就 warn + continue，复读仍错才 panic（真损坏保持 fail-stop）。修完 20 次 0 次触发
+- ⚠️ 未能在修复后复现（裸指针版 20 次 + 保留 UB 只加复读的诊断版 20 次，均 0 次），机制是推断而非直接测到
+- ⚠️ **BSS 只剩约 15KB 余量**，下一个加静态缓冲的模块会再撞 ASSERT。放血点：`desc.rs` 三个 8KB IST 栈（24KB）、`sched::KSTACKS`（48KB）
+
+**模块 7：系统调用接到 fs 层 + 内核栈池移出 BSS**（2026-08-06）
+- **21 个系统调用从 `-ENOSYS` 占位改成真接 fs 层**：`open`/`creat`/`close`/`read`、`dup`/`dup2`、`chdir`/`chmod`/`truncate`、`mkdir`/`rmdir`/`unlink`/`link`/`mknod`(→`fs::namei::do_*`)、`fsync`、`stat`/`lstat`/`fstat`(→`fs::stat::*`)、`getdents`/`getdents64`。fs 层一直是好的，只是没接上
+- `write` 改成 fs 优先 + 控制台兜底：先走 `fs::read_write::write`，只有 fd 1/2 拿到 `-EBADF` 才退回内核控制台（task[0] 没有 stdout/stderr）
+- 用户指针护栏 `check_range`/`user_path`/`user_buf`/`user_buf_mut`/`user_stat_out`：只接受恒等映射低 1GB 内的地址，路径按 PATH_MAX 4096 有界 strnlen。⚠️ **它不阻止用户态读写内核内存**，只挡未映射地址；等 `mm/mmap.c` 的 `vm_area_struct` 移植完必须换成真的 `verify_area`
+- 新增 `syscall_fs_selftest()`（9 组，全走真 `int 0x80`）：creat+write、lseek+read 内容比对、fstat st_size、dup 相异、close×2 + 二次 close 得 `-EBADF`、按路径 stat、mkdir/rmdir 往返、unlink + stat 失败、EFAULT 护栏（坏指针 + NULL）。必须挂在 `fs_init_thread` 里，**不能在 task[0]**（所有 fs 路径都可能睡）
+- **内核栈池移出 BSS**：`.text`/`.rodata` 涨了约 24KB 后 `_kernel_end` 冲到 0x922C0，超 0x90000 共 8896 字节。`sched::KSTACKS`（48KB，BSS 最大项）改成由 `page_alloc::init` 在 `page_ref` 表之后划出、清零、调 `sched::attach_kstacks()`（照 bug-024 的 `page_ref::attach()` 套路），`map_end` 抬到池尾之后确保不进空闲链表；`MemInfo` 加 `kstack_addr`
+- 顺带解掉一个长期限制：`KSTACK_SLOTS` **3 → 8**。原注释写明「再加一份就会越界」，现在池子不占 BSS，内核线程数不再被 BSS 卡着
+- 修 `write` 自检的过期期望：`write(0,…)` 现在返 `-EBADF`（POSIX 语义，未打开的 fd），此前只认 fd 1/2 直写控制台所以期望的是 `-EINVAL`
+- `scripts/check-syscall-nr.py`（新，可执行）：解析 `nr` 模块的 `pub const X: usize = N` 对比内核头的 `#define __NR_x N`，自动找 `/usr/src/linux-headers-*/`，带 `PRIVATE` 白名单和 `sysctl`→`_sysctl` 拼写映射，另自查重号。输出 `官方 360 个号，本树 360 个 / 全部一致`，exit 0
+- `scripts/test.sh` 加 `MEM=` 覆盖（默认 256M），照 `TIMEOUT`/`PROFILE` 的既有约定，用来跑内存矩阵
+- 验证：`_kernel_end` = **0x854F0**（debug）/ 0x5B4E0（release），距 0x90000 约 44KB 余量，`kernel.ld` 的 ASSERT 原样保留（量溢出时临时放宽过，已完全还原并核对与 HEAD 一致）；debug 与 release **都报 361 wired**（`WIRED` 位图消掉了 ICF 分歧）；`-m 32M/128M/1G/3G` 全部启动且 `syscall-fs` 绿
+- ⚠️ **HEAD 基线不可用**：另开 worktree 跑 `HEAD` 会撞同一条 `overlaps setup parameter area` —— 这个树里未提交的 `page_alloc.rs`/`page_ref.rs` 改动**就是**那个修复。别拿 HEAD 做基线对比
+
 ## 🚀 Next phase
 
-**Goal（先做）:** 收尾模块 5 的一个未解决缺陷 —— fs 自检约 **15%**
-概率失败（`buf 0 bytes` / 缓冲里出现 BIOS ROM 的 `0xf000ff53` /
-mount 找不到魔数 / 漏一个 zone）。详见 buglog **bug-023**。
+**Stage 2–8 + TCP/e1000 + per-task pwd/root + VESA 全部完成。**
+下一阶段：**LFS 真实启动验证**。
 
-已排除：页分配器重复派页、缓冲数据页落在低端内存、ramdisk `PAGES`
-未初始化、一块两缓冲、空闲环下标越界、内核栈溢出。已确认现象：某个
-缓冲头的 `b_size` 变成 0（从没 init 过却挂进了链）。指向仍有一处非
-原子的链表/指针更新与中断交错。**下一步**：用 `qemu -d int` 配合在
-`add_request`/`end_request`/`getblk` 里记录事件序列（环形缓冲，事后
-dump），而不是继续加断言。护栏已就位，不要删。
+### Objective
+在真实 ext4 磁盘镜像上启动 /bin/bash。
 
-**Goal（然后）:** 移植信号与进程生命周期 —— `kernel/signal.c` 的信号投递/`sigaction`、
-`kernel/exit.c` 的 `do_exit`/`sys_waitpid` 收尸链、`kernel/fork.c` 的真正
-`sys_fork`。这三者互相咬合，且是把现有调度器接到用户态的前提。
+### Scope
+1. **LFS 启动测试** — 构建静态 busybox 镜像，`LFS_BOOT=true`，验证 /bin/sh
+2. **setup.S VBE 探测** — 实模式 VBE 函数调用，填入 LFB 地址到 BootParams
+3. **USB HID 键盘** — UHCI 主机控制器初始化 + HID 键盘报告解析
 
-### Acceptance criteria
-1. `send_sig(SIGSEGV, ...)` 能真正投递：用户态触发 page fault 后进程被杀而不是只打一行日志
-2. `do_exit` 走完整流程：转 `TASK_ZOMBIE` → 通知父进程 → 父进程 `waitpid` 收尸并回收内核栈
-3. `sys_fork` 能复制出一个真正的子进程（需要 `copy_page_tables`），父子各自返回不同的 pid
-4. `ret_from_sys_call` 里接上 `do_signal`，返回用户态前投递待处理信号
+### Objective
+把内核从「纯内核态运行」推到真正 iretq 到 ring-3、跑用户代码、再通过 int 0x80（以及 syscall 指令）回到内核。这是 LFS 集成的前提——当前内核从未执行过一条用户态指令。
+
+### Scope
+1. **Ring-3 切换基础设施** — 构造用户页表（用户空间 3GB 分割，不使用段基址而是靠页表隔离）、TSS 里填好 rsp0、iretq 到 USER_CS
+2. **`copy_page_tables` / `clone_page_tables`** — fork 不再共用内核页表（当前 tss.cr3 == 0），真正给子进程一份**写时复制**的页表
+3. **`verify_area` / `copy_from_user` / `copy_to_user`** — 替换当前只挡未映射地址的 `check_range`，对用户态指针做真正的 vm_area_struct 校验
+4. **页面错误恢复路径** — page fault 在用户态时不再走 `die_if_kernel`（Stage 2 的 `send_sig_stub` 已经为它留好了信号投递），COW 页的缺页处理也在这里
+5. **`syscall` 指令入口启用**（可选）— 目前 `entry.S:syscall_entry` 是 `cli; hlt` 桩，需要 per-task 的用户栈暂存位 + MSR 配置
+6. **初始化用户态 init 进程** — fork + iretq 一个最简单的用户态任务跑起来（哪怕只是 `hlt` 循环），验证整套 ring-3 ↔ ring-0 往返
 
 ### Files to create / edit
 | Type | File | Content |
-|---|---|---|
-| new | `src/signal.rs` | `sigaction`/`sigset`/`send_sig`/`do_signal`（原版 `kernel/signal.c`）|
-| new | `src/exit.rs` | `do_exit`/`sys_waitpid`/`notify_parent`/`release`（原版 `kernel/exit.c`）|
-| new | `src/fork.rs` | `sys_fork`/`copy_process`（原版 `kernel/fork.c`）|
-| edit | `src/mm/paging.rs` | 加 `copy_page_tables`/`clone_page_tables`（原版 `mm/memory.c`）|
-| edit | `boot/entry.S` | `ret_from_sys_call` 里插 `do_signal` 调用（原版 `signal_return` 那段）|
-| edit | `src/traps.rs` | 把 `send_sig_stub` 换成真的 `send_sig` |
-| edit | `src/sched/task.rs` | 补 `sigaction[32]`、`exit_signal`、亲子链的 `p_cptr`/`p_ysptr`/`p_osptr` |
+|------|------|---------|
+| edit | `src/mm/paging.rs` | `copy_page_tables`/`clone_page_tables`（COW，fork 时给子进程一份独立的 PML4）|
+| edit | `src/syscall/sys.rs` | fork 里接 `copy_page_tables`、补 `sys_execve` 的用户态入口骨架 |
+| new | `src/mm/user.rs` | 用户页表构造（map user pages to 0..3GB with USER bit, separate from kernel 1:1 map）、`create_user_process`（见 stage 3 下的具体步骤） |
+| edit | `src/mm/page_alloc.rs` | 可能需要加 `get_free_page_for_user`（用户页放在物理地址 > 0x100000 之上） |
+| edit | `src/sched/task.rs` | 补 `vm_area_struct`（原版 `mm/mmap.c`，每个 task 的 mm），或新建 `src/mm/vma.rs` |
+| edit | `boot/entry.S` | 可能启用 `syscall_entry`（MSR STAR/LSTAR/SFMASK）、加 `iretq` 到用户态后第一次被中断/系统调用回来时确保栈正确 |
+| edit | `src/desc.rs` | 确认 USER_DS 的 DPL=3、TSS 的 IST 栈都就绪 |
+| New | `src/mm/area.rs` | `verify_area`/`access_ok`（原版 `mm/memory.c` 和 `asm/segment.h`），替换当前 `sys.rs::check_range` |
+| New | `src/uspace/` (or in `src/syscall`) | `copy_from_user`/`copy_to_user`/`strncpy_from_user` |
 
-### Closed decisions
-- 沿用现有 `extern "C" start_kernel` ABI，不迁移到 `bootloader_api`（理由见 cerebrum Decision Log）
-- 用 nightly，但**手写描述符结构体而不用 `x86_64` crate 的 `InterruptDescriptorTable`**：
-  模块 4 实际实现时发现手写更贴合原版结构（原版 `_set_gate` 宏就是直接拼位），
-  且能精确控制 IST 与 DPL。`x86_64` crate 仍在依赖里但目前未实际使用，
-  下阶段若不再需要可以移除。
-- 内核线程（`sched::kernel_thread`）保留：`sys_fork` 到位后它仍是跑
-  bdflush/kswapd 那类纯内核任务的正确工具。
-- 异常/中断里的打印统一走 `klib::printk` 的 `pr_*!` 宏，不要用 `kprintln!`
+### Open decisions (from Stage 2, mostly still open)
+- **`printk` 临界区**：`klib::printk::emit()` 缺中断保护，已知缺口。Stage 3 开始前应该先做。
+- **per-task filp/pwd/root**：FD 表目前还是全局的 `FD_TABLE`（`fs/open.rs`），`do_exit` 里的 `close_all()` 是对全局操作的。在 fork 真正分出独立地址空间之前，这项工作对 Stage 3 的正确性更关键了。
+- **`arch_prctl`（FS/GS base）**：glibc 启动时调这个装 TLS，execve 之前必须补。
+- **x86_64 `struct stat` ABI**：当前的 `Stat` 是 i386 布局，任何返回给用户态的 `fstat`/`stat` 都会被 glibc 误解。Stage 3 应该补 x86_64 版本。
+- **ELF64 加载器**：当前只认 ELF32。是否在 Stage 3 一起做、还是留给 Stage 4，看复杂度。
+- `syscall` 指令入口是否在 Stage 3 启用待定。
 
-### Open decisions
-- **`printk` 的临界区还没加**：`klib::printk::emit()` 的 SAFETY 注释假设
-  「不与中断上下文并发」，但现在 `do_timer`/`do_IRQ`/`do_trap` 都会 printk。
-  原版靠 `cli()`/`restore_flags()` 保护 `log_buf`。现在 `irq::local_irq_save`
-  已经就绪，应该在下阶段开头就给 `emit()` 包上——这是已知的正确性缺口。
-- **内核线程退出会泄漏一页内核栈**：`do_kthread_exit` 里没法释放自己
-  正在用的栈。原版的做法是转 `TASK_ZOMBIE`，由 `release()` 在父进程
-  `waitpid` 时回收。等 `exit.c` 移植完自然解决。
-- **`sys_write` 缺 `verify_area`**：现在只接受落在恒等映射低 1GB 内的地址，
-  用户态指针无法校验。要等 `mm/mmap.c` 的 `vm_area_struct` 才能做对。
-- `syscall` 指令入口（`entry.S:syscall_entry`）留了符号但未启用，
-  需要 per-cpu 的用户栈暂存位置。要不要在这一阶段启用待定。
+### Acceptance criteria
+1. `iretq` 到用户态（USER_CS DPL=3）的一段代码，用户态触发 `int 0x80` 或 page fault → 内核收到并正确处理（信号投递或服务调用），再 iretq 回去
+2. `fork` + `copy_page_tables`：父进程写 COW 页触发缺页，拿到自己的私有副本；子进程看到的是 fork 时刻的快照
+3. `copy_from_user`/`copy_to_user` 对用户指针做边界检查，写入超出映射范围的地址返回 `-EFAULT`（替换当前 `check_range` 只认恒等映射的假实现）
+4. 用户态 segfault（访问 null 或未映射地址）→ `page_fault` → `send_sig(SIGSEGV)` → `do_signal` → `do_exit(SIGSEGV)`，任务被回收（Stage 2 的信号路径与 Stage 3 的缺页恢复挂上）
+
+---
 
 ---
 
 ## 📁 Active architecture
 
 - **Stack:** Rust `#![no_std]` + edition 2024 + **nightly**（`rust-toolchain.toml` 固定），crate-type = `staticlib`，依赖 `x86_64` 0.15；GNU as + ld；QEMU x86_64
-- **Key modules:** `src/lib.rs`(入口) / `src/console.rs`(VGA) / `src/serial.rs`(COM1) / `src/e820.rs` / `src/mm/`(page, page_alloc, kmalloc, paging) / `src/klib/`(ctype, string, errno, vsprintf, printk) / `src/desc.rs`(GDT/TSS/IDT) / `src/traps.rs` / `src/irq.rs` / `src/sched/`(task, mod) / `src/syscall/`(mod, sys) / `boot/*.S`(bootsect, setup, head, **entry**) + `boot/*.ld`
+- **Key modules:** `src/lib.rs`(入口) / `src/console.rs`(VGA) / `src/serial.rs`(COM1) / `src/e820.rs` / `src/mm/`(page, page_alloc, kmalloc, paging) / `src/klib/`(ctype, string, errno, vsprintf, printk) / `src/desc.rs`(GDT/TSS/IDT) / `src/traps.rs` / `src/irq.rs` / `src/sched/`(task, mod) / `src/syscall/`(mod=nr 表+分发表, sys=341 个实现) / `boot/*.S`(bootsect, setup, head, **entry**) + `boot/*.ld`
 - **陷入/返回 ABI:** `boot/entry.S` 的 `SAVE_ALL` 压栈顺序 == `src/traps.rs` 的 `PtRegs` 字段顺序，改一侧必须同步另一侧。`orig_rax` 格三用途：系统调用号 / 异常错误码 / `!irq`
 - **段选择子:** KERNEL_CS=0x08 KERNEL_DS=0x10 USER_CS=0x1B USER_DS=0x23 TSS=0x28（entry.S 里有同名 .set 常量，必须一致）
 - **中断向量:** 0-20 异常（2/8/14 走 IST）、0x20-0x2F 是 PIC 重映射后的 IRQ0-15、0x80 是 int 0x80
-- **系统调用约定:** 号在 rax，参数 rdi/rsi/rdx/r10/r8/r9（r10 而非 rcx，为兼容 syscall 指令）
+- **系统调用约定:** 号在 rax，参数 rdi/rsi/rdx/r10/r8/r9（r10 而非 rcx，为兼容 syscall 指令）。**调用号用 x86_64 正式表**，加新号照 `syscall_64.tbl` 逐号填，不要按功能分组手写（重号会静默覆盖，见 bug-026）
 - **物理内存约定:** 低 1MB 永久保留（启动期结构）；`mem_map` 放 0x100000 起；可管理内存 clamp 到 1GB（setup.S 的恒等映射上限）
 - **Patterns:**
   - 每个 `unsafe` 块上方写 `// SAFETY:`；`unsafe fn` 写 `# Safety` 文档段

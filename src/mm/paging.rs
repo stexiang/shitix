@@ -37,19 +37,19 @@ pub mod flags {
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 #[inline]
-fn pml4_index(v: usize) -> usize {
+pub fn pml4_index(v: usize) -> usize {
     (v >> 39) & 0x1ff
 }
 #[inline]
-fn pdpt_index(v: usize) -> usize {
+pub fn pdpt_index(v: usize) -> usize {
     (v >> 30) & 0x1ff
 }
 #[inline]
-fn pd_index(v: usize) -> usize {
+pub fn pd_index(v: usize) -> usize {
     (v >> 21) & 0x1ff
 }
 #[inline]
-fn pt_index(v: usize) -> usize {
+pub fn pt_index(v: usize) -> usize {
     (v >> 12) & 0x1ff
 }
 
@@ -87,7 +87,7 @@ pub fn current_pml4() -> usize {
 ///
 /// # Safety
 /// `table` 必须是页对齐的、位于恒等映射范围内的页表物理地址，`idx < 512`。
-unsafe fn entry(table: usize, idx: usize) -> u64 {
+pub unsafe fn entry(table: usize, idx: usize) -> u64 {
     debug_assert!(idx < PTRS_PER_PAGE);
     // SAFETY: 由调用者契约保证 table 是有效页表页且被恒等映射；
     // idx < 512 使偏移落在这一页内。用 volatile 防止编译器缓存页表内容。
@@ -117,6 +117,12 @@ unsafe fn next_level(table: usize, idx: usize, user: bool) -> Option<usize> {
             if e & flags::HUGE != 0 {
                 // 撞到 setup.S 建的 2MB 大页：不在这里做拆分，交给调用者处理
                 return None;
+            }
+            // 条目已存在：追加 USER 位（如果需要且尚未设置）。
+            // 这是 2026-08-07 修的关键 bug——之前这里直接 return，
+            // 漏掉了「在共享页表条目上补 USER」这条路径。
+            if user && (e & flags::USER == 0) {
+                set_entry(table, idx, e | flags::USER);
             }
             return Some((e & ADDR_MASK) as usize);
         }
@@ -243,5 +249,178 @@ pub unsafe fn unmap_page(pml4: usize, vaddr: usize) -> Option<usize> {
         set_entry(pt, pt_index(vaddr), 0);
         invalidate_page(vaddr);
         Some((e & ADDR_MASK) as usize)
+    }
+}
+
+/// 分配一个空的 PML4 页，清零并返回物理地址。
+/// 调用者负责把 PML4[0] 填上内核页表条目再使用。
+pub fn alloc_pml4() -> usize {
+    let p = get_free_page();
+    if p == 0 {
+        return 0;
+    }
+    // SAFETY：刚分配的页，物理地址有效且在恒等映射内。
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, PAGE_SIZE);
+    }
+    p
+}
+
+/// 在新分配的用户 PML4 里建立内核映射。
+///
+/// 分配一个干净的 PDPT 页，PDPT[0] = kernel_pd(0x6000) | PRESENT | RW（无 USER），
+/// 其他 PDPT 条目为 0（供用户空间使用，隔离各进程的用户页表子树）。
+///
+/// 返回 false 表示 `dst_pml4 == 0` 或内存不足。
+pub fn clone_kernel_pdpt(dst_pml4: usize) -> bool {
+    if dst_pml4 == 0 {
+        return false;
+    }
+    // 分配一个独立的 PDPT 页，避免与启动 PDPT(0x5000) 共享
+    // 从而隔离各进程的用户页表子树。
+    let pdpt = get_free_page();
+    if pdpt == 0 {
+        return false;
+    }
+    // SAFETY：dst_pml4 / pdpt 在恒等映射内可写。
+    unsafe {
+        // PML4[0] → 新的 PDPT（先不设 USER，等 map_page 需要时再加）
+        set_entry(dst_pml4, 0, pdpt as u64 | flags::PRESENT | flags::RW);
+        // PDPT[0] → 内核 PD(0x6000)，无 USER
+        set_entry(pdpt, 0, 0x6000u64 | flags::PRESENT | flags::RW);
+    }
+    true
+}
+
+/// 复制页表项到新的页表。
+///
+/// 复制源页表的用户空间映射到目标页表，适用于 fork 时的页表复制。
+/// `user` 参数控制是否将 USER 位写入新条目。
+///
+/// **注意**：当前实现对 user=true 时检查 PTE 的权限标志有精简——只检查了
+/// PML4/PDPT/PD 都存在的条目。对 2MB 大页直接跳过（不拆分）。
+/// COW 语义留给调用者通过 `cow_copy_page_table` 处理。
+///
+/// # Safety
+/// - src_pml4 和 dst_pml4 必须是有效的四级页表根
+/// - 此函数不处理 COW 标记，需要调用者设置
+pub unsafe fn copy_page_table(src_pml4: usize, dst_pml4: usize, user: bool) -> bool {
+    // 用户空间范围: 1GB - 4GB（与 umm 的 USERSPACE_START/END 一致）
+    const USERSPACE_START: usize = 0x4000_0000;
+    const USERSPACE_END: usize = 0xFFFF_FFFF;
+
+    let extra = if user { flags::USER } else { 0 };
+
+    // 遍历用户空间的每一页
+    let mut vaddr = USERSPACE_START;
+    while vaddr < USERSPACE_END {
+        // 检查源页表中的映射
+        if let Some(phys) = unsafe { translate(src_pml4, vaddr) } {
+            // 用 get_page_flags 在 src_pml4 上取标志——这是正确路径
+            let prot = get_page_flags(src_pml4, vaddr).unwrap_or(flags::READONLY & !flags::USER);
+
+            // 在目标页表中创建映射
+            if !map_page(dst_pml4, vaddr, phys, prot | flags::PRESENT | extra) {
+                return false;
+            }
+        }
+        vaddr += PAGE_SIZE;
+    }
+    true
+}
+
+/// 复制并设置 COW 页表。
+///
+/// 复制父进程的页表到子进程，将所有 USER 页面设置为只读 (COW)。
+///
+/// # Safety
+/// 同 copy_page_table
+pub unsafe fn cow_copy_page_table(src_pml4: usize, dst_pml4: usize) -> bool {
+    // 用户空间范围
+    const USERSPACE_START: usize = 0x4000_0000;
+    const USERSPACE_END: usize = 0xFFFF_FFFF;
+
+    let mut vaddr = USERSPACE_START;
+    while vaddr < USERSPACE_END {
+        // 检查源页表中的映射
+        if let Some(phys) = unsafe { translate(src_pml4, vaddr) } {
+            // 设置为只读 (COW)：USER + PRESENT，无 RW
+            let cow_prot = flags::PRESENT | flags::USER;
+
+            // 源 PTE 也清 RW 位（父进程变成只读），使父/子都会在写时触发 COW 缺页。
+            // SAFETY: pml4 / vaddr 都是有效的（translate 刚返回了 Some）。
+            unsafe {
+                let _ = set_page_flags(src_pml4, vaddr, cow_prot);
+            }
+
+            if !map_page(dst_pml4, vaddr, phys, cow_prot) {
+                return false;
+            }
+        }
+        vaddr += PAGE_SIZE;
+    }
+    true
+}
+
+/// 获取页表项的权限标志
+pub fn get_page_flags(pml4: usize, vaddr: usize) -> Option<u64> {
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return None;
+        }
+        let pdpt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return None;
+        }
+        let pd = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return None;
+        }
+        let pt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pt, pt_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return None;
+        }
+        
+        Some(e & 0xFFF)
+    }
+}
+
+/// 设置页表项的权限
+pub fn set_page_flags(pml4: usize, vaddr: usize, new_flags: u64) -> bool {
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        let pdpt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return false;
+        }
+        let pd = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
+            return false;
+        }
+        let pt = (e & ADDR_MASK) as usize;
+        
+        let e = entry(pt, pt_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        
+        let phys = e & ADDR_MASK;
+        set_entry(pt, pt_index(vaddr), phys | new_flags | flags::PRESENT);
+        invalidate_page(vaddr);
+        true
     }
 }

@@ -67,9 +67,9 @@ const DEFAULT_COLOR: ColorCode = ColorCode::new(Color::LightGray, Color::Black);
 
 /// 控制台状态。对应原版 console.c 里的 `x`/`y`/`attr` 三个全局量。
 pub struct Writer {
-    row: usize,
-    col: usize,
-    color: ColorCode,
+    pub row: usize,
+    pub col: usize,
+    pub color: ColorCode,
 }
 
 /// 全局控制台。内核早期只有一条执行流，不存在并发写入。
@@ -79,7 +79,7 @@ static mut WRITER: Writer = Writer { row: 0, col: 0, color: DEFAULT_COLOR };
 ///
 /// 用 `addr_of_mut!` 而不是直接借用 `static mut`：edition 2024 禁止后者，
 /// 且前者不会先构造一个中间引用。
-fn writer() -> &'static mut Writer {
+pub fn writer() -> &'static mut Writer {
     // SAFETY: 内核启动早期为单线程且中断门全部指向 ignore_int（见 head.S），
     // 不存在第二个执行流同时取得这个引用，因此不会出现别名可变引用。
     unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }
@@ -193,6 +193,53 @@ pub fn putb(b: u8) {
     sync_cursor();
 }
 
+/// 清除从光标到行尾。
+pub fn clear_to_eol() {
+    let w = writer();
+    let row = w.row;
+    for col in w.col..COLS {
+        w.put_at(row, col, b' ');
+    }
+}
+
+/// 清除整行。
+pub fn clear_line() {
+    let w = writer();
+    for col in 0..COLS {
+        w.put_at(w.row, col, b' ');
+    }
+    w.col = 0;
+}
+
+/// 设置光标位置（0-based）。
+pub fn set_cursor_pos(row: usize, col: usize) {
+    let w = writer();
+    w.row = row.min(ROWS - 1);
+    w.col = col.min(COLS - 1);
+    set_cursor(w.row, w.col);
+}
+
+/// 获取当前光标行。
+pub fn cursor_row() -> usize { writer().row }
+
+/// 获取当前光标列。
+pub fn cursor_col() -> usize { writer().col }
+
+/// 清除从光标到屏幕末尾。
+pub fn clear_to_end() {
+    let w = writer();
+    // clear current line from cursor
+    for col in w.col..COLS {
+        w.put_at(w.row, col, b' ');
+    }
+    // clear lines below
+    for row in (w.row + 1)..ROWS {
+        for col in 0..COLS {
+            w.put_at(row, col, b' ');
+        }
+    }
+}
+
 /// 设置后续输出的前景/背景色，返回旧属性以便调用方恢复。
 pub fn set_color(fg: Color, bg: Color) -> ColorCode {
     let w = writer();
@@ -230,7 +277,7 @@ pub fn _print_colored(fg: Color, bg: Color, args: fmt::Arguments) {
 }
 
 /// 把硬件光标移到 `Writer` 当前位置。
-fn sync_cursor() {
+pub fn sync_cursor() {
     let w = writer();
     set_cursor(w.row, w.col.min(COLS - 1));
 }

@@ -158,13 +158,41 @@
  * 21 份几乎相同的代码）。
  *
  * 进入时栈顶是刚压的向量号，紧下面是 orig_rax 格（错误码）。
- * 先把向量号弹到 rax 暂存，SAVE_ALL 之后再作为第二参数传出去。
  */
 exc_common:
-    popq    %rax                    /* 向量号 */
-    SAVE_ALL
+    /*
+     * 不能像原来那样 `popq %rax` 取向量号：那会在 SAVE_ALL **之前**毁掉被
+     * 打断上下文的 %rax——IRQ 路径上同样的写法就是 bug-029 的根因（见
+     * irq_common 的注释）。异常路径上这条一直是潜伏的，因为目前绝大多数
+     * 异常直接 panic；但 int3/debug/overflow 本来就可恢复，而 page_fault
+     * 在用户态与 COW 接上之后会变成高频可恢复异常，那时每次缺页都会把
+     * 被打断代码的 %rax 换成向量号 14。
+     *
+     * 改成先 SAVE_ALL（此时 %rax 还是真值，被如实存进 PT_RAX），向量号留在
+     * pt_regs 上方的临时槽里，保存完再取。
+     */
+    SAVE_ALL                        /* 此刻 0x78(%rsp)=向量号, 0x80=错误码 */
+    movq    0x78(%rsp), %rsi        /* 参数 2: 向量号 */
+    /*
+     * 把「错误码 + CPU 压的 iretq 帧」整体下移 8 字节，盖掉那个临时槽，
+     * 让栈恢复成标准 pt_regs 布局（orig_rax 回到 PT_ORIG_RAX = 0x78）。
+     * 从低地址往高地址依次搬，源永远在目标上方 8 字节，不会自我覆盖。
+     * 这里拿 %rax 当搬运寄存器是安全的：它的真值已经在 PT_RAX 里，
+     * RESTORE_ALL 从那一格恢复，我们不碰那一格。
+     */
+    movq    0x80(%rsp), %rax        /* 错误码 → orig_rax */
+    movq    %rax, 0x78(%rsp)
+    movq    0x88(%rsp), %rax        /* rip */
+    movq    %rax, 0x80(%rsp)
+    movq    0x90(%rsp), %rax        /* cs */
+    movq    %rax, 0x88(%rsp)
+    movq    0x98(%rsp), %rax        /* rflags */
+    movq    %rax, 0x90(%rsp)
+    movq    0xa0(%rsp), %rax        /* rsp */
+    movq    %rax, 0x98(%rsp)
+    movq    0xa8(%rsp), %rax        /* ss */
+    movq    %rax, 0xa0(%rsp)
     movq    %rsp, %rdi              /* 参数 1: &mut PtRegs */
-    movq    %rax, %rsi              /* 参数 2: 向量号 */
     /* SysV ABI 要求 call 时 rsp 16 字节对齐。此刻 rsp 指向 pt_regs 起点，
        pt_regs 是 0xa8 字节且 iretq 帧本身 8 字节对齐，所以对齐性取决于
        进入异常时的栈。统一用 rbp 对齐一次，代价一条指令。 */
@@ -190,7 +218,6 @@ exc_common:
     .global IRQ\nr\()_interrupt
 IRQ\nr\()_interrupt:
     pushq   $~\nr
-    pushq   $\nr
     jmp     irq_common
     .endm
 
@@ -212,9 +239,23 @@ IRQ\nr\()_interrupt:
     BUILD_IRQ 15
 
 irq_common:
-    popq    %rax                    /* IRQ 号 */
+    /*
+     * bug-029：这里原本是「先 `pushq $nr` 传 IRQ 号，再在 irq_common 里
+     * `popq %rax` 取回」——而那条 pop **在 SAVE_ALL 之前**，把被打断任务的
+     * %rax 就地毁掉了，SAVE_ALL 存下去的是 IRQ 号，RESTORE_ALL 又老实把它
+     * 恢复回去。于是每个时钟滴答都让被打断的内核代码带着 %rax = 0 继续跑
+     * （时钟是 IRQ 0）。低 1GB 是恒等映射，所以那个 0 当指针用时不 page
+     * fault，而是静默读回实模式 IVT 的字节——`0xf000ff53` 那串 BIOS IRET
+     * 桩，表现为 i_mode=0xff53 / nlink=255 / s_magic=0xff53；当计数用时
+     * 就是「readdir 列出 0 项」。%rax 在滴答那一刻是否活着完全取决于寄存器
+     * 分配，所以改一行无关代码都能让失败率大幅跳动。
+     *
+     * orig_rax 那一格本来就存着 ~nr，SAVE_ALL 之后从 PT_ORIG_RAX 取出来取反
+     * 即可，不需要额外的 scratch push，也就不需要在保存前动任何寄存器。
+     */
     SAVE_ALL
-    movq    %rax, %rdi              /* 参数 1: irq */
+    movq    PT_ORIG_RAX(%rsp), %rdi /* 参数 1: irq = ~orig_rax */
+    notq    %rdi
     movq    %rsp, %rsi              /* 参数 2: &mut PtRegs（原版 do_IRQ 同序）*/
     movq    %rsp, %rbp
     andq    $-16, %rsp
@@ -245,17 +286,25 @@ system_call:
  * syscall 指令入口（x86_64 特有，原版没有）。
  * 进入时：rcx = 用户 rip，r11 = 用户 rflags，且**没有换栈**——
  * 必须自己从 TSS 里取内核栈。原版 int 0x80 由 CPU 通过 TSS.ss0/esp0 换栈，
- * 这里要手工做。
- *
- * 暂未启用（需要 per-cpu 的用户栈暂存位置，等 sched 的 percpu 就位）。
- * 保留符号以便 syscall::init 决定是否写 MSR_LSTAR。
- */
-    .global syscall_entry
-syscall_entry:
-    /* 目前 MSR_LSTAR 未指向这里，走到这说明配置错了，直接停机比乱跑安全 */
-    cli
-    hlt
-    jmp     syscall_entry
+	 * 这里要手工换栈 + swapgs。
+	 * 用全局 scratch 变量代替 per-cpu 区域存用户 RSP，
+	 * kernel_rsp_scratch 在 switch_to_task 里更新。
+	 */
+	    .global syscall_entry
+	syscall_entry:
+	    swapgs
+	    movq    %rsp, user_rsp_scratch(%rip)
+	    movq    kernel_rsp_scratch(%rip), %rsp
+	    pushq   $0x23
+	    pushq   user_rsp_scratch(%rip)
+	    pushq   %r11
+	    pushq   $0x1B
+	    pushq   %rcx
+	    pushq   %rax
+	    cld
+	    SAVE_ALL
+	    call    do_syscall
+	    jmp     ret_from_sys_call
 
 /* ---- 返回路径（对应原版 ret_from_sys_call）---- */
 
@@ -292,12 +341,52 @@ ret_check_resched:
 
     cmpl    $0, need_resched(%rip)
     jne     reschedule
+
+    /*
+     * 投递待处理信号。对应原版 ret_from_sys_call 里那段
+     *   movl _current,%eax; cmpl $0,signal(%eax); je 2f
+     *   ... pushl %esp; call _do_signal
+     *
+     * 原版直接在汇编里读 task_struct 的 signal/blocked 偏移；我们的
+     * `current` 是个下标（sched::CURRENT）而不是指针，且 Task 的字段偏移
+     * 由 Rust 布局决定，写死在汇编里会随 Task 改字段而静默错位。
+     * 所以先 call 一个 Rust 谓词（has_pending_signal），真有信号才进
+     * do_signal——常态路径多一次 call，换来偏移不会失同步。
+     */
+    movq    %rsp, %rbp
+    andq    $-16, %rsp
+    call    signal_pending_c
+    movq    %rbp, %rsp
+    testb   %al, %al
+    jz      restore_and_iret
+
+    /* 同 reschedule：call 之前 rsp 必须 16 对齐（见那里的注释）。
+       do_signal 的唯一参数是 pt_regs 指针，也就是对齐前的 rsp。 */
+    movq    %rsp, %rbp
+    movq    %rsp, %rdi
+    andq    $-16, %rsp
+    call    do_signal
+    movq    %rbp, %rsp
+    /* do_signal 可能把状态改成 Stopped 并 schedule 过，重新走一遍检查 */
+    jmp     ret_check_resched
 restore_and_iret:
     RESTORE_ALL
 
-/* 原版 reschedule: 把 ret_from_sys_call 压栈后 jmp _schedule */
+/*
+ * 原版 reschedule: 把 ret_from_sys_call 压栈后 jmp _schedule。
+ *
+ * 这里必须先对齐栈再 call：pt_regs 是 0xa8 字节（8 mod 16），所以进到
+ * ret_from_sys_call 时 rsp 是 8 mod 16，直接 call 会让 schedule 拿到一个
+ * 不满足 SysV ABI 的栈。opt-level=1 下 LLVM 会用 movaps 存取栈上的槽位，
+ * 栈错位时那些访问要么 #GP 要么读到错的位置——表现出来就是「某个基址
+ * 寄存器莫名变成 0」（bug-029）。其余几处 call 都已经这么做了，
+ * 唯独这里漏了。
+ */
 reschedule:
+    movq    %rsp, %rbp
+    andq    $-16, %rsp
     call    schedule
+    movq    %rbp, %rsp
     jmp     ret_check_resched
 
 /* 原版 handle_bottom_half：开中断跑软中断，期间 intr_count 加一 */
@@ -367,7 +456,11 @@ ret_from_fork:
  */
     .global kernel_thread_entry
 kernel_thread_entry:
+    /* 同 reschedule：call 之前 rsp 必须 16 对齐（见那里的注释）。 */
+    movq    %rsp, %rbp
+    andq    $-16, %rsp
     call    schedule_tail
+    movq    %rbp, %rsp
     popq    %rax                    /* fn */
     popq    %rdi                    /* arg */
     andq    $-16, %rsp
@@ -378,3 +471,13 @@ kernel_thread_entry:
     cli
 1:  hlt
     jmp     1b
+
+/* ---- syscall scratch 变量 ---------------------------------- */
+    .section .bss
+    .align 8
+    .global user_rsp_scratch
+user_rsp_scratch:
+    .quad 0
+    .global kernel_rsp_scratch
+kernel_rsp_scratch:
+    .quad 0

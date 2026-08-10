@@ -52,6 +52,65 @@ pub struct Stat {
     pub __unused5: u32,
 }
 
+/// x86_64 `struct stat`（兼容 glibc）。144 字节。
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Stat64 {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i64; 3],
+}
+
+impl Stat64 {
+    pub const fn zeroed() -> Self {
+        Stat64 {
+            st_dev: 0, st_ino: 0, st_nlink: 0, st_mode: 0,
+            st_uid: 0, st_gid: 0, __pad0: 0, st_rdev: 0,
+            st_size: 0, st_blksize: 0, st_blocks: 0,
+            st_atime: 0, st_atime_nsec: 0,
+            st_mtime: 0, st_mtime_nsec: 0,
+            st_ctime: 0, st_ctime_nsec: 0,
+            __unused: [0; 3],
+        }
+    }
+
+    /// 从 inode 填充 Stat64。
+    /// # Safety
+    /// `inr` 必须是有效 inode 号。
+    pub unsafe fn from_inode(inr: usize) -> Option<Self> {
+        // SAFETY: 契约转交。
+        let ip = unsafe { crate::fs::inode::iget(inr, 0) };
+        if ip == crate::fs::inode::NIL {
+            return None;
+        }
+        let mut s = Self::zeroed();
+        s.st_ino = inr as u64;
+        s.st_nlink = unsafe { (*crate::fs::inode::inode(ip)).i_nlink as u64 };
+        s.st_mode = unsafe { (*crate::fs::inode::inode(ip)).i_mode as u32 };
+        s.st_uid = unsafe { (*crate::fs::inode::inode(ip)).i_uid as u32 };
+        s.st_gid = unsafe { (*crate::fs::inode::inode(ip)).i_gid as u32 };
+        s.st_size = unsafe { (*crate::fs::inode::inode(ip)).i_size as i64 };
+        s.st_blksize = 1024;
+        s.st_blocks = (s.st_size + 511) / 512;
+        Some(s)
+    }
+}
+
 impl Stat {
     pub const fn zeroed() -> Self {
         Stat {
@@ -79,38 +138,36 @@ impl Stat {
     }
 }
 
-/// 把一个 inode 拷成 [`Stat`]。对应原版 `cp_new_stat()`。
+/// 把一个 inode 拷成 [`Stat64`]（x86_64 ABI）。对应原版 `cp_new_stat()`。
 ///
 /// # Safety
 /// `n` 必须是有效 inode 下标。
-unsafe fn cp_new_stat(n: usize, out: &mut Stat) {
+unsafe fn cp_new_stat(n: usize, out: &mut Stat64) {
     // SAFETY: 契约转交。
     unsafe {
         let i = inode::inode(n);
-        *out = Stat::zeroed();
-        out.st_dev = i.i_dev;
-        out.st_ino = i.i_ino;
-        out.st_mode = i.i_mode;
-        out.st_nlink = i.i_nlink;
-        out.st_uid = i.i_uid;
-        out.st_gid = i.i_gid;
-        out.st_rdev = i.i_rdev;
-        out.st_size = i.i_size;
-        out.st_blksize = if i.i_blksize == 0 { super::BLOCK_SIZE as u32 } else { i.i_blksize };
-        // 原版：st_blocks 是 512 字节块数。minix 的 inode 不存这个
-        // （v1 没有 i_blocks 字段），原版从 i_size 算，我们照做。
-        out.st_blocks = (i.i_size + 511) / 512;
-        out.st_atime = i.i_atime;
-        out.st_mtime = i.i_mtime;
-        out.st_ctime = i.i_ctime;
+        *out = Stat64::zeroed();
+        out.st_dev = i.i_dev as u64;
+        out.st_ino = i.i_ino as u64;
+        out.st_mode = i.i_mode as u32;
+        out.st_nlink = i.i_nlink as u64;
+        out.st_uid = i.i_uid as u32;
+        out.st_gid = i.i_gid as u32;
+        out.st_rdev = i.i_rdev as u64;
+        out.st_size = i.i_size as i64;
+        out.st_blksize = if i.i_blksize == 0 { super::BLOCK_SIZE as i64 } else { i.i_blksize as i64 };
+        out.st_blocks = ((i.i_size as i64) + 511) / 512;
+        out.st_atime = i.i_atime as i64;
+        out.st_mtime = i.i_mtime as i64;
+        out.st_ctime = i.i_ctime as i64;
     }
 }
 
-/// 按路径查。对应原版 `sys_stat()`。
+/// 按路径查。对应原版 `sys_stat()`，x86_64 使用 `Stat64` ABI。
 ///
 /// # Safety
 /// 只能在进程上下文调用。
-pub unsafe fn sys_stat(path: &[u8], out: &mut Stat) -> i64 {
+pub unsafe fn sys_stat(path: &[u8], out: &mut Stat64) -> i64 {
     // SAFETY: 契约转交。
     unsafe {
         let n = match namei::namei(path) {
@@ -128,7 +185,7 @@ pub unsafe fn sys_stat(path: &[u8], out: &mut Stat) -> i64 {
 ///
 /// # Safety
 /// 只能在进程上下文调用。
-pub unsafe fn sys_lstat(path: &[u8], out: &mut Stat) -> i64 {
+pub unsafe fn sys_lstat(path: &[u8], out: &mut Stat64) -> i64 {
     // SAFETY: 契约转交。
     unsafe { sys_stat(path, out) }
 }
@@ -137,7 +194,7 @@ pub unsafe fn sys_lstat(path: &[u8], out: &mut Stat) -> i64 {
 ///
 /// # Safety
 /// 只能在进程上下文调用。
-pub unsafe fn sys_fstat(fd: usize, out: &mut Stat) -> i64 {
+pub unsafe fn sys_fstat(fd: usize, out: &mut Stat64) -> i64 {
     // SAFETY: 契约转交。
     unsafe {
         let f = fd_to_filp(fd);
