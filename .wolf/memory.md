@@ -373,3 +373,57 @@
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 08:58
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 09:01
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 10:18
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 10:21
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 10:23
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 10:10 | Implemented /proc filesystem with procfs module (version, meminfo, pid lookup, dirent) | src/fs/proc.rs | compiles |
+| 10:10 | Implemented tmpfs (RAM-backed filesystem for /tmp) with read/write/dirent/lookup/create | src/fs/tmpfs.rs | compiles |
+| 10:10 | Wired FsType::Proc and FsType::Tmpfs into all VFS dispatch points | src/fs/{mod,read_write,namei,open,inode}.rs | compiles |
+| 10:12 | Added SA_RESTART logic to signal delivery path — rewinds rip and restores orig_rax | src/signal.rs | compiles |
+| 10:14 | Wired mount("proc") and mount("tmpfs") into sys_mount | src/syscall/sys.rs | compiles |
+| 10:20 | Fixed ext4/ext2 reader to support multiple block groups (Ext4SbInfo.group_count field, inode_table_for_inode function) | src/fs/ext4/ops.rs | compiles |
+| 10:26 | Built Alpine-musl LFS Docker image (bash, coreutils, binutils, grep, sed, gawk, findutils, diffutils, make, patch, tar, gzip, less) | lfs-docker/Dockerfile lfs-docker/build-lfs.sh | Docker image built |
+| 10:30 | Built 256MB ext2 rootfs image, fixed /bin/sh symlink→hard copy | target/boot/lfs.img | boot test PASS |
+| 10:35 | Kernel boots, mounts ext2 root, opens /bin/sh, reads ELF header (0x7F 0x45 0x4C 0x46), loads ld-musl-x86_64.so.1, execve succeeds | src/lib.rs | SHITIX_BOOT_OK |
+
+## Session: 2026-08-10 11:17
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 11:17
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 11:18
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+
+## Session: 2026-08-10 11:19
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|

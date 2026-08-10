@@ -41,6 +41,10 @@ pub enum FsType {
     Chr,
     /// 块设备文件。原版 `blkdev_inode_operations`
     Blk,
+    /// procfs 虚拟文件系统
+    Proc,
+    /// tmpfs 内存文件系统
+    Tmpfs,
 }
 
 /// 内存里的 inode。对应原版 `struct inode`。

@@ -76,6 +76,13 @@ QEMU_BASE=(
     -no-shutdown
 )
 
+# ROOTIMG: pass a second IDE drive as the root filesystem (ext2)
+if [[ -n "${ROOTIMG:-}" ]]; then
+    [[ -f "$ROOTIMG" ]] || fail "ROOTIMG=$ROOTIMG not found"
+    QEMU_BASE+=(-drive "format=raw,file=$ROOTIMG,if=ide")
+    info "Root image: $ROOTIMG"
+fi
+
 case "$MODE" in
 run)
     info "交互式运行（关闭窗口即退出）"

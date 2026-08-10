@@ -121,12 +121,15 @@ pub mod full {
 
     pub struct Ext4SbInfo {
         pub ext4_sb: Ext4SuperBlock,
-        pub ext4_gd: Ext4GroupDesc,
+        pub ext4_gd: Ext4GroupDesc,  // group 0 descriptor
         pub inode_size: u32,
         pub block_size: usize,    // always 1024 for buffer cache
         pub fs_block_size: usize, // actual filesystem block size
         pub inodes_per_group: u32,
         pub blocks_per_group: u32,
+        pub group_count: u32,     // total number of block groups
+        pub gd_1024_block: u32,   // 1024-byte block where group descriptors start
+        pub gd_size: usize,       // size of each group descriptor (32 or 64)
         pub valid: bool,
     }
 
@@ -138,7 +141,8 @@ pub mod full {
                 free_inodes_count: 0, used_dirs_count: 0, flags: 0, itable_unused: 0, checksum: 0,
             },
             inode_size: 128, block_size: 1024, fs_block_size: 1024,
-            inodes_per_group: 0, blocks_per_group: 0, valid: false,
+            inodes_per_group: 0, blocks_per_group: 0, group_count: 0,
+            gd_1024_block: 0, gd_size: 32, valid: false,
         }
     }
 
@@ -207,8 +211,12 @@ pub mod full {
             let info = ext4_info(sb_nr);
             if !info.valid { return; }
             let dev = sb(sb_nr).s_dev;
-            let inode_table = info.ext4_gd.inode_table;
-            let byte_off = (ino as u64 - 1) * info.inode_size as u64;
+            let inode_table = match inode_table_for_inode(sb_nr, ino) {
+                Some(t) => t as u64,
+                None => return,
+            };
+            let group_base = ((ino as u64 - 1) / info.inodes_per_group as u64) * info.inodes_per_group as u64;
+            let byte_off = (ino as u64 - 1 - group_base) * info.inode_size as u64;
             let block = inode_table + byte_off / info.block_size as u64;
             let block_off = (byte_off % info.block_size as u64) as usize;
             let b = match buffer::bread(dev, block as u32, info.block_size) {
@@ -271,6 +279,38 @@ pub mod full {
         unsafe { bmap_phys(ip, block) }
     }
 
+    /// Read the inode table offset for the group containing `ino`.
+    unsafe fn inode_table_for_inode(sb_nr: usize, ino: u32) -> Option<u32> {
+        unsafe {
+            let info = ext4_info(sb_nr);
+            if !info.valid || info.inodes_per_group == 0 { return None; }
+            let group = (ino as u64 - 1) / info.inodes_per_group as u64;
+            if group == 0 {
+                return Some(info.ext4_gd.inode_table as u32);
+            }
+            if group >= info.group_count as u64 {
+                return None;
+            }
+            // Read the group descriptor from the group descriptor table
+            let gd_byte_off = group as usize * info.gd_size;
+            let gd_1024_off = info.gd_1024_block as u64 + (gd_byte_off / 1024) as u64;
+            let gd_inblock_off = gd_byte_off % 1024;
+            let dev = sb(sb_nr).s_dev;
+            let bn = buffer::bread(dev, gd_1024_off as u32, 1024)?;
+            let data = bh(bn).data();
+            if gd_inblock_off + info.gd_size > data.len() {
+                buffer::brelse(bn);
+                return None;
+            }
+            let gd_bytes = &data[gd_inblock_off..gd_inblock_off + info.gd_size];
+            // bg_inode_table is at offset 8 in the group descriptor (32-bit LE)
+            let itable = u32::from_le_bytes([gd_bytes[8], gd_bytes[9], gd_bytes[10], gd_bytes[11]]);
+            let scale = (info.fs_block_size / 1024) as u32;
+            buffer::brelse(bn);
+            Some(itable * scale)
+        }
+    }
+
     /// 读磁盘 inode 的原始 60 字节 `i_block` 区。失败返 `None`。
     unsafe fn read_inode_iblock(ip: usize) -> Option<([u8; 60], usize, u16)> {
         unsafe {
@@ -281,8 +321,12 @@ pub mod full {
             let info = ext4_info(sb_nr);
             if !info.valid { return None; }
             let dev = sb(sb_nr).s_dev;
-            let inode_table = info.ext4_gd.inode_table;
-            let byte_off = (ino as u64 - 1) * info.inode_size as u64;
+            let inode_table = match inode_table_for_inode(sb_nr, ino) {
+                Some(t) => t as u64,
+                None => return None,
+            };
+            let group_base = ((ino as u64 - 1) / info.inodes_per_group as u64) * info.inodes_per_group as u64;
+            let byte_off = (ino as u64 - 1 - group_base) * info.inode_size as u64;
             let blk = inode_table + byte_off / info.block_size as u64;
             let block_off = (byte_off % info.block_size as u64) as usize;
             let b = buffer::bread(dev, blk as u32, info.block_size)?;
@@ -362,9 +406,13 @@ pub mod full {
                 if dind == 0 { return None; }
                 let outer = idx / ptrs_per_block;
                 let inner = idx % ptrs_per_block;
-                let b = buffer::bread(dev, dind, fs_bs)?;
+                // Read outer pointer from double-indirect block using 1024-byte buffer
+                let scale = (fs_bs / 1024) as u32;
+                let dptr_off = (outer as usize) * 4;
+                let dblock_1024 = dind * scale + (dptr_off / 1024) as u32;
+                let b = buffer::bread(dev, dblock_1024, 1024)?;
                 let data = bh(b).data();
-                let off = (outer as usize) * 4;
+                let off = dptr_off % 1024;
                 let ind = if off + 4 <= data.len() {
                     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
                 } else { 0 };
@@ -380,32 +428,45 @@ pub mod full {
             let outer = idx / ppb2;
             let mid = (idx % ppb2) / ptrs_per_block;
             let inner = idx % ptrs_per_block;
-            let b = buffer::bread(dev, tind, fs_bs)?;
+            let scale = (fs_bs / 1024) as u32;
+            // Read triple-indirect pointer using 1024-byte buffer
+            let tptr_off = (outer as usize) * 4;
+            let tblock_1024 = tind * scale + (tptr_off / 1024) as u32;
+            let b = buffer::bread(dev, tblock_1024, 1024)?;
             let data = bh(b).data();
-            let off = (outer as usize) * 4;
+            let off = tptr_off % 1024;
             let dind = if off + 4 <= data.len() {
                 u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
             } else { 0 };
             buffer::brelse(b);
             if dind == 0 { return None; }
-            let b = buffer::bread(dev, dind, fs_bs)?;
-            let data = bh(b).data();
-            let off = (mid as usize) * 4;
-            let ind = if off + 4 <= data.len() {
-                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+            // Read double-indirect pointer using 1024-byte buffer
+            let dptr_off2 = (mid as usize) * 4;
+            let dblock_1024_2 = dind * scale + (dptr_off2 / 1024) as u32;
+            let b2 = buffer::bread(dev, dblock_1024_2, 1024)?;
+            let data2 = bh(b2).data();
+            let off2 = dptr_off2 % 1024;
+            let ind = if off2 + 4 <= data2.len() {
+                u32::from_le_bytes([data2[off2], data2[off2 + 1], data2[off2 + 2], data2[off2 + 3]])
             } else { 0 };
-            buffer::brelse(b);
+            buffer::brelse(b2);
             if ind == 0 { return None; }
             read_indirect(dev, ind, inner, fs_bs)
         }
     }
 
     /// 读一级间接块 `ind` 中第 `idx` 个指针。
+    /// `ind` is in filesystem blocks (e.g. 4096 bytes). Since our buffer cache
+    /// only has 1024-byte buffers, we scale `ind` to 1024-byte units and read
+    /// the needed sub-block.
     unsafe fn read_indirect(dev: u16, ind: u32, idx: u32, fs_bs: usize) -> Option<u32> {
         unsafe {
-            let b = buffer::bread(dev, ind, fs_bs)?;
+            let scale = (fs_bs / 1024) as u32;
+            let ptr_offset = (idx as usize) * 4;
+            let block_1024 = ind * scale + (ptr_offset / 1024) as u32;
+            let b = buffer::bread(dev, block_1024, 1024)?;
             let data = bh(b).data();
-            let off = (idx as usize) * 4;
+            let off = ptr_offset % 1024;
             let p = if off + 4 <= data.len() {
                 u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
             } else { 0 };
@@ -612,6 +673,11 @@ pub mod full {
         info.fs_block_size = fs_block_size; // Actual filesystem block size for scaling
         info.inodes_per_group = inodes_pg;
         info.blocks_per_group = bpg * scale;
+        info.gd_1024_block = desc_1024_block;
+        info.gd_size = desc_size;
+        // Compute group count: total inodes / inodes_per_group (ceiling)
+        let total_inodes = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        info.group_count = if inodes_pg > 0 { (total_inodes + inodes_pg - 1) / inodes_pg } else { 0 };
         info.valid = true;
 
         unsafe {

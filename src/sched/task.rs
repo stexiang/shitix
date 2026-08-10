@@ -14,8 +14,8 @@
 use crate::klib::printk::Level;
 
 /// 最大任务数。对应原版 `include/linux/tasks.h` 的 `NR_TASKS 128`。
-/// 取 6 省 BSS。
-pub const NR_TASKS: usize = 6;
+/// LFS 需要足够多的任务槽位来运行 bash + coreutils 管道链。
+pub const NR_TASKS: usize = 64;
 
 /// 进程名长度。对应原版 `char comm[16]`。
 pub const COMM_LEN: usize = 16;
@@ -176,6 +176,20 @@ pub struct Task {
     /// `put_user`）。不能在 clone 父进程上下文里写——COW 下那会改穿父进程
     /// 的页。0 表示无 SETTID 请求。
     pub set_child_tid: u64,
+
+    /// mmap 向下增长的分配基址（类似 Linux 的 mmap_base）。
+    /// 初始值设在用户地址空间高端，每次 mmap 往下减。
+    pub mmap_base: u64,
+
+    /// 可执行文件路径（供 /proc/self/exe 使用）。
+    pub exe_path: [u8; 128],
+
+    /// close-on-exec 位图：bit N 置位表示 fd N 在 execve 时自动关闭。
+    pub close_on_exec: u64,
+
+    /// 文件创建掩码。`umask(2)` 设置，`open(O_CREAT)`/`mkdir` 时
+    /// 实际权限 = mode & !umask。
+    pub umask: u16,
 }
 
 impl Task {
@@ -210,6 +224,10 @@ impl Task {
             pwd: usize::MAX,
             root: usize::MAX,
             set_child_tid: 0,
+            mmap_base: 0x7FFF_0000_0000,
+            exe_path: [0u8; 128],
+            close_on_exec: 0,
+            umask: 0o022,
         }
     }
 

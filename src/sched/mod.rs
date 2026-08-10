@@ -35,10 +35,10 @@ use crate::irq;
 use crate::klib::errno::{EAGAIN, KResult};
 use crate::klib::printk::Level;
 use crate::mm;
-use task::{HZ, STACK_MAGIC, flags};
+use task::{STACK_MAGIC, flags};
 
 // fs/ 与 drivers/ 需要这几个名字；原版它们都在 sched.h 里公开。
-pub use task::{NR_TASKS, Task, TaskState};
+pub use task::{NR_TASKS, Task, TaskState, HZ};
 
 /// syscall 指令的栈暂存区（定义在 entry.S .bss）。
 mod syscall_scratch {

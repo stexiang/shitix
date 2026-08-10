@@ -161,6 +161,7 @@ pub fn find_entry(buf: &[u8], name: &[u8]) -> Option<u32> {
     None
 }
 
+#[cfg(feature = "extra-drivers")]
 /// 把一项填进用户给的 [`Dirent`]。对应 ext4 的 `ext4_readdir`，但沿用
 /// 本树单项语义（一次 `getdents` 返回一项）。
 ///

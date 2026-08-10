@@ -196,6 +196,8 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
             FsType::Ext2 => super::ext4::namei::lookup(dir, name),
             #[cfg(not(feature = "extra-drivers"))]
             FsType::Ext2 => super::minix::namei::lookup(dir, name),
+            FsType::Proc => super::proc::lookup(dir, name),
+            FsType::Tmpfs => super::tmpfs::lookup(dir, name),
             _ => Err(ENOTDIR),
         }
     }

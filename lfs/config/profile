@@ -1,0 +1,16 @@
+# /etc/profile - System-wide environment settings
+
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export TERM=linux
+export PS1='\u@shitix:\w\$ '
+export LANG=C.UTF-8
+export CHARSET=UTF-8
+
+# Set default editor
+export EDITOR=/usr/bin/vim
+
+# Set pager
+export PAGER=/usr/bin/less
+
+# Umask
+umask 022

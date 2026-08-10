@@ -25,9 +25,11 @@ pub mod minix;
 pub mod namei;
 pub mod open;
 pub mod pipe;
+pub mod proc;
 pub mod read_write;
 pub mod stat;
 pub mod super_block;
+pub mod tmpfs;
 
 pub use buffer::{BLOCK_SIZE, bread, brelse, getblk, sync_dev};
 pub use devices::{block_read, block_write, chrdev_read, chrdev_write};

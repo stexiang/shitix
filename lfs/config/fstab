@@ -1,0 +1,9 @@
+# /etc/fstab - Static filesystem information
+#
+# <device>      <mount>   <type>   <options>         <dump> <pass>
+/dev/hda1       /         ext4     defaults,noatime  1      1
+proc            /proc     proc     nosuid,nodev,noexec 0    0
+tmpfs           /tmp      tmpfs    defaults,nosuid,nodev 0  0
+tmpfs           /var/tmp  tmpfs    defaults,nosuid,nodev 0  0
+tmpfs           /run      tmpfs    defaults,nosuid,nodev,mode=0755 0 0
+devtmpfs        /dev      devtmpfs mode=0755,nosuid  0      0

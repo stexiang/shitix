@@ -754,12 +754,27 @@ fn fs_init_thread(_arg: u64) {
         unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
 
         if mounted {
-            sprintln!("LFS: execve /bin/sh...");
+            // Try /init first, fall back to /bin/sh
+            sprintln!("LFS: execve /init...");
             let ret = unsafe {
                 syscall::syscall3(syscall::nr::EXECVE,
-                    b"/bin/sh\0".as_ptr() as u64, 0, 0)
+                    b"/init\0".as_ptr() as u64, 0, 0)
             };
-            sprintln!("LFS: /bin/sh returned {}", ret);
+            if ret < 0 {
+                sprintln!("LFS: /init failed ({}), trying /sbin/init...", ret);
+                let ret = unsafe {
+                    syscall::syscall3(syscall::nr::EXECVE,
+                        b"/sbin/init\0".as_ptr() as u64, 0, 0)
+                };
+                if ret < 0 {
+                    sprintln!("LFS: /sbin/init failed ({}), trying /bin/sh...", ret);
+                    let ret = unsafe {
+                        syscall::syscall3(syscall::nr::EXECVE,
+                            b"/bin/sh\0".as_ptr() as u64, 0, 0)
+                    };
+                    sprintln!("LFS: /bin/sh returned {}", ret);
+                }
+            }
         } else {
             sprintln!("LFS: IDE not found — run with second drive for busybox shell");
             sprintln!("LFS: (current boot continues to selftest mode)");
