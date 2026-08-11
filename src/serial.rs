@@ -51,6 +51,21 @@ pub fn print(s: &str) {
     }
 }
 
+/// 检查串口是否有待接收字符。
+pub fn has_char() -> bool {
+    unsafe { inb(PORT + 5) & 0x01 != 0 }
+}
+
+/// 读 LSR 寄存器（调试用）
+pub fn read_lsr() -> u8 {
+    unsafe { inb(PORT + 5) }
+}
+
+/// 从串口读一个字符（必须先 has_char 确认有数据）。
+pub fn getc() -> u8 {
+    unsafe { inb(PORT) }
+}
+
 /// 让 `write!` / `sprintln!` 能往串口写。
 pub struct Writer;
 
@@ -106,5 +121,29 @@ pub fn print_dec(mut v: u64) {
     while n > 0 {
         n -= 1;
         putc(buf[n]);
+    }
+}
+
+/// Print a u64 as hex (no leading 0x).
+pub fn raw_hex64(v: u64) {
+    putc(b'0');
+    putc(b'x');
+    let mut empty = true;
+    for shift in (0..16).rev() {
+        let nibble = ((v >> (shift * 4)) & 0xF) as u8;
+        if nibble != 0 || !empty || shift == 0 {
+            empty = false;
+            putc(if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) });
+        }
+    }
+}
+
+/// Print an i64 in hex with sign.
+pub fn raw_hex64_signed(v: i64) {
+    if v < 0 {
+        putc(b'-');
+        raw_hex64((-v) as u64);
+    } else {
+        raw_hex64(v as u64);
     }
 }

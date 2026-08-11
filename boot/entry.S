@@ -303,7 +303,16 @@ system_call:
 	    pushq   %rax
 	    cld
 	    SAVE_ALL
+	    /* do_syscall(&mut PtRegs)：参数 1 是栈上 pt_regs 指针。
+	     * 这段在 system_call（int 0x80 路径）里有，syscall_entry 之前漏了，
+	     * 导致 do_syscall 拿到的 rdi 是用户态第一参数而不是 &PtRegs——
+	     * 用 int 0x80 的 LFS 引导程序没事，用 syscall 指令的 glibc /bin/sh
+	     * 就会把调用号/参数全读成 0（误派发成 read(0,0,0)）。 */
+	    movq    %rsp, %rdi              /* 参数 1: &mut PtRegs */
+	    movq    %rsp, %rbp
+	    andq    $-16, %rsp
 	    call    do_syscall
+	    movq    %rbp, %rsp
 	    jmp     ret_from_sys_call
 
 /* ---- 返回路径（对应原版 ret_from_sys_call）---- */

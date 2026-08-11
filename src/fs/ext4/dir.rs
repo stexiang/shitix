@@ -111,12 +111,18 @@ impl<'a> Iterator for DirIter<'a> {
         let name_len = b[6];
         let file_type = b[7];
 
-        // 损坏检查：rec_len 必须能真的推进，且不能越界
+        // 损坏检查
         if rec_len < EXT4_DIR_ENTRY_HEADER_LEN as u16
             || rec_len % 4 != 0
             || (rec_len as usize) < EXT4_DIR_ENTRY_HEADER_LEN + name_len as usize
-            || self.pos + rec_len as usize > self.buf.len()
         {
+            return None;
+        }
+        // Check that the entry data (header + name) fits in buffer.
+        // rec_len may extend beyond buffer for the last entry in a dir block
+        // (e.g., 4096-byte block read as 1024-byte sub-blocks).
+        let entry_end = self.pos + EXT4_DIR_ENTRY_HEADER_LEN + name_len as usize;
+        if entry_end > self.buf.len() {
             return None;
         }
 
@@ -127,7 +133,9 @@ impl<'a> Iterator for DirIter<'a> {
             file_type,
             name_off: self.pos + EXT4_DIR_ENTRY_HEADER_LEN,
         };
-        self.pos += rec_len as usize;
+        // Advance by rec_len, but don't go past the buffer
+        let next = self.pos + rec_len as usize;
+        self.pos = if next > self.buf.len() { self.buf.len() } else { next };
         Some(e)
     }
 }
@@ -151,4 +159,79 @@ pub fn find_entry(buf: &[u8], name: &[u8]) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(feature = "extra-drivers")]
+/// 把一项填进用户给的 [`Dirent`]。对应 ext4 的 `ext4_readdir`，但沿用
+/// 本树单项语义（一次 `getdents` 返回一项）。
+///
+/// `pos` 是目录内的字节偏移（`filp->f_pos`）。`Dirent.d_name` 只有 32 字节，
+/// 名字超长截断。返回下一次的 `f_pos`，到末尾返回 0。
+///
+/// # Safety
+/// 只能在进程上下文调用。`n` 必须是已 `iget` 的目录 inode。
+pub unsafe fn fill_dirent(n: usize, pos: u64, out: &mut crate::fs::Dirent) -> i64 {
+    use crate::fs::buffer::{self, BLOCK_SIZE, NIL, bh};
+    use crate::fs::inode;
+    use crate::fs::super_block::sb;
+    use crate::klib::errno::{EBADF, ENOTDIR};
+    use crate::fs::mode;
+
+    unsafe {
+        if !mode::is_dir(inode::inode(n).i_mode) {
+            return -(ENOTDIR as i64);
+        }
+        let sb_nr = inode::inode(n).i_sb;
+        if sb_nr == NIL {
+            return -(EBADF as i64);
+        }
+        let dev = sb(sb_nr).s_dev;
+        let size = inode::inode(n).i_size as u64;
+        let mut off = pos;
+
+        while off < size {
+            let block = (off / BLOCK_SIZE as u64) as u32;
+            let phys = crate::fs::ext4::ops::full::bmap(n, block, false);
+            if phys == 0 {
+                off = (block as u64 + 1) * BLOCK_SIZE as u64;
+                continue;
+            }
+            let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                Some(b) => b,
+                None => return -(crate::klib::errno::EIO as i64),
+            };
+            let data = bh(bn).data();
+            let block_base = (block as u64) * BLOCK_SIZE as u64;
+            let cur = (off - block_base) as usize;
+
+            // 从块内偏移 cur 起找第一个有效（inode!=0）目录项。
+            let mut chosen: Option<(Ext4DirEntry, usize)> = None;
+            for e in DirIter::new(data) {
+                let e_off = e.name_off - EXT4_DIR_ENTRY_HEADER_LEN;
+                if e_off < cur { continue; }
+                if !e.is_empty() {
+                    chosen = Some((e, e_off));
+                    break;
+                }
+            }
+            if let Some((e, e_off)) = chosen {
+                let nlen = (e.name_len as usize).min(out.d_name.len());
+                let nstart = e.name_off;
+                out.d_ino = e.inode as u64;
+                out.d_off = (e_off + e.rec_len as usize) as i64;
+                out.d_reclen = core::mem::size_of::<crate::fs::Dirent>() as u16;
+                out.d_type = e.file_type; // EXT4_FT_* 与 DT_* 同值
+                out.d_name = [0; 32];
+                if nstart + nlen <= data.len() {
+                    out.d_name[..nlen].copy_from_slice(&data[nstart..nstart + nlen]);
+                }
+                buffer::brelse(bn);
+                return (e_off + e.rec_len as usize) as i64;
+            }
+            // 本块没有更多有效项：跳到下一块
+            buffer::brelse(bn);
+            off = (block as u64 + 1) * BLOCK_SIZE as u64;
+        }
+        0
+    }
 }

@@ -54,32 +54,33 @@ pub unsafe fn find_entry(dir: usize, name: &[u8]) -> Option<(usize, usize)> {
     }
 
     unsafe {
+        let sb_nr = inode::inode(dir).i_sb;
+        let dev = sb(sb_nr).s_dev;
         let size = inode::inode(dir).i_size as u64;
         let mut off = 0u64;
         while off < size {
             let block = (off / BLOCK_SIZE as u64) as u32;
-
-            // 用 ext4 bmap 映射逻辑块到物理块
             let phys = crate::fs::ext4::ops::full::bmap(dir, block, false);
             if phys == 0 {
                 off = (block as u64 + 1) * BLOCK_SIZE as u64;
                 continue;
             }
 
-            // 直接从 ramdisk 读取目录块，绕过 buffer cache
-            let mut raw = [0u8; BLOCK_SIZE];
-            if !crate::drivers::block::ramdisk::raw_read_block(phys as usize, &mut raw) {
-                off = (block as u64 + 1) * BLOCK_SIZE as u64;
-                continue;
-            }
-            for entry in DirIter::new(&raw) {
+            let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                Some(b) => b, None => break,
+            };
+            let data = bh(bn).data();
+            let mut found = None;
+            for entry in DirIter::new(data) {
                 if entry.is_empty() || entry.name_len as usize != name.len() { continue; }
                 let ns = entry.name_off;
-                if ns + name.len() <= raw.len() && &raw[ns..ns + name.len()] == name {
-                    return Some((NIL, entry.inode as usize));
+                if ns + name.len() <= data.len() && &data[ns..ns + name.len()] == name {
+                    found = Some((bn, entry.name_off - EXT4_DIR_ENTRY_HEADER_LEN));
+                    break;
                 }
             }
-
+            if found.is_some() { return found; }
+            buffer::brelse(bn);
             off = (block as u64 + 1) * BLOCK_SIZE as u64;
         }
         None
@@ -98,15 +99,9 @@ pub unsafe fn lookup(dir: usize, name: &[u8]) -> Result<usize, i32> {
         }
         match find_entry(dir, name) {
             Some((b, _off)) => {
-                let ino = if b == NIL {
-                    // ramdisk 直读：_off 即为 inode 号
-                    _off as u32
-                } else {
-                    let raw = &bh(b).data()[_off..];
-                    let ino = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                    unsafe { buffer::brelse(b) };
-                    ino
-                };
+                let raw = &bh(b).data()[_off..];
+                let ino = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                buffer::brelse(b);
                 if ino == 0 {
                     return Err(ENOENT);
                 }
@@ -288,53 +283,61 @@ pub unsafe fn mkdir(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
 unsafe fn add_entry(dir: usize, ino: u32, name: &[u8], ftype: u8) -> Result<(), i32> {
     let rec_len = ext4_dir_rec_len(name.len() as u8) as usize;
     let sb_nr = unsafe { inode::inode(dir).i_sb };
+    let dev = unsafe { sb(sb_nr).s_dev };
 
     unsafe {
         let size = inode::inode(dir).i_size as u64;
         let last_block = if size == 0 { 0u32 } else { ((size - 1) / BLOCK_SIZE as u64) as u32 };
 
-        // 直接从 ramdisk 读写目录块，完全绕过 buffer cache
+        // Use buffer cache to read/write directory blocks
         if size > 0 {
             let phys = crate::fs::ext4::ops::full::bmap(dir, last_block, true);
-            let mut raw = [0u8; BLOCK_SIZE];
-            if phys != 0 && crate::drivers::block::ramdisk::raw_read_block(phys as usize, &mut raw) {
-                let mut off = 0usize;
-                while off + EXT4_DIR_ENTRY_HEADER_LEN <= BLOCK_SIZE {
-                    let rec = u16::from_le_bytes([raw[off + 4], raw[off + 5]]) as usize;
-                    if rec == 0 || off + rec > BLOCK_SIZE { break; }
-                    let ino_existing = u32::from_le_bytes([raw[off],raw[off+1],raw[off+2],raw[off+3]]);
-                    let existing_name_len = raw[off + 6] as usize;
-                    let existing_rec = rec;
+            if phys != 0 {
+                if let Some(bn) = buffer::bread(dev, phys, BLOCK_SIZE) {
+                    let raw = buffer::bh(bn).data_mut();
+                    let mut off = 0usize;
+                    while off + EXT4_DIR_ENTRY_HEADER_LEN <= BLOCK_SIZE {
+                        let rec = u16::from_le_bytes([raw[off + 4], raw[off + 5]]) as usize;
+                        if rec == 0 || off + rec > BLOCK_SIZE { break; }
+                        let ino_existing = u32::from_le_bytes([raw[off],raw[off+1],raw[off+2],raw[off+3]]);
+                        let existing_name_len = raw[off + 6] as usize;
+                        let existing_rec = rec;
 
-                    // 空槽：直接填入
-                    if ino_existing == 0 && existing_rec >= rec_len {
-                        raw[off..off+4].copy_from_slice(&ino.to_le_bytes());
-                        raw[off+6] = name.len() as u8; raw[off+7] = ftype;
-                        let noff = off + EXT4_DIR_ENTRY_HEADER_LEN;
-                        raw[noff..noff+name.len()].copy_from_slice(name);
-                        crate::drivers::block::ramdisk::raw_write_block(phys as usize, &raw);
-                        return Ok(());
-                    }
+                        if ino_existing == 0 && existing_rec >= rec_len {
+                            raw[off..off+4].copy_from_slice(&ino.to_le_bytes());
+                            raw[off+6] = name.len() as u8; raw[off+7] = ftype;
+                            let noff = off + EXT4_DIR_ENTRY_HEADER_LEN;
+                            raw[noff..noff+name.len()].copy_from_slice(name);
+                            buffer::bh(bn).b_uptodate = true;
+                            buffer::mark_buffer_dirty(bn);
+                            buffer::brelse(bn);
+                            crate::fs::buffer::sync_dev(dev);
+                            return Ok(());
+                        }
 
-                    // 拆分现有条目
-                    if ino_existing != 0 && existing_rec >= ext4_dir_rec_len(existing_name_len as u8) as usize + rec_len {
-                        let new_off = off + ext4_dir_rec_len(existing_name_len as u8) as usize;
-                        let remaining = existing_rec - ext4_dir_rec_len(existing_name_len as u8) as usize;
-                        raw[off+4..off+6].copy_from_slice(&ext4_dir_rec_len(existing_name_len as u8).to_le_bytes());
-                        raw[new_off..new_off+4].copy_from_slice(&ino.to_le_bytes());
-                        raw[new_off+4..new_off+6].copy_from_slice(&(remaining as u16).to_le_bytes());
-                        raw[new_off+6] = name.len() as u8; raw[new_off+7] = ftype;
-                        let noff = new_off + EXT4_DIR_ENTRY_HEADER_LEN;
-                        raw[noff..noff+name.len()].copy_from_slice(name);
-                        crate::drivers::block::ramdisk::raw_write_block(phys as usize, &raw);
-                        return Ok(());
+                        if ino_existing != 0 && existing_rec >= ext4_dir_rec_len(existing_name_len as u8) as usize + rec_len {
+                            let new_off = off + ext4_dir_rec_len(existing_name_len as u8) as usize;
+                            let remaining = existing_rec - ext4_dir_rec_len(existing_name_len as u8) as usize;
+                            raw[off+4..off+6].copy_from_slice(&ext4_dir_rec_len(existing_name_len as u8).to_le_bytes());
+                            raw[new_off..new_off+4].copy_from_slice(&ino.to_le_bytes());
+                            raw[new_off+4..new_off+6].copy_from_slice(&(remaining as u16).to_le_bytes());
+                            raw[new_off+6] = name.len() as u8; raw[new_off+7] = ftype;
+                            let noff = new_off + EXT4_DIR_ENTRY_HEADER_LEN;
+                            raw[noff..noff+name.len()].copy_from_slice(name);
+                            buffer::bh(bn).b_uptodate = true;
+                            buffer::mark_buffer_dirty(bn);
+                            buffer::brelse(bn);
+                            crate::fs::buffer::sync_dev(dev);
+                            return Ok(());
+                        }
+                        off += existing_rec;
                     }
-                    off += existing_rec;
+                    buffer::brelse(bn);
                 }
             }
         }
 
-        // 需要新块
+        // Need a new block
         let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
         let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
         let phys = match bitmap::alloc_block(sb_data, gd, 0) {
@@ -343,45 +346,57 @@ unsafe fn add_entry(dir: usize, ino: u32, name: &[u8], ftype: u8) -> Result<(), 
         let new_block = (size / BLOCK_SIZE as u64) as u32;
         crate::fs::ext4::ops::full::extend_inode_block(dir, new_block, phys as u32);
 
-        let mut raw = [0u8; BLOCK_SIZE];
-        raw[0..4].copy_from_slice(&ino.to_le_bytes());
-        raw[4..6].copy_from_slice(&((BLOCK_SIZE - rec_len) as u16).to_le_bytes());
-        raw[6] = name.len() as u8; raw[7] = ftype;
-        raw[8..8+name.len()].copy_from_slice(name);
-        let tail = (EXT4_DIR_ENTRY_HEADER_LEN + name.len() + 3) & !3;
-        if tail + EXT4_DIR_ENTRY_HEADER_LEN <= BLOCK_SIZE {
-            raw[tail+4..tail+6].copy_from_slice(&((BLOCK_SIZE - tail) as u16).to_le_bytes());
+        if let Some(bn) = buffer::getblk(dev, phys as u32, BLOCK_SIZE) {
+            let raw = buffer::bh(bn).data_mut();
+            raw[0..4].copy_from_slice(&ino.to_le_bytes());
+            raw[4..6].copy_from_slice(&((BLOCK_SIZE - rec_len) as u16).to_le_bytes());
+            raw[6] = name.len() as u8; raw[7] = ftype;
+            raw[8..8+name.len()].copy_from_slice(name);
+            let tail = (EXT4_DIR_ENTRY_HEADER_LEN + name.len() + 3) & !3;
+            if tail + EXT4_DIR_ENTRY_HEADER_LEN <= BLOCK_SIZE {
+                raw[tail+4..tail+6].copy_from_slice(&((BLOCK_SIZE - tail) as u16).to_le_bytes());
+            }
+            buffer::bh(bn).b_uptodate = true;
+            buffer::mark_buffer_dirty(bn);
+            buffer::brelse(bn);
         }
-        crate::drivers::block::ramdisk::raw_write_block(phys as usize, &raw);
 
         inode::inode(dir).i_size = (new_block as u32 + 1) * 1024;
         inode::inode(dir).i_dirt = true;
+        // Sync to flush dirty parent directory buffer before it gets reused
+        crate::fs::buffer::sync_dev(dev);
         Ok(())
     }
 }
 
 unsafe fn remove_entry(dir: usize, name: &[u8]) -> Result<(), i32> {
-    // 直接操作 ramdisk：先找到条目，清零 inode
+    let sb_nr = inode::inode(dir).i_sb;
+    let dev = sb(sb_nr).s_dev;
     let size = inode::inode(dir).i_size as u64;
     let mut off = 0u64;
     while off < size {
         let block = (off / BLOCK_SIZE as u64) as u32;
         let phys = crate::fs::ext4::ops::full::bmap(dir, block, false);
         if phys == 0 { off = (block as u64 + 1) * BLOCK_SIZE as u64; continue; }
-        let mut raw = [0u8; BLOCK_SIZE];
-        if !crate::drivers::block::ramdisk::raw_read_block(phys as usize, &mut raw) {
-            off = (block as u64 + 1) * BLOCK_SIZE as u64; continue;
-        }
-        for entry in DirIter::new(&raw) {
+        let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+            Some(b) => b, None => break,
+        };
+        let raw = buffer::bh(bn).data_mut();
+        let mut found = false;
+        for entry in DirIter::new(raw) {
             if entry.is_empty() || entry.name_len as usize != name.len() { continue; }
             let ns = entry.name_off;
             if ns + name.len() <= raw.len() && &raw[ns..ns + name.len()] == name {
                 let eoff = ns - EXT4_DIR_ENTRY_HEADER_LEN;
                 raw[eoff] = 0; raw[eoff+1] = 0; raw[eoff+2] = 0; raw[eoff+3] = 0;
-                crate::drivers::block::ramdisk::raw_write_block(phys as usize, &raw);
-                return Ok(());
+                buffer::bh(bn).b_uptodate = true;
+                buffer::mark_buffer_dirty(bn);
+                found = true;
+                break;
             }
         }
+        buffer::brelse(bn);
+        if found { return Ok(()); }
         off = (block as u64 + 1) * BLOCK_SIZE as u64;
     }
     Err(ENOENT)
@@ -397,13 +412,15 @@ pub unsafe fn rmdir(dir: usize, name: &[u8]) -> i32 {
         if i.i_size > 1024 {
             let mut n = 0u32;
             let mut off = 0u64;
+            let dev = sb(inode::inode(ip).i_sb).s_dev;
             while off < i.i_size as u64 {
                 let blk = (off / BLOCK_SIZE as u64) as u32;
                 let phys = crate::fs::ext4::ops::full::bmap(ip, blk, false);
                 if phys == 0 { break; }
-                let mut raw = [0u8; BLOCK_SIZE];
-                if crate::drivers::block::ramdisk::raw_read_block(phys as usize, &mut raw) {
-                    for e in DirIter::new(&raw) { if !e.is_empty() { n += 1; if n > 2 { break; } } }
+                if let Some(bn) = buffer::bread(dev, phys, BLOCK_SIZE) {
+                    let raw = buffer::bh(bn).data();
+                    for e in DirIter::new(raw) { if !e.is_empty() { n += 1; if n > 2 { break; } } }
+                    buffer::brelse(bn);
                 }
                 off = (blk as u64 + 1) * BLOCK_SIZE as u64;
             }

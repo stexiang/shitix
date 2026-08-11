@@ -37,11 +37,8 @@ pub unsafe fn init() {
         #[cfg(feature = "extra-drivers")]
         block::hd::init();
         char_dev::init();
-        // IDE 硬盘和声卡子系统默认不启用：debug 构建镜像偏大。
-        // 可通过 `cargo build --features extra-drivers` 启用，或直接使用 release 构建。
         #[cfg(feature = "extra-drivers")]
         {
-            block::hd::init();
             sound::init();
         }
     }

@@ -110,17 +110,31 @@ unsafe fn set_entry(table: usize, idx: usize, val: u64) {
 /// # Safety
 /// `table` 必须是有效的、被恒等映射的页表页物理地址。
 unsafe fn next_level(table: usize, idx: usize, user: bool) -> Option<usize> {
-    // SAFETY: 由调用者契约保证 table 有效。
     unsafe {
         let e = entry(table, idx);
         if e & flags::PRESENT != 0 {
             if e & flags::HUGE != 0 {
-                // 撞到 setup.S 建的 2MB 大页：不在这里做拆分，交给调用者处理
-                return None;
+                // Split 2MB large page for user-space access.
+                // Strip GLOBAL flag — TLB entries with GLOBAL persist across CR3
+                // switches and would point to old 2MB pages instead of new 4KB ones.
+                let pt = get_free_page();
+                if pt == 0 { return None; }
+                let phys = e & ADDR_MASK;
+                // Keep PRESENT|RW but NEVER add USER: the split entries cover
+                // the entire 2MB region including free pages that contain
+                // allocator metadata (free-list pointers). USER flag is added
+                // later by map_page only for the specific pages the ELF loader
+                // allocates. Also strip HUGE and GLOBAL.
+                let base_flags = (e & !ADDR_MASK & !flags::HUGE & !0x100) | flags::PRESENT;
+                for i in 0..512 {
+                    set_entry(pt, i, (phys + i as u64 * 4096) | base_flags);
+                }
+                let mut new_e = (pt as u64) | base_flags;
+                if user { new_e |= flags::USER; }
+                set_entry(table, idx, new_e);
+                return Some(pt);
             }
             // 条目已存在：追加 USER 位（如果需要且尚未设置）。
-            // 这是 2026-08-07 修的关键 bug——之前这里直接 return，
-            // 漏掉了「在共享页表条目上补 USER」这条路径。
             if user && (e & flags::USER == 0) {
                 set_entry(table, idx, e | flags::USER);
             }
@@ -219,6 +233,47 @@ pub unsafe fn translate(pml4: usize, vaddr: usize) -> Option<usize> {
     }
 }
 
+/// 查询虚拟地址是否映射为**用户可访问**的页（最终 PTE 含 PRESENT|USER）。
+///
+/// 与 [`translate`] 的区别：后者只看 PRESENT，会把「拆分 2MB 内核大页后留下的
+/// present-but-not-user 的 4KB 表项」也算作已映射。brk 等用户内存分配器必须用本函数，
+/// 否则会把内核拆分页当成「已分配的用户页」而跳过映射，导致用户态访问这些页时
+/// 触发 err=0x5 的保护故障（present + read + user）。
+///
+/// # Safety
+/// `pml4` 必须是有效的四级页表根物理地址。
+pub unsafe fn is_user_mapped(pml4: usize, vaddr: usize) -> bool {
+    // SAFETY: 每级都先查 PRESENT 再往下走，不会解引用无效页表。
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        let pdpt = (e & ADDR_MASK) as usize;
+
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        if e & flags::HUGE != 0 {
+            return e & flags::USER != 0;
+        }
+        let pd = (e & ADDR_MASK) as usize;
+
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 {
+            return false;
+        }
+        if e & flags::HUGE != 0 {
+            return e & flags::USER != 0;
+        }
+        let pt = (e & ADDR_MASK) as usize;
+
+        let e = entry(pt, pt_index(vaddr));
+        e & (flags::PRESENT | flags::USER) == (flags::PRESENT | flags::USER)
+    }
+}
+
 /// 撤销一页映射，返回它原先指向的物理地址。
 /// 对应原版 `unmap_page_range()`（原版会顺带 `free_page`，这里把释放交给调用者）。
 ///
@@ -268,26 +323,29 @@ pub fn alloc_pml4() -> usize {
 
 /// 在新分配的用户 PML4 里建立内核映射。
 ///
-/// 分配一个干净的 PDPT 页，PDPT[0] = kernel_pd(0x6000) | PRESENT | RW（无 USER），
-/// 其他 PDPT 条目为 0（供用户空间使用，隔离各进程的用户页表子树）。
+/// 分配独立的 PDPT + PD 页，复制内核 PD 条目。
+/// 这样用户进程的 2MB 页拆分不会污染共享内核 PD(0x6000)。
 ///
 /// 返回 false 表示 `dst_pml4 == 0` 或内存不足。
 pub fn clone_kernel_pdpt(dst_pml4: usize) -> bool {
     if dst_pml4 == 0 {
         return false;
     }
-    // 分配一个独立的 PDPT 页，避免与启动 PDPT(0x5000) 共享
-    // 从而隔离各进程的用户页表子树。
     let pdpt = get_free_page();
-    if pdpt == 0 {
+    let pd = get_free_page();
+    if pdpt == 0 || pd == 0 {
+        if pdpt != 0 { crate::mm::free_page(pdpt); }
+        if pd != 0 { crate::mm::free_page(pd); }
         return false;
     }
-    // SAFETY：dst_pml4 / pdpt 在恒等映射内可写。
+    // SAFETY：dst_pml4 / pdpt / pd 在恒等映射内可写。
     unsafe {
-        // PML4[0] → 新的 PDPT（先不设 USER，等 map_page 需要时再加）
+        // Copy kernel PD entries (512 × 8 bytes = 4096 bytes) from 0x6000
+        core::ptr::copy_nonoverlapping(0x6000usize as *const u8, pd as *mut u8, 4096);
+        // PML4[0] → new PDPT
         set_entry(dst_pml4, 0, pdpt as u64 | flags::PRESENT | flags::RW);
-        // PDPT[0] → 内核 PD(0x6000)，无 USER
-        set_entry(pdpt, 0, 0x6000u64 | flags::PRESENT | flags::RW);
+        // PDPT[0] → NEW PD (not shared 0x6000)
+        set_entry(pdpt, 0, pd as u64 | flags::PRESENT | flags::RW);
     }
     true
 }
@@ -331,38 +389,101 @@ pub unsafe fn copy_page_table(src_pml4: usize, dst_pml4: usize, user: bool) -> b
 
 /// 复制并设置 COW 页表。
 ///
-/// 复制父进程的页表到子进程，将所有 USER 页面设置为只读 (COW)。
+/// 对应原版 `mm/memory.c:copy_page_tables()`：遍历源进程的用户页表，
+/// 把每一页用户页在父子两边都改成只读，并递增该物理页的引用计数
+/// （原版 `mem_map[MAP_NR(page)]++`）。这样写时复制缺页处理程序才能
+/// 依靠「引用计数 > 1 → 复制」正确工作。
+///
+/// 与旧实现的关键差别：旧实现按 `0x4000_0000..0xFFFF_FFFF` 线性扫描虚拟
+/// 地址，但 BusyBox/glibc 把 ELF 装在 `0x400000` 段（低于 1GB），整段
+/// 文本/数据都被跳过，fork 后子进程没有代码映射，一返回用户态即缺页。
+/// 这里改为遍历页表树本身——只复制 PML4 低半区（用户空间，PML4[0..256]）
+/// 里实际存在的条目，覆盖从 0 起的全部规范用户地址。
 ///
 /// # Safety
-/// 同 copy_page_table
+/// - `src_pml4` 和 `dst_pml4` 必须是有效的四级页表根物理地址。
+/// - `dst_pml4` 应已通过 [`clone_kernel_pdpt`] 建好内核映射。
+/// - 调用方须保证独占（单核 + 关中断或不可重入上下文）。
 pub unsafe fn cow_copy_page_table(src_pml4: usize, dst_pml4: usize) -> bool {
-    // 用户空间范围
-    const USERSPACE_START: usize = 0x4000_0000;
-    const USERSPACE_END: usize = 0xFFFF_FFFF;
+    use crate::mm::page_ref;
 
-    let mut vaddr = USERSPACE_START;
-    while vaddr < USERSPACE_END {
-        // 检查源页表中的映射
-        if let Some(phys) = unsafe { translate(src_pml4, vaddr) } {
-            // 设置为只读 (COW)：USER + PRESENT，无 RW
-            let cow_prot = flags::PRESENT | flags::USER;
+    // 用户空间 = PML4 低半区（index 0..256），对应规范地址 0..0x7FFF_FFFF_FFFF。
+    // 高半区（256..512）是内核空间，由 clone_kernel_pdpt 处理，不在此复制。
+    for pml4_i in 0..256usize {
+        let pml4e = unsafe { entry(src_pml4, pml4_i) };
+        if pml4e & flags::PRESENT == 0 || pml4e & flags::USER == 0 {
+            continue;
+        }
+        // 源 PDPT 物理地址。
+        let src_pdpt = (pml4e & ADDR_MASK) as usize;
 
-            // 源 PTE 也清 RW 位（父进程变成只读），使父/子都会在写时触发 COW 缺页。
-            // SAFETY: pml4 / vaddr 都是有效的（translate 刚返回了 Some）。
-            unsafe {
-                let _ = set_page_flags(src_pml4, vaddr, cow_prot);
+        for pdpt_i in 0..512usize {
+            let pdpte = unsafe { entry(src_pdpt, pdpt_i) };
+            if pdpte & flags::PRESENT == 0 || pdpte & flags::USER == 0 {
+                continue;
             }
+            if pdpte & flags::HUGE != 0 {
+                // 1GB 大页：用户空间不该出现（setup.S 的 1GB 大页无 USER 位）。
+                // 出现说明状态异常，跳过以免误把内核巨页复制成用户页。
+                continue;
+            }
+            let src_pd = (pdpte & ADDR_MASK) as usize;
 
-            if !map_page(dst_pml4, vaddr, phys, cow_prot) {
-                return false;
+            for pd_i in 0..512usize {
+                let pde = unsafe { entry(src_pd, pd_i) };
+                if pde & flags::PRESENT == 0 || pde & flags::USER == 0 {
+                    continue;
+                }
+                if pde & flags::HUGE != 0 {
+                    // 2MB 大页：用户空间也不该出现（next_level 在需要 4KB 粒度时
+                    // 已把大页拆成 4KB 表）。出现则跳过。
+                    continue;
+                }
+                let src_pt = (pde & ADDR_MASK) as usize;
+
+                for pt_i in 0..512usize {
+                    let pte = unsafe { entry(src_pt, pt_i) };
+                    if pte & flags::PRESENT == 0 || pte & flags::USER == 0 {
+                        continue;
+                    }
+                    // 重建该 PTE 的虚拟地址。
+                    let vaddr = (pml4_i << 39) | (pdpt_i << 30)
+                        | (pd_i << 21) | (pt_i << 12);
+                    // COW 只清 RW（bit 1）触发写保护缺页，其余标志（含 NX bit 63、
+                    // ACCESSED/DIRTY 等）原样保留——原版 `copy_page_tables` 用
+                    // `~2` 清 PAGE_RW，再 OR 上 PAGE_PRESENT|PAGE_USER。
+                    let cow_flags = (pte & !ADDR_MASK & !flags::RW) | flags::PRESENT | flags::USER;
+
+                    let phys = (pte & ADDR_MASK) as usize;
+                    let pfn = page_ref::phys_to_pfn(phys);
+
+                    // 原版：mem_map[MAP_NR(page)]++ —— 记录这一页现在被两个进程共享。
+                    page_ref::page_ref_inc(pfn);
+
+                    // 父进程：清 RW（变只读），保留其余标志（含 NX）。
+                    // SAFETY: vaddr 在源页表里确实存在（上面四级都 PRESENT）。
+                    unsafe {
+                        let _ = set_page_flags(src_pml4, vaddr, cow_flags);
+                    }
+
+                    // 子进程：映射同一物理页，同样只读。
+                    // SAFETY: dst_pml4 已建好内核半区，用户半区由本函数填充。
+                    if !unsafe { map_page(dst_pml4, vaddr, phys, cow_flags) } {
+                        return false;
+                    }
+                }
             }
         }
-        vaddr += PAGE_SIZE;
     }
     true
 }
 
 /// 获取页表项的权限标志
+///
+/// 返回 PTE 中除物理地址（bits 12–51）外的全部位：低位保护标志
+/// （PRESENT/RW/USER/...）以及高位标志（NX bit 63、AVL bits 52–62）。
+/// 旧实现用 `e & 0xFFF` 只取低 12 位，丢掉了 NX，导致 mprotect 与取指
+/// 缺页处理无法正确判别/清除 NO_EXEC。
 pub fn get_page_flags(pml4: usize, vaddr: usize) -> Option<u64> {
     unsafe {
         let e = entry(pml4, pml4_index(vaddr));
@@ -370,29 +491,34 @@ pub fn get_page_flags(pml4: usize, vaddr: usize) -> Option<u64> {
             return None;
         }
         let pdpt = (e & ADDR_MASK) as usize;
-        
+
         let e = entry(pdpt, pdpt_index(vaddr));
         if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
             return None;
         }
         let pd = (e & ADDR_MASK) as usize;
-        
+
         let e = entry(pd, pd_index(vaddr));
         if e & flags::PRESENT == 0 || e & flags::HUGE != 0 {
             return None;
         }
         let pt = (e & ADDR_MASK) as usize;
-        
+
         let e = entry(pt, pt_index(vaddr));
         if e & flags::PRESENT == 0 {
             return None;
         }
-        
-        Some(e & 0xFFF)
+
+        // 物理地址占 bits 12–51；其余位都是标志（含 NX bit 63）。
+        Some(e & !ADDR_MASK)
     }
 }
 
 /// 设置页表项的权限
+///
+/// `new_flags` 应为完整的标志位集合（建议用 [`get_page_flags`] 取出再修改）：
+/// 物理地址（bits 12–51）从现有 PTE 取，其余位用 `new_flags`。高位标志
+/// （如 NX bit 63）会按 `new_flags` 写入——传入则置位，不传（为 0）则清除。
 pub fn set_page_flags(pml4: usize, vaddr: usize, new_flags: u64) -> bool {
     unsafe {
         let e = entry(pml4, pml4_index(vaddr));

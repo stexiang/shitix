@@ -7,7 +7,7 @@
 /// E820 条目数存放地址（setup.S 写入）。
 const COUNT_ADDR: usize = 0x9_01E0;
 /// 条目数组基址，20 字节一条。
-const BASE: usize = 0x9_E000;
+const BASE: usize = 0x9_F000;
 /// setup.S 最多写这么多条。
 const MAX: usize = 128;
 /// E820 类型 1 = 可用 RAM。
@@ -40,7 +40,7 @@ pub fn get(i: usize) -> Option<Entry> {
         return None;
     }
     let p = (BASE + i * 20) as *const u8;
-    // SAFETY: i < count() <= 128，故 p..p+20 落在 0x9E000..0x9EA00 内，
+    // SAFETY: i < count() <= 128，故 p..p+20 落在 0x9F000..0x9FA00 内，
     // 属于 setup.S 写入且被恒等映射的低端内存。20 字节步进不保证 8 字节
     // 对齐，故用 read_unaligned。
     unsafe {

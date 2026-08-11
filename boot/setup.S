@@ -77,7 +77,7 @@ _setup_start:
     movw    %ax, %es
     xorl    %ebx, %ebx
     xorw    %bp, %bp
-    movw    $0xE000, %di        /* es:di = 0x9E000, 避开 setup 自身 */
+    movw    $0xF000, %di        /* es:di = 0x9F000, 避开 setup 自身与 kernel BSS */
 e820_loop:
     movl    $0x0000E820, %eax
     movl    $0x534D4150, %edx   /* 'SMAP' */
@@ -88,7 +88,7 @@ e820_loop:
     jne     e820_done
     incw    %bp
     addw    $20, %di
-    cmpw    $0xE000 + 20*128, %di
+    cmpw    $0xF000 + 20*128, %di
     jae     e820_done
     testl   %ebx, %ebx
     jnz     e820_loop
@@ -154,24 +154,35 @@ e820_done:
     lgdt    gdt_desc
     lidt    idt_desc
 
-/* CR4.PAE | CR4.PGE */
+/* CR4.PAE | CR4.PGE | CR4.OSFXSR | CR4.OSXMMEXCPT
+ * OSFXSR(0x200)+OSXMMEXCPT(0x400) 让 SSE/SSE2 指令可用并把 SSE 异常
+ * 导向 #XM 而非 #UD；不开的话任何访问 XMM 的指令（glibc 启动里很多，
+ * 例如 movd %ebx,%xmm0）会触发 #UD->SIGILL，用户程序无法启动。 */
     movl    %cr4, %eax
-    orl     $0xA0, %eax
+    orl     $0x6A0, %eax
     movl    %eax, %cr4
 
 /* CR3 = PML4 */
     movl    $PML4_ADDR, %eax
     movl    %eax, %cr3
 
-/* EFER.LME = 1 */
+/* EFER.LME = 1, EFER.SCE = 1 (syscall enable), EFER.NXE = 1 (NX bit)。
+ * NXE 必须开：mprotect 给 .data/.bss 设 NO_EXEC(位63) 时，若 NXE 关闭，
+ * 位63 是保留位，CPU 一访问就 #PF(reserved) 把 glibc 启动卡死。 */
     movl    $0xC0000080, %ecx
     rdmsr
-    orl     $0x100, %eax
+    orl     $0x901, %eax
     wrmsr
 
-/* 同时开 PG 和 PE，直接进入 long mode 的 compatibility 状态 */
+/* 同时开 PG 和 PE，直接进入 long mode 的 compatibility 状态。
+ * 必须同时置位 WP（CR0 bit 16）：WP=0 时内核态写忽略页表 R/W 位，
+ * fork 后所有用户页都被 cow_copy_page_table 标成只读，此时内核的
+ * copy_to_user（read 等）与 clone 的 CLONE_CHILD_SETTID/CLEARTID
+ * 会直接写到共享物理页、绕过写时复制，把父或子的堆/TLS 数据写穿，
+ * 表现为 fork 出的子进程（ls/cat）在 glibc malloc 里取到腐败 chunk 而 #GP。
+ * Linux 在 start_kernel 早期就置 WP=1，这里对齐。 */
     movl    %cr0, %eax
-    orl     $0x80000001, %eax
+    orl     $0x80010001, %eax
     movl    %eax, %cr0
 
 /* 远跳进 64 位代码段，落到 system (物理 0x10000) */

@@ -757,7 +757,7 @@ static SYS_CALL_TABLE: [SysFn; nr::NR_SYSCALLS] = {
     t[nr::RECVMMSG] = sys::recvmmsg; // 299
     t[nr::FANOTIFY_INIT] = sys::fanotify_init; // 300
     t[nr::FANOTIFY_MARK] = sys::fanotify_mark; // 301
-    t[nr::PRLIMIT64] = sys::prlimit; // 302
+    t[nr::PRLIMIT64] = sys::prlimit64; // 302
     t[nr::NAME_TO_HANDLE_AT] = sys::name_to_handle_at; // 303
     t[nr::OPEN_BY_HANDLE_AT] = sys::open_by_handle_at; // 304
     t[nr::CLOCK_ADJTIME] = sys::clock_adjtime; // 305
@@ -1215,7 +1215,6 @@ pub fn syscall_count() -> u64 {
 pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
     // SAFETY: 契约保证 regs 有效且我们独占。
     let regs = unsafe { &mut *regs };
-    // 调用号在 orig_rax（entry.S 的 `pushq %rax` 存的），同原版 orig_eax
     let call_nr = regs.orig_rax as usize;
 
     // SAFETY: 单核；系统调用不可重入到自身。
@@ -1235,6 +1234,7 @@ pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
     cur.errno = 0;
 
     let args = SysArgs::from_regs(regs);
+
     let ret = SYS_CALL_TABLE[call_nr](&args, regs);
 
     // 原版：先写返回值，再看 errno 是否要覆盖

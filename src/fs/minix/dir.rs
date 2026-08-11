@@ -116,6 +116,7 @@ pub unsafe fn fill_dirent(n: usize, pos: u64, out: &mut Dirent) -> i64 {
                 out.d_ino = e.ino as u64;
                 out.d_off = (e.offset + dirsize) as i64;
                 out.d_reclen = core::mem::size_of::<Dirent>() as u16;
+                out.d_type = 0; // minix v1 无文件类型，DT_UNKNOWN
                 out.d_name = [0; 32];
                 out.d_name[..e.name_len].copy_from_slice(&e.name[..e.name_len]);
                 (e.offset + dirsize) as i64

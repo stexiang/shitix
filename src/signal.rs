@@ -825,6 +825,21 @@ pub unsafe extern "C" fn do_signal(regs: *mut crate::traps::PtRegs) {
         let signum = unsafe {
             let pending = (*task).signal & !(*task).blocked;
             if pending == 0 {
+                // No more signals — restart syscall if needed (no handler delivered)
+                let r = &mut *regs;
+                let ret = r.rax as i64;
+                const NEG_EINTR: i64 = -(crate::klib::errno::EINTR as i64);
+                const NEG_ERESTARTSYS: i64 = -(crate::klib::errno::ERESTARTSYS as i64);
+                const NEG_ERESTARTNOHAND: i64 = -(crate::klib::errno::ERESTARTNOHAND as i64);
+                const NEG_ERESTARTNOINTR: i64 = -(crate::klib::errno::ERESTARTNOINTR as i64);
+                if ret == NEG_ERESTARTSYS || ret == NEG_ERESTARTNOHAND
+                    || ret == NEG_ERESTARTNOINTR
+                {
+                    r.rax = r.orig_rax;
+                    r.rip -= 2;
+                } else if ret == NEG_EINTR {
+                    // -EINTR with no handler: leave as-is (userspace sees it)
+                }
                 return;
             }
             // 取最低位的待处理信号。信号 n 用 bit n（见 send_sig），bit 0 不用。
@@ -849,10 +864,41 @@ pub unsafe extern "C" fn do_signal(regs: *mut crate::traps::PtRegs) {
             if h as usize == ign as usize {
                 continue;
             }
+            // SA_RESTART: 如果系统调用返回了 -EINTR/-ERESTARTSYS，
+            // 且 handler 设了 SA_RESTART，则回退 rip 并恢复 rax 以便
+            // sigreturn 之后重新执行该系统调用。
+            unsafe {
+                let r = &mut *regs;
+                let ret = r.rax as i64;
+                const NEG_EINTR: i64 = -(crate::klib::errno::EINTR as i64);
+                const NEG_ERESTARTSYS: i64 = -(crate::klib::errno::ERESTARTSYS as i64);
+                const NEG_ERESTARTNOHAND: i64 = -(crate::klib::errno::ERESTARTNOHAND as i64);
+                const NEG_ERESTARTNOINTR: i64 = -(crate::klib::errno::ERESTARTNOINTR as i64);
+
+                match ret {
+                    NEG_ERESTARTNOINTR => {
+                        // Always restart regardless of SA_RESTART
+                        r.rax = r.orig_rax;
+                        r.rip -= 2;
+                    }
+                    NEG_ERESTARTSYS | NEG_EINTR => {
+                        if action.flags.0 & SigActionFlags::SA_RESTART != 0 {
+                            r.rax = r.orig_rax;
+                            r.rip -= 2;
+                        }
+                        // else: leave -EINTR in rax, userspace sees the error
+                    }
+                    NEG_ERESTARTNOHAND => {
+                        // Handler is being delivered → convert to -EINTR
+                        r.rax = NEG_EINTR as u64;
+                    }
+                    _ => {}
+                }
+            }
             // 自定义 handler：在用户栈上搭信号帧
             // SAFETY: regs 指向当前内核栈上的 pt_regs。
             unsafe { setup_frame(regs, signum, h, action.flags.0) };
-            continue; // 已设好帧，返回用户态后 handler 会跑
+            continue;
         }
 
         // SIG_DFL：按原版 do_signal 的 default 分支分类。

@@ -63,8 +63,33 @@ static mut CURRENT_DEV: usize = 0;
 static mut RESET_FLAG: bool = false;
 /// 硬盘容量（扇区数）
 static mut HD_SIZES: [u64; MAX_HD] = [0; MAX_HD];
+/// 每个盘的扇区偏移。用于「合并镜像」：内核镜像占起始 1MB，根文件系统
+/// 紧随其后，挂 dev(3,0) 时要把所有读写的 LBA 加上这个偏移（2048 扇区）
+/// 才能落到根文件系统而不是内核引导区。偏移 0 = 整盘即文件系统（双盘布局）。
+static mut HD_OFFSET: [u64; MAX_HD] = [0; MAX_HD];
 /// 已初始化标志
 static mut INITIALIZED: bool = false;
+
+/// 设置某个盘的扇区偏移。用于合并镜像：根文件系统不在盘首，而在 1MB 偏移处。
+///
+/// # Safety
+/// 启动期、无并发 I/O 时调用一次。设置后该盘的所有读写都加上此偏移。
+pub unsafe fn set_offset(dev: usize, offset: u64) {
+    if dev < MAX_HD {
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(HD_OFFSET[dev]), offset);
+        }
+    }
+}
+
+/// 查询某个盘的容量（扇区数）。未探测到的盘返回 0。
+pub fn drive_size(dev: usize) -> u64 {
+    if dev < MAX_HD {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) }
+    } else {
+        0
+    }
+}
 
 // ---- I/O 辅助函数 ----
 
@@ -84,8 +109,7 @@ unsafe fn ide_status() -> u8 {
 /// # Safety
 /// IDE 控制器已初始化。
 unsafe fn ide_wait_ready() -> bool {
-    // SAFETY: I/O 端口读
-    for _ in 0..100000 {
+    for _ in 0..500000 {
         let status = unsafe { ide_status() };
         if (status & STATUS_BSY) == 0 {
             return (status & STATUS_DRDY) != 0;
@@ -100,7 +124,7 @@ unsafe fn ide_wait_ready() -> bool {
 /// # Safety
 /// IDE 控制器已初始化。
 unsafe fn ide_wait_drq() -> bool {
-    for _ in 0..100000 {
+    for _ in 0..500000 {
         let status = unsafe { ide_status() };
         if (status & STATUS_ERR) != 0 {
             return false;
@@ -136,6 +160,21 @@ unsafe fn ide_select_device(dev: usize, lba: u64) {
 
     unsafe {
         x86_64::instructions::port::PortWriteOnly::<u8>::new(IDE_PRIMARY_BASE + REG_DRIVE).write(drive_byte);
+    }
+}
+
+/// 选盘后让选择生效。ATA 规范要求写完 Drive/Head 寄存器后读 4 次状态
+/// （约 400ns）让设备完成切换；不读的话紧接的状态检查可能读到「上一个
+/// 选中的设备」的状态——缺从盘时上一个是从盘，状态停在 0xFF/0x00，
+/// 后续 wait_ready 永远超时。
+///
+/// # Safety
+/// IDE 控制器已初始化。
+unsafe fn ide_settle() {
+    unsafe {
+        for _ in 0..4 {
+            let _ = x86_64::instructions::port::PortReadOnly::<u8>::new(IDE_PRIMARY_BASE + REG_STATUS).read();
+        }
     }
 }
 
@@ -188,34 +227,28 @@ unsafe fn ide_write_sector(buf: *const u16) {
 /// `buf` 指向至少 512 字节的可写缓冲区。
 /// `dev` 是设备索引 (0=主盘, 1=从盘)。
 unsafe fn hd_read_sector(dev: usize, lba: u64, buf: *mut u8) -> bool {
-    if dev >= MAX_HD {
-        return false;
-    }
-
+    if dev >= MAX_HD { return false; }
     let size = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) };
-    if size == 0 || lba >= size {
-        return false;
-    }
+    if size == 0 || lba >= size { return false; }
 
-    // SAFETY: IDE 控制器端口是标准的
-    unsafe {
-        if !ide_wait_ready() {
-            return false;
+    // Retry up to 3 times — PIO can fail under timing variations
+    for _ in 0..3u32 {
+        unsafe {
+            // 必须先选盘再等就绪：状态寄存器反映的是「当前选中」的设备。
+            // 若上一个被选中的盘不存在（如缺从盘时探测过从盘），状态会停在
+            // BSY=1 或 DRDY=0，这里先选目标盘、读几次状态让选择生效。
+            ide_select_device(dev, lba);
+            ide_settle();
+            if !ide_wait_ready() { continue; }
+            ide_setup_lba(lba, 1);
+            ide_write_cmd(CMD_READ_SECTORS);
+            if ide_wait_drq() {
+                ide_read_sector(buf as *mut u16);
+                return true;
+            }
         }
-
-        ide_select_device(dev, lba);
-        ide_setup_lba(lba, 1); // 1 扇区
-
-        ide_write_cmd(CMD_READ_SECTORS);
-
-        if !ide_wait_drq() {
-            return false;
-        }
-
-        ide_read_sector(buf as *mut u16);
     }
-
-    true
+    false
 }
 
 /// 写一个扇区到 IDE 硬盘。
@@ -223,34 +256,25 @@ unsafe fn hd_read_sector(dev: usize, lba: u64, buf: *mut u8) -> bool {
 /// # Safety
 /// `buf` 指向至少 512 字节的可读缓冲区。
 unsafe fn hd_write_sector(dev: usize, lba: u64, buf: *const u8) -> bool {
-    if dev >= MAX_HD {
-        return false;
-    }
-
+    if dev >= MAX_HD { return false; }
     let size = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) };
-    if size == 0 || lba >= size {
-        return false;
-    }
+    if size == 0 || lba >= size { return false; }
 
-    // SAFETY: IDE 控制器端口是标准的
-    unsafe {
-        if !ide_wait_ready() {
-            return false;
+    for _ in 0..3u32 {
+        unsafe {
+            // 先选盘再等就绪，理由同 hd_read_sector。
+            ide_select_device(dev, lba);
+            ide_settle();
+            if !ide_wait_ready() { continue; }
+            ide_setup_lba(lba, 1);
+            ide_write_cmd(CMD_WRITE_SECTORS);
+            if ide_wait_drq() {
+                ide_write_sector(buf as *const u16);
+                return true;
+            }
         }
-
-        ide_select_device(dev, lba);
-        ide_setup_lba(lba, 1);
-
-        ide_write_cmd(CMD_WRITE_SECTORS);
-
-        if !ide_wait_drq() {
-            return false;
-        }
-
-        ide_write_sector(buf as *const u16);
     }
-
-    true
+    false
 }
 
 // ---- 探测 ----
@@ -261,46 +285,49 @@ unsafe fn hd_write_sector(dev: usize, lba: u64, buf: *const u8) -> bool {
 /// # Safety
 /// 启动期在中断禁用时调用。
 unsafe fn hd_identify(dev: usize) -> Option<u64> {
-    // SAFETY: IDE 端口操作
-    unsafe {
-        if !ide_wait_ready() {
-            return None;
-        }
+    // Retry up to 3 times — PIO probe is timing-sensitive
+    for attempt in 0..3u32 {
+        unsafe {
+            // Reset the drive first (only on first attempt)
+            if attempt == 0 {
+                // Select device and wait for it to be ready
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(IDE_PRIMARY_BASE + REG_DRIVE)
+                    .write(if dev == 0 { 0xA0u8 } else { 0xB0u8 });
+                // Small delay for device selection
+                for _ in 0..1000 { core::hint::spin_loop(); }
+            }
 
-        ide_select_device(dev, 0);
-        ide_setup_lba(0, 0);
+            if !ide_wait_ready() { continue; }
 
-        // 发送 IDENTIFY 命令
-        ide_write_cmd(CMD_IDENTIFY);
+            ide_select_device(dev, 0);
+            // Delay after select
+            for _ in 0..100 { core::hint::spin_loop(); }
+            ide_setup_lba(0, 0);
 
-        // 读状态检查设备是否存在
-        let status = ide_status();
-        if status == 0 {
-            return None; // 设备不存在
-        }
+            ide_write_cmd(CMD_IDENTIFY);
 
-        // 等待 BSY 清零
-        if !ide_wait_ready() {
-            return None;
-        }
+            // Check for floating bus (no device)
+            let status = ide_status();
+            if status == 0 || status == 0xFF {
+                return None; // No device on this port
+            }
 
-        // 检查 LBA48 能力位（word 83 & 0x0400）和 LBA28 总扇区数（word 60-61）
-        let mut identify_data: [u16; 256] = [0; 256];
-        let drq_ok = ide_wait_drq();
-        if drq_ok {
-            ide_read_sector(identify_data.as_mut_ptr());
+            // Wait for BSY to clear
+            if !ide_wait_ready() { continue; }
 
-            // word 60-61: 总 LBA28 可寻址扇区数
-            let lba28_sectors =
-                (identify_data[60] as u64) |
-                ((identify_data[61] as u64) << 16);
+            // Small delay — some drives need time after BSY clears
+            for _ in 0..1000 { core::hint::spin_loop(); }
 
-            if lba28_sectors > 0 {
-                return Some(lba28_sectors);
+            let mut identify_data: [u16; 256] = [0; 256];
+            if ide_wait_drq() {
+                ide_read_sector(identify_data.as_mut_ptr());
+                let lba28 = (identify_data[60] as u64) | ((identify_data[61] as u64) << 16);
+                if lba28 > 0 {
+                    return Some(lba28);
+                }
             }
         }
     }
-
     None
 }
 
@@ -309,56 +336,56 @@ unsafe fn hd_identify(dev: usize) -> Option<u64> {
 ///
 /// 对应原版 `do_hd_request()`。
 fn do_hd_request() {
-    // 检查是否有待处理的请求
     let major_num = HD_MAJOR as u32;
-    let (cmd, sector, nr_sectors, buffer_addr, bh) = {
+    let (cmd, sector, nr_sectors, buffer_addr, bh, dev) = {
         let req = unsafe { super::ll_rw::cur(major_num) };
-        (req.cmd, req.sector as u64, req.nr_sectors as u64, req.buffer, req.bh)
+        // Extract device minor from bh->b_dev
+        let d = unsafe { crate::fs::buffer::bh(req.bh).b_dev as u32 };
+        let drive = (d & 0xFF) as usize; // minor = drive index
+        (req.cmd, req.sector as u64, req.nr_sectors as u64, req.buffer, req.bh, drive)
     };
 
-    // All requests coming through this handler are for HD_MAJOR
-
-    // 从硬盘读/写
-    let max_lba = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[0])) };
-    if sector + nr_sectors > max_lba {
-        crate::pr_warn!("hd: sector {} out of range (max {})\n", sector + nr_sectors, max_lba);
+    // Read HD size for this drive
+    let max_lba = if dev < MAX_HD {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) }
+    } else { 0 };
+    // 合并镜像偏移：dev(3,0) 的根文件系统在 1MB 偏移处，把文件系统相对
+    // LBA 加上偏移得到盘上绝对 LBA。dev(3,1)（双盘布局）偏移为 0。
+    let offset = if dev < MAX_HD {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_OFFSET[dev])) }
+    } else { 0 };
+    if max_lba > 0 && sector + offset + nr_sectors > max_lba {
+        crate::pr_warn!("hd: sector {} out of range (max {})\n", sector + offset + nr_sectors, max_lba);
         unsafe { end_request(major_num, false) };
         return;
     }
 
     let buf = buffer_addr as *mut u8;
-    let bs = BLOCK_SIZE as u64;
-    let sec_per_block = bs / SECTOR_SIZE as u64; // BLOCK_SIZE / 512
 
+    // sector is already in 512-byte LBA units from make_request
     for i in 0..nr_sectors {
-        let lba = sector + i;
-        let block_off = (i * bs) as usize;
+        let sector_lba = sector + offset + i;
+        let byte_off = (i * SECTOR_SIZE as u64) as usize;
 
-        for s in 0..sec_per_block {
-            let sector_lba = lba * sec_per_block + s;
-            let sector_off = block_off + (s as usize) * SECTOR_SIZE;
+        let ok = if cmd == READ {
+            unsafe { hd_read_sector(dev, sector_lba, buf.add(byte_off)) }
+        } else if cmd == WRITE {
+            unsafe { hd_write_sector(dev, sector_lba, buf.add(byte_off) as *const u8) }
+        } else {
+            false
+        };
 
-            let ok = if cmd == READ {
-                // SAFETY: buf 由请求队列分配，IDE 端口标准
-                unsafe { hd_read_sector(0, sector_lba, buf.add(sector_off)) }
-            } else if cmd == WRITE {
-                // SAFETY: buf 由请求队列分配
-                unsafe { hd_write_sector(0, sector_lba, buf.add(sector_off) as *const u8) }
-            } else {
-                false
-            };
-
-            if !ok {
-                crate::pr_warn!("hd: I/O error at sector {}\n", sector_lba);
-                unsafe { end_request(major_num, false) };
-                return;
-            }
+        if !ok {
+            crate::pr_warn!("hd: I/O error at sector {} drive {}\n", sector_lba, dev);
+            unsafe { end_request(major_num, false) };
+            return;
         }
     }
 
     unsafe { end_request(major_num, true) };
     let _ = bh;
     let _ = major_num;
+    let _ = dev;
 }
 
 /// 检查 IDE 设备是否就绪。
@@ -373,6 +400,10 @@ fn is_ready() -> bool {
 /// # Safety
 /// 启动期调用一次，在中断启用之前。
 pub unsafe fn init() {
+    // Skip if already initialized
+    if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(INITIALIZED)) } {
+        return;
+    }
     crate::kprintln!("hd: probing IDE drives...");
 
     // 探测 primary IDE 通道的主盘和从盘

@@ -35,10 +35,10 @@ use crate::irq;
 use crate::klib::errno::{EAGAIN, KResult};
 use crate::klib::printk::Level;
 use crate::mm;
-use task::{HZ, STACK_MAGIC, flags};
+use task::{STACK_MAGIC, flags};
 
 // fs/ 与 drivers/ 需要这几个名字；原版它们都在 sched.h 里公开。
-pub use task::{NR_TASKS, Task, TaskState};
+pub use task::{NR_TASKS, Task, TaskState, HZ};
 
 /// syscall 指令的栈暂存区（定义在 entry.S .bss）。
 mod syscall_scratch {
@@ -366,6 +366,30 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
 /// 只能由 entry.S 的两个新任务入场点调用。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn schedule_tail() {
+    // CLONE_CHILD_SETTID：子进程把自己的 pid 写到 set_child_tid 指向的
+    // 用户地址（对应 Linux ret_from_fork 的 `put_user(tsk->pid, ...)`）。
+    // 必须在子进程上下文做：写自己的地址空间，COW 缺页会正确复制出私有页，
+    // 不会改穿父进程。在 clone 父进程上下文里写会腐败父进程的堆。
+    //
+    // 必须在 sti() 之前做：新任务被 switch_to 切进来时是关中断的，自己的栈
+    // 上没有配对的 restore_flags。若先 sti 再写，定时器中断可能在写之前抢断、
+    // 切到父进程；父进程 fork-parent atfork 会写共享 TLS 页，把子进程马上要
+    // 读的自指针（fs:0x10）覆盖掉，导致子进程 robust-list 初始化读到 0、写穿
+    // 第 0 页、级联腐败 malloc arena。先写完 SETTID 再开中断。
+    // SAFETY: current 在子进程上下文里有效；set_child_tid 为 0 时跳过。
+    unsafe {
+        let cur = current();
+        let tid = cur.pid;
+        let addr = cur.set_child_tid;
+        if addr != 0 {
+            // 写用户地址：若该页是 COW 只读，supervisor 写会触发 #PF，
+            // 由 traps.rs 的内核态 COW 处理路径复制后重试。
+            core::ptr::write_volatile(addr as *mut i32, tid);
+            // 一次性：写完即清，避免后续 fork 的子进程重复写老地址。
+            cur.set_child_tid = 0;
+        }
+    }
+
     // 新任务是在关中断状态下被 switch_to 切进来的（schedule 里关的），
     // 但它自己的栈上没有配对的 restore_flags，所以在这里显式恢复。
     // SAFETY: IDT/PIC 已就绪；新任务预期运行在开中断状态。

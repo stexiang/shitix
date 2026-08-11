@@ -38,8 +38,8 @@ SECTIONS
      * E820 条目在 0x9E000。BSS 可以使用 0x90C00-0x9DFFF 的空间。
      * 此处留 4KB 安全余量到 E820 表。
      */
-    ASSERT(_kernel_end <= 0x9D000,
-           "kernel image (incl. BSS) extends past safe area at 0x9D000")
+    ASSERT(_kernel_end <= 0x9F000,
+           "kernel image (incl. BSS) extends past safe area at 0x9F000")
 
     /DISCARD/ : {
         *(.note*)

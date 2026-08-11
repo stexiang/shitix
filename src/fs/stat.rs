@@ -142,7 +142,7 @@ impl Stat {
 ///
 /// # Safety
 /// `n` 必须是有效 inode 下标。
-unsafe fn cp_new_stat(n: usize, out: &mut Stat64) {
+pub unsafe fn cp_new_stat(n: usize, out: &mut Stat64) {
     // SAFETY: 契约转交。
     unsafe {
         let i = inode::inode(n);
@@ -181,13 +181,23 @@ pub unsafe fn sys_stat(path: &[u8], out: &mut Stat64) -> i64 {
 }
 
 /// 不展开符号链接的版本。对应原版 `sys_lstat()`。
-/// 见模块文档：目前与 [`sys_stat`] 行为相同。
+///
+/// 用 [`lnamei`]（`_namei(..., follow_links=false)`）解析，对末尾符号链接
+/// 返回链接自身的 inode，而非其目标——与原版 `lstat` 语义一致。
 ///
 /// # Safety
 /// 只能在进程上下文调用。
 pub unsafe fn sys_lstat(path: &[u8], out: &mut Stat64) -> i64 {
     // SAFETY: 契约转交。
-    unsafe { sys_stat(path, out) }
+    unsafe {
+        let n = match namei::lnamei(path) {
+            Ok(n) => n,
+            Err(e) => return -(e as i64),
+        };
+        cp_new_stat(n, out);
+        inode::iput(n);
+        0
+    }
 }
 
 /// 按 fd 查。对应原版 `sys_fstat()`。

@@ -139,7 +139,9 @@ pub unsafe fn sys_open(path: &[u8], flags: u32, m: u16) -> i64 {
             FsType::Chr => super::devices::chrdev_open(i_rdev),
             FsType::Blk => super::devices::blkdev_open(i_rdev),
             FsType::Minix => 0,
-            FsType::Ext2 => 0, // TODO: ext2 open
+            FsType::Ext2 => 0,
+            FsType::Proc => 0,
+            FsType::Tmpfs => 0,
             FsType::None => -(EINVAL as i64),
         };
         if r < 0 {

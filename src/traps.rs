@@ -222,13 +222,33 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
                 let is_write = (error_code & 2) != 0;   // 写访问
                 let is_present = (error_code & 1) != 0;  // 页面已映射（只是缺 RW）
                 let is_user = (error_code & 4) != 0;     // CPL=3 触发
+                // bit4 = instruction fetch（err=0x15 表示在 present+user 且带 NX
+                // 的页上取指）。常见成因：cow_copy_page_table 用 PRESENT|USER
+                // 重写了 PTE，但 mprotect 之前给某些页落过 NO_EXEC，或动态
+                // 链接器对 RELRO 段 mprotect(PROT_READ) 连带把同页代码标成 NX。
+                let is_fetch = (error_code & 0x10) != 0;
 
-                if pml4 != 0 && is_write && is_present && is_user {
-                    // 尝试处理 COW 页面故障
-                    if let Some(handled) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
-                        if handled {
-                            crate::pr_debug!("COW page fault handled at {:#x}", fault_addr);
-                            return;  // 成功处理，恢复执行
+                if pml4 != 0 && is_present && is_user {
+                    // 写访问走 COW 路径。
+                    if is_write {
+                        if let Some(handled) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
+                            if handled {
+                                crate::pr_debug!("COW page fault handled at {:#x}", fault_addr);
+                                return;  // 成功处理，恢复执行
+                            }
+                        }
+                    }
+                    // 取指故障：页面已映射且属用户空间，仅因 NX 位被拒。
+                    // 用户态代码段本应可执行——直接清掉 NO_EXEC 让其继续。
+                    // set_page_flags 会保留 RW/USER/PRESENT，只重写低标志，
+                    // 用 get_page_flags 取当前标志再清 NO_EXEC 即可。
+                    if is_fetch {
+                        if let Some(f) = crate::mm::paging::get_page_flags(pml4, fault_addr as usize) {
+                            let exec_flags = f & !crate::mm::paging::flags::NO_EXEC;
+                            if crate::mm::paging::set_page_flags(pml4, fault_addr as usize, exec_flags) {
+                                crate::pr_debug!("exec page fault handled at {:#x}", fault_addr);
+                                return;
+                            }
                         }
                     }
                 }
@@ -240,6 +260,27 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
         let signr = info.map(|i| i.signr).unwrap_or(SIGSEGV);
         send_sig_stub(signr, name, regs, error_code, cr2);
         return;
+    }
+
+    // 内核态缺页。CR0.WP=1 后，内核对 COW 只读用户页的写（copy_to_user，
+    // 如 read() 把数据拷进子进程缓冲区）会以 supervisor write-protect 形式
+    // 缺页（err: P=1 W=1 U=0）。按 COW 复制后重试写即可——这正是 WP=1
+    // 相对 WP=0 的关键收益：内核写不再穿透共享页 corrupt 父进程。
+    if v == 14 {
+        if let Some(fault_addr) = cr2 {
+            let is_write = (error_code & 2) != 0;
+            let is_present = (error_code & 1) != 0;
+            let is_user_page = (error_code & 4) == 0;  // supervisor 访问用户页
+            if is_write && is_present && is_user_page {
+                let pml4 = unsafe { (*sched::task_ptr(sched::current_index())).pml4 };
+                if pml4 != 0 {
+                    if let Some(true) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
+                        crate::pr_debug!("COW supervisor fault handled at {:#x}", fault_addr);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     die_if_kernel(name, regs, error_code, cr2, v);
@@ -255,6 +296,21 @@ fn send_sig_stub(signr: u32, name: &str, regs: &PtRegs, error_code: u64, cr2: Op
     crate::pr!(Level::Err,
                "{}: sig {} at rip={:#x} err={:#x} cr2={:#x} (user)",
                name, signr, regs.rip, error_code, cr2.unwrap_or(0));
+
+    // DEBUG: dump user rsp/rax and the return address on the user stack,
+    // 以定位用户态为何跳到错误地址（如 0x1000）。
+    if signr == 11 {
+        crate::pr!(Level::Err, "USER regs: rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rbp={:#x}",
+                   regs.rsp, regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rbp);
+        let usp = regs.rsp as usize;
+        // 读用户栈顶 8 个 u64（返回地址等）
+        for k in 0..8usize {
+            let addr = usp + k*8;
+            // SAFETY: 仅诊断读，地址来自用户 rsp；可能触发嵌套 #PF，但顶层已 in_panic 风险低
+            let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            crate::pr!(Level::Err, "  ustack[{:#x}] = {:#x}", addr, v);
+        }
+    }
 
     let nr = sched::current_index();
 

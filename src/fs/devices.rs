@@ -169,9 +169,11 @@ pub unsafe fn chrdev_read(rdev: u16, pos: u64, buf: &mut [u8]) -> i64 {
 pub unsafe fn chrdev_write(rdev: u16, pos: u64, buf: &[u8]) -> i64 {
     // SAFETY: 契约转交给具体驱动。
     unsafe {
-        match get_chrfops(major(rdev)) {
+        let ma = major(rdev);
+        let mi = minor(rdev);
+        match get_chrfops(ma) {
             Some(CharDev::Tty) => char_dev::tty::tty_write(buf),
-            Some(CharDev::Mem) => char_dev::mem::write(minor(rdev), pos, buf),
+            Some(CharDev::Mem) => char_dev::mem::write(mi, pos, buf),
             None => -(ENXIO as i64),
         }
     }

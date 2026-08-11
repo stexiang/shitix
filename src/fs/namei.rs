@@ -11,10 +11,12 @@
 //!    （因为解析过程中会睡，用户页可能被换出）。我们目前所有调用方
 //!    都在内核态（用户态要等 `execve`），所以直接收 `&[u8]`。
 //!    `verify_area`/`getname` 那一层等 `mm/mmap.c` 到位再加。
-//! 2. **不做符号链接展开**。原版 `_namei` 的 `follow_link` 循环
-//!    （带 `current->link_count` 防环）依赖 `minix_follow_link`，
-//!    而 `minix/symlink.c` 没移植（见 `minix/mod.rs` 的说明）。
-//!    遇到符号链接会因为 `i_op == FsType::None` 而返回 `-EINVAL`。
+//! 2. **符号链接展开**。中间分量与（默认的）末尾分量都跟随符号链接，
+//!    对应原版 `_namei`/`dir_namei` 的 `follow_link` 循环（带
+//!    `current->link_count` 防环，超过 5 层返回 `-ELOOP`）。ext4 的快速
+//!    链接（目标内联在 `i_block`）与慢链接（目标在数据块）都支持；
+//!    minix 符号链接未移植，遇到 minix 链接返回 `-EIO`。`lnamei`（`lstat`
+//!    用）不跟随末尾链接。
 //! 3. **权限检查简化**。原版 `permission()` 比对 `current->euid`/`egid`
 //!    与 inode 的 uid/gid 选 owner/group/other 三组权限位，root
 //!    （`suser()`）全通过。我们的 `Task` 还没有 uid 字段
@@ -27,7 +29,7 @@ use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::super_block;
 use crate::fs::{MAY_EXEC, MAY_READ, MAY_WRITE, MS_RDONLY, mode, oflags};
 use crate::klib::errno::{
-    EACCES, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, ENOTDIR, EPERM, EROFS,
+    EACCES, EEXIST, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM, EROFS,
 };
 
 /// 路径分量的最大长度。对应原版 `include/linux/limits.h` 的 `NAME_MAX 255`，
@@ -67,12 +69,136 @@ fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&c| c == b'/').filter(|s| !s.is_empty())
 }
 
+/// 读符号链接目标。对应各 fs 的 `*_follow_link` 里取 `link` 的那一步：
+/// 快速链接目标在 inode 内联区，慢链接在第一个数据块。返回目标字节切片
+/// （不含 NUL）。非符号链接或读不出返回 `None`。
+///
+/// 目前只支持 ext4（`extra-drivers`）；minix 符号链接未移植，返回 `None`。
+///
+/// # Safety
+/// 只能在进程上下文调用。`ip` 是已 `iget` 的 inode。
+unsafe fn read_symlink_target(ip: usize) -> Option<([u8; 256], usize)> {
+    // SAFETY: 契约转交。
+    unsafe {
+        let iop = core::ptr::addr_of!((*inode::inode_ptr(ip)).i_op).read_volatile();
+        let im = core::ptr::addr_of!((*inode::inode_ptr(ip)).i_mode).read_volatile();
+        if !mode::is_lnk(im) {
+            return None;
+        }
+        match iop {
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::ops::full::read_symlink(ip),
+            _ => None,
+        }
+    }
+}
+
+/// 跟随一个符号链接。对应原版 `follow_link(dir, inode, flag, mode, &res)`。
+///
+/// `dir` 是含这个链接的目录（相对链接的解析起点），`inode` 是链接自身。
+/// 若 `inode` 不是符号链接，直接返回它。否则读出目标字符串：目标以 `/`
+/// 开头从根解析，否则从 `dir` 解析（同原版 `open_namei(link, ..., dir)`）。
+///
+/// `link_count` 防环：超过 5 层返回 `-ELOOP`（同原版）。`dir` 与 `inode`
+/// 的引用计数归这个函数管：成功时返回的 inode 已 `iget`，`dir`/`inode`
+/// 已 `iput`；失败时两者也已 `iput`。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+unsafe fn follow_link(dir: usize, inode: usize) -> Result<usize, i32> {
+    // SAFETY: 契约转交。
+    unsafe {
+        if dir == NIL || inode == NIL {
+            if dir != NIL { inode::iput(dir); }
+            if inode != NIL { inode::iput(inode); }
+            return Err(ENOENT);
+        }
+        let im = core::ptr::addr_of!((*inode::inode_ptr(inode)).i_mode).read_volatile();
+        if !mode::is_lnk(im) {
+            // 不是链接：原版返回 inode 本身，dir 释放。
+            inode::iput(dir);
+            return Ok(inode);
+        }
+        // 防环
+        let lc = core::ptr::addr_of_mut!(
+            (*crate::sched::task_ptr(crate::sched::current_index())).link_count
+        );
+        let cur_lc = lc.read_volatile();
+        if cur_lc > 5 {
+            inode::iput(dir);
+            inode::iput(inode);
+            return Err(ELOOP);
+        }
+        let (tgt, n) = match read_symlink_target(inode) {
+            Some(v) => v,
+            None => {
+                inode::iput(dir);
+                inode::iput(inode);
+                return Err(EIO);
+            }
+        };
+        let target = &tgt[..n];
+        // 解析起点：目标以 / 开头用根，否则用 dir（含链接的目录）。
+        // 原版 open_namei(link,...,dir) 里 dir 作为相对解析的 base。
+        let base = if target.first() == Some(&b'/') {
+            inode::iput(dir);
+            super_block::root_inode()
+        } else {
+            dir
+        };
+        if base == NIL {
+            inode::iput(inode);
+            return Err(ENOENT);
+        }
+        lc.write_volatile(cur_lc + 1);
+        let r = _namei(target, base, true);
+        lc.write_volatile(cur_lc);
+        // _namei 成功时返回的 inode 已 iget；它内部已 iput(base)。
+        // inode（链接自身）始终释放。
+        inode::iput(inode);
+        r
+    }
+}
+
+/// 解析路径的核心。对应原版 `_namei(path, base, follow_links, &res)`。
+///
+/// `base` 是相对路径的起点（已 `iget`，函数内 `iput`）。`follow_links`
+/// 为真则对最终分量也跟随符号链接（`namei`/`open_namei` 行为），为假则
+/// 不跟（`lnamei` 行为，用于 `lstat`/`readlink`）。
+///
+/// 成功返回的 inode 已 `iget`，调用方负责 `iput`。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+unsafe fn _namei(path: &[u8], base: usize, follow_links: bool) -> Result<usize, i32> {
+    // SAFETY: 契约转交。
+    unsafe {
+        let (dir, last) = dir_namei_base(path, base)?;
+        if last.is_empty() {
+            // 路径以 / 结尾或就是 "/"：目标就是那个目录
+            return Ok(dir);
+        }
+        let inode = match lookup_one(dir, last) {
+            Ok(n) => n,
+            Err(e) => {
+                inode::iput(dir);
+                return Err(e);
+            }
+        };
+        if follow_links {
+            // follow_link 会 iput(dir) 与链接 inode，返回已 iget 的目标
+            follow_link(dir, inode)
+        } else {
+            inode::iput(dir);
+            Ok(inode)
+        }
+    }
+}
+
 /// 解析路径，返回**最后一个分量的父目录** inode 与那个分量的名字。
-/// 对应原版 `dir_namei()`。
+/// 对应原版 `dir_namei()`。中间分量遇到符号链接会跟随（同原版）。
 ///
 /// 返回的 inode 已 `iget`，调用方负责 `iput`。
-///
-/// 路径以 `/` 开头则从根开始，否则从 `pwd` 开始（同原版）。
 ///
 /// # Safety
 /// 只能在进程上下文调用。
@@ -87,10 +213,20 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
         if start == NIL {
             return Err(ENOENT);
         }
+        dir_namei_base(path, start)
+    }
+}
 
-        // 最后一个分量单独拿出来
-        let mut parts: [&[u8]; 0] = [];
-        let _ = &mut parts;
+/// `dir_namei` 的实现，接受显式起点（已 `iget`，函数内 `iput`）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+unsafe fn dir_namei_base(path: &[u8], start: usize) -> Result<(usize, &[u8]), i32> {
+    // SAFETY: 契约转交。
+    unsafe {
+        if start == NIL {
+            return Err(ENOENT);
+        }
         let all: &[u8] = path;
         // 找最后一个 '/' 之后的部分
         let (dir_part, last) = match all.iter().rposition(|&c| c == b'/') {
@@ -98,7 +234,7 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
             None => (&all[..0], all),
         };
 
-        // 从起点开始逐级 lookup
+        // 从起点开始逐级 lookup，中间分量跟随符号链接
         (*inode::inode_ptr(start)).i_count += 1;
         let mut cur = start;
         for comp in components(dir_part) {
@@ -106,7 +242,6 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
                 inode::iput(cur);
                 return Err(ENAMETOOLONG);
             }
-            // 用裸指针避免多个 &mut 别名
             let cur_mode = core::ptr::addr_of!((*inode::inode_ptr(cur)).i_mode).read_volatile();
             if !mode::is_dir(cur_mode) {
                 inode::iput(cur);
@@ -123,8 +258,13 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
                     return Err(e);
                 }
             };
-            inode::iput(cur);
-            cur = next;
+            // 中间分量若是符号链接，跟随它（原版 dir_namei 里的 follow_link）。
+            // follow_link 会 iput(cur) 与链接 inode，返回已 iget 的新 cur。
+            let followed = match follow_link(cur, next) {
+                Ok(n) => n,
+                Err(e) => return Err(e),
+            };
+            cur = followed;
         }
         let final_mode = core::ptr::addr_of!((*inode::inode_ptr(cur)).i_mode).read_volatile();
         if !mode::is_dir(final_mode) {
@@ -196,12 +336,14 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
             FsType::Ext2 => super::ext4::namei::lookup(dir, name),
             #[cfg(not(feature = "extra-drivers"))]
             FsType::Ext2 => super::minix::namei::lookup(dir, name),
+            FsType::Proc => super::proc::lookup(dir, name),
+            FsType::Tmpfs => super::tmpfs::lookup(dir, name),
             _ => Err(ENOTDIR),
         }
     }
 }
 
-/// 解析一个完整路径。对应原版 `namei()`。
+/// 解析一个完整路径。对应原版 `namei()`，会跟随末尾的符号链接。
 ///
 /// 返回的 inode 已 `iget`，调用方负责 `iput`。
 ///
@@ -210,14 +352,36 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
 pub unsafe fn namei(path: &[u8]) -> Result<usize, i32> {
     // SAFETY: 契约转交。
     unsafe {
-        let (dir, last) = dir_namei(path)?;
-        if last.is_empty() {
-            // 路径以 / 结尾（或就是 "/"）：目标就是那个目录
-            return Ok(dir);
+        let start = if path.first() == Some(&b'/') {
+            super_block::root_inode()
+        } else {
+            super_block::pwd_inode()
+        };
+        if start == NIL {
+            return Err(ENOENT);
         }
-        let r = lookup_one(dir, last);
-        inode::iput(dir);
-        r
+        _namei(path, start, true)
+    }
+}
+
+/// 解析路径但不跟随末尾符号链接。对应原版 `lnamei()`（`lstat`/`readlink` 用）。
+///
+/// 返回的 inode 已 `iget`，调用方负责 `iput`。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn lnamei(path: &[u8]) -> Result<usize, i32> {
+    // SAFETY: 契约转交。
+    unsafe {
+        let start = if path.first() == Some(&b'/') {
+            super_block::root_inode()
+        } else {
+            super_block::pwd_inode()
+        };
+        if start == NIL {
+            return Err(ENOENT);
+        }
+        _namei(path, start, false)
     }
 }
 
@@ -267,8 +431,11 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
                     inode::iput(dir);
                     return Err(EEXIST);
                 }
-                inode::iput(dir);
-                n
+                // 原版 open_namei 对已存在的目标会 follow_link（除非 O_NOFOLLOW，
+                // 这里没移植 O_NOFOLLOW，统一跟随，与原版一致）。open 拿到
+                // 的应是链接指向的真实文件。
+                let followed = follow_link(dir, n);
+                followed?
             }
             Err(e) => {
                 if e != ENOENT || flags & oflags::O_CREAT == 0 {

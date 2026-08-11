@@ -547,6 +547,10 @@ pub unsafe fn end_request(m: u32, uptodate: bool) {
             req(n).bh = next_b;
             bh(b).b_reqnext = NIL;
             bh(b).b_uptodate = uptodate;
+            // Clear b_dirt on successful write completion (crucial for buffer reuse)
+            if req(n).cmd == WRITE && uptodate {
+                bh(b).b_dirt = false;
+            }
             buffer::unlock_buffer(b);
             if next_b != NIL {
                 // 还有后续缓冲：把请求的游标挪过去，本次调用结束。
@@ -575,6 +579,13 @@ pub unsafe fn end_request(m: u32, uptodate: bool) {
         }
         req(n).dev = None;
         (*core::ptr::addr_of_mut!(WAIT_FOR_REQUEST)).wake_up();
+
+        // Chain to next request if queued
+        if blk_dev(m as usize).current_request != NIL {
+            if let Some(f) = blk_dev(m as usize).request_fn {
+                f();
+            }
+        }
     }
 }
 

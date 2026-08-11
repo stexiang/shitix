@@ -175,3 +175,7 @@ errnos! {
 
 /// `EAGAIN` 的别名，对应原版 `#define EWOULDBLOCK EAGAIN`。
 pub const EWOULDBLOCK: i32 = EAGAIN;
+
+/// `struct utsname` 每个字段的长度（含结尾 NUL），对应 glibc 的
+/// `_UTSNAME_LENGTH`（64 + 1）。
+pub const utsname_len: usize = 65;

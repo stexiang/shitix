@@ -25,9 +25,11 @@ pub mod minix;
 pub mod namei;
 pub mod open;
 pub mod pipe;
+pub mod proc;
 pub mod read_write;
 pub mod stat;
 pub mod super_block;
+pub mod tmpfs;
 
 pub use buffer::{BLOCK_SIZE, bread, brelse, getblk, sync_dev};
 pub use devices::{block_read, block_write, chrdev_read, chrdev_write};
@@ -46,7 +48,7 @@ pub use inode::{Inode, iget, iput};
 pub use super_block::{SuperBlock, mount_root};
 
 /// 原版 `NR_OPEN 256`。每进程 fd 上限。与 Task 的 filp 数组大小一致。
-pub const NR_OPEN: usize = 16;
+pub const NR_OPEN: usize = 64;
 /// 原版 `NR_INODE 2048`，缩到 64。
 pub const NR_INODE: usize = 64;
 /// 原版 `NR_FILE 1024`，缩到 32。
@@ -155,13 +157,18 @@ pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
 
-/// 目录项，返回给 `getdents` 一类的调用。对应原版 `include/linux/dirent.h`。
+/// 目录项，返回给 `getdents`/`getdents64`。对应 `struct linux_dirent64`：
+/// `d_ino`(u64) `d_off`(s64) `d_reclen`(u16) `d_type`(u8) `d_name[]`。
+/// glibc 的 `readdir` 走 `getdents64`，缺 `d_type` 会让 `d_name` 错位一格
+///（名字丢首字节），所以这里必须有 `d_type`。
 #[repr(C)]
 pub struct Dirent {
     pub d_ino: u64,
     pub d_off: i64,
     pub d_reclen: u16,
-    /// 原版是 `char d_name[NAME_MAX+1]`，NAME_MAX=255；minix 名字最长 30，取 32。
+    pub d_type: u8,
+    /// 名字。minix 最长 30，ext4 最长 255；这里取 32（与原版 `NAME_MAX+1` 风格
+    /// 一致，超长由各 fs 的 `fill_dirent` 截断）。`getdents` 一次返回一项。
     pub d_name: [u8; 32],
 }
 

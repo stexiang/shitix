@@ -16,7 +16,7 @@ use crate::fs::file_table::filp;
 use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::open::fd_to_filp;
 use crate::fs::{Dirent, SEEK_CUR, SEEK_END, SEEK_SET, mode, oflags};
-use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENOTDIR, ESPIPE};
+use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENOTDIR, EROFS, ESPIPE};
 
 /// 读。对应原版 `sys_read()`。
 ///
@@ -64,6 +64,8 @@ pub unsafe fn read(fd: usize, buf: &mut [u8]) -> i64 {
             }
             #[cfg(not(feature = "extra-drivers"))]
             FsType::Ext2 => -(ENOSYS as i64),
+            FsType::Proc => super::proc::read(n, pos, buf),
+            FsType::Tmpfs => super::tmpfs::read(n, pos, buf),
             FsType::None => -(EINVAL as i64),
         };
         if r > 0 {
@@ -109,7 +111,8 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
         };
 
         let m = inode::inode(n).i_mode;
-        let r = match inode::inode(n).i_op {
+        let iop = inode::inode(n).i_op;
+        let r = match iop {
             FsType::Chr => super::devices::chrdev_write(inode::inode(n).i_rdev, pos, buf),
             FsType::Blk => super::devices::block_write(inode::inode(n).i_rdev, pos, buf),
             FsType::Minix => {
@@ -127,6 +130,8 @@ pub unsafe fn write(fd: usize, buf: &[u8]) -> i64 {
             }
             #[cfg(not(feature = "extra-drivers"))]
             FsType::Ext2 => -(ENOSYS as i64),
+            FsType::Proc => -(EROFS as i64),
+            FsType::Tmpfs => super::tmpfs::write(n, pos, buf),
             FsType::None => -(EINVAL as i64),
         };
         if r > 0 {
@@ -208,10 +213,18 @@ pub unsafe fn readdir(fd: usize, out: &mut Dirent) -> i64 {
             return -(EBADF as i64);
         }
         let ip = inode::inode_ptr(n);
-        if (*ip).i_op != FsType::Minix || !mode::is_dir((*ip).i_mode) {
+        let i_op = unsafe { core::ptr::addr_of!((*ip).i_op).read_volatile() };
+        if !mode::is_dir(unsafe { core::ptr::addr_of!((*ip).i_mode).read_volatile() }) {
             return -(ENOTDIR as i64);
         }
-        let r = super::minix::dir::fill_dirent(n, pos, out);
+        let r = match i_op {
+            FsType::Minix => super::minix::dir::fill_dirent(n, pos, out),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::dir::fill_dirent(n, pos, out),
+            FsType::Proc => super::proc::fill_dirent(n, pos, out),
+            FsType::Tmpfs => super::tmpfs::fill_dirent(n, pos, out),
+            _ => -(ENOTDIR as i64),
+        };
         if r > 0 {
             filp(f).f_pos = r as u64;
             // 原版 readdir 成功返回 1（读到一项）
