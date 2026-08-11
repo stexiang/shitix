@@ -41,6 +41,39 @@
   execve 现在把 `fs_base`/`gs_base` 清 0 并同步写 MSR（新程序靠 arch_prctl
   重新建 TLS）。
 
+### 合并镜像启动修复（2026-08-10）
+
+#### 问题
+单盘「合并镜像」（`lfs-docker/build-combined.sh`：shitix.img 占起始 1MB
++ LFS rootfs 紧随其后）启动失败：
+- LFS 启动路径硬编码 `mkdev(3,1)`（从盘），单盘环境从盘不存在 →
+  `I/O error at sector 2 drive 1` → MINIX superblock 读不出 → `IDE not found`。
+- 即使改挂 `mkdev(3,0)`（主盘），rootfs 在 1MB 偏移处（扇区 2048），
+  原 hd 驱动读绝对 LBA 不加偏移，会读到引导区而非 ext4 超级块。
+- 更隐蔽：探测过「不存在的从盘」后，IDE 控制器选中状态留在从盘（浮空
+  0xFF/0x00），随后读主盘时 `hd_read_sector` 先 `ide_wait_ready` 再
+  `ide_select_device`——状态寄存器反映的还是上个选中的（不存在的）从盘，
+  BSY 永远不清，主盘读全部「not ready」超时。
+
+#### 修复
+- **hd 偏移**（`src/drivers/block/hd.rs`）：新增 `HD_OFFSET[dev]` +
+  `set_offset()`/`drive_size()`。`do_hd_request` 把文件系统相对 LBA 加偏移
+  得到盘上绝对 LBA，并按绝对 LBA 做越界检查。
+- **选盘-就绪顺序**（`hd_read_sector`/`hd_write_sector`）：改为先
+  `ide_select_device` → `ide_settle()`（读 4 次状态让选盘生效，ATA 规范
+  要求写完 Drive/Head 后约 400ns）→ 再 `ide_wait_ready`。修复缺从盘后
+  主盘读全部超时的根因。
+- **LFS 启动回退**（`src/lib.rs` fs_init_thread）：先试从盘 `mkdev(3,1)`
+  （双盘布局）；失败且主盘 >2048 扇区（说明后面有 rootfs）时，给主盘设
+  偏移 2048 再试 `mkdev(3,0)`（合并镜像）。纯 1MB 引导镜像不触发回退，
+  避免刷「out of range」警告。
+
+#### 验证
+- 合并镜像（单盘 shitix-lfs-combined.img）：`VFS: Mounted root` →
+  `/sbin/init` 执行（`init: must be run as PID 1`）。
+- 双盘（shitix.img + lfs3.img）：无回归，`/sbin/init` 执行。
+- 默认引导（单 1MB 镜像）：干净落到 selftest，`boot ok`。
+
 ### 已知未解决问题
 - `ls`/`cat`（exec 后做较多 malloc 的命令）在 `rip=0x42c08e` 触发
   `general protection: sig 11 err=0x0`（#GP，非 #PF）。故障指令

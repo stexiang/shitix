@@ -747,10 +747,27 @@ fn fs_init_thread(_arg: u64) {
             }
         }
 
-        // 2. Mount root: try IDE, fallback to ramdisk
+        // 2. Mount root: try IDE slave (dual-drive), then IDE master at 1MB
+        //    offset (combined image: kernel + rootfs on one disk).
         sprintln!("LFS: mounting root...");
-        let ide_dev = fs::mkdev(3, 1);
-        let mounted = unsafe { fs::mount_root(ide_dev, 0) };
+        let ide_slave = fs::mkdev(3, 1);
+        let mut mounted = unsafe { fs::mount_root(ide_slave, 0) };
+        if !mounted {
+            // 合并镜像：内核占起始 1MB（2048 扇区），根文件系统紧随其后。
+            // 只在主盘容量明显大于 1MB 时才试——纯引导镜像（1MB）后面没有根文件系统，
+            // 硬试只会刷一屏「out of range」警告。
+            let master_sectors = drivers::block::hd::drive_size(0);
+            if master_sectors > 2048 {
+                sprintln!("LFS: slave drive absent, trying combined image on master...");
+                unsafe { drivers::block::hd::set_offset(0, 2048) };
+                let ide_master = fs::mkdev(3, 0);
+                mounted = unsafe { fs::mount_root(ide_master, 0) };
+                if !mounted {
+                    // 失败则复位偏移，避免影响后续（如果有）对 master 的访问
+                    unsafe { drivers::block::hd::set_offset(0, 0) };
+                }
+            }
+        }
         unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
 
         if mounted {

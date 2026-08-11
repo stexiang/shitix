@@ -63,8 +63,33 @@ static mut CURRENT_DEV: usize = 0;
 static mut RESET_FLAG: bool = false;
 /// 硬盘容量（扇区数）
 static mut HD_SIZES: [u64; MAX_HD] = [0; MAX_HD];
+/// 每个盘的扇区偏移。用于「合并镜像」：内核镜像占起始 1MB，根文件系统
+/// 紧随其后，挂 dev(3,0) 时要把所有读写的 LBA 加上这个偏移（2048 扇区）
+/// 才能落到根文件系统而不是内核引导区。偏移 0 = 整盘即文件系统（双盘布局）。
+static mut HD_OFFSET: [u64; MAX_HD] = [0; MAX_HD];
 /// 已初始化标志
 static mut INITIALIZED: bool = false;
+
+/// 设置某个盘的扇区偏移。用于合并镜像：根文件系统不在盘首，而在 1MB 偏移处。
+///
+/// # Safety
+/// 启动期、无并发 I/O 时调用一次。设置后该盘的所有读写都加上此偏移。
+pub unsafe fn set_offset(dev: usize, offset: u64) {
+    if dev < MAX_HD {
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(HD_OFFSET[dev]), offset);
+        }
+    }
+}
+
+/// 查询某个盘的容量（扇区数）。未探测到的盘返回 0。
+pub fn drive_size(dev: usize) -> u64 {
+    if dev < MAX_HD {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) }
+    } else {
+        0
+    }
+}
 
 // ---- I/O 辅助函数 ----
 
@@ -138,6 +163,21 @@ unsafe fn ide_select_device(dev: usize, lba: u64) {
     }
 }
 
+/// 选盘后让选择生效。ATA 规范要求写完 Drive/Head 寄存器后读 4 次状态
+/// （约 400ns）让设备完成切换；不读的话紧接的状态检查可能读到「上一个
+/// 选中的设备」的状态——缺从盘时上一个是从盘，状态停在 0xFF/0x00，
+/// 后续 wait_ready 永远超时。
+///
+/// # Safety
+/// IDE 控制器已初始化。
+unsafe fn ide_settle() {
+    unsafe {
+        for _ in 0..4 {
+            let _ = x86_64::instructions::port::PortReadOnly::<u8>::new(IDE_PRIMARY_BASE + REG_STATUS).read();
+        }
+    }
+}
+
 /// 编程 IDE 扇区计数、LBA 地址。
 ///
 /// # Safety
@@ -194,8 +234,12 @@ unsafe fn hd_read_sector(dev: usize, lba: u64, buf: *mut u8) -> bool {
     // Retry up to 3 times — PIO can fail under timing variations
     for _ in 0..3u32 {
         unsafe {
-            if !ide_wait_ready() { continue; }
+            // 必须先选盘再等就绪：状态寄存器反映的是「当前选中」的设备。
+            // 若上一个被选中的盘不存在（如缺从盘时探测过从盘），状态会停在
+            // BSY=1 或 DRDY=0，这里先选目标盘、读几次状态让选择生效。
             ide_select_device(dev, lba);
+            ide_settle();
+            if !ide_wait_ready() { continue; }
             ide_setup_lba(lba, 1);
             ide_write_cmd(CMD_READ_SECTORS);
             if ide_wait_drq() {
@@ -218,8 +262,10 @@ unsafe fn hd_write_sector(dev: usize, lba: u64, buf: *const u8) -> bool {
 
     for _ in 0..3u32 {
         unsafe {
-            if !ide_wait_ready() { continue; }
+            // 先选盘再等就绪，理由同 hd_read_sector。
             ide_select_device(dev, lba);
+            ide_settle();
+            if !ide_wait_ready() { continue; }
             ide_setup_lba(lba, 1);
             ide_write_cmd(CMD_WRITE_SECTORS);
             if ide_wait_drq() {
@@ -303,8 +349,13 @@ fn do_hd_request() {
     let max_lba = if dev < MAX_HD {
         unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_SIZES[dev])) }
     } else { 0 };
-    if max_lba > 0 && sector + nr_sectors > max_lba {
-        crate::pr_warn!("hd: sector {} out of range (max {})\n", sector + nr_sectors, max_lba);
+    // 合并镜像偏移：dev(3,0) 的根文件系统在 1MB 偏移处，把文件系统相对
+    // LBA 加上偏移得到盘上绝对 LBA。dev(3,1)（双盘布局）偏移为 0。
+    let offset = if dev < MAX_HD {
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HD_OFFSET[dev])) }
+    } else { 0 };
+    if max_lba > 0 && sector + offset + nr_sectors > max_lba {
+        crate::pr_warn!("hd: sector {} out of range (max {})\n", sector + offset + nr_sectors, max_lba);
         unsafe { end_request(major_num, false) };
         return;
     }
@@ -313,7 +364,7 @@ fn do_hd_request() {
 
     // sector is already in 512-byte LBA units from make_request
     for i in 0..nr_sectors {
-        let sector_lba = sector + i;
+        let sector_lba = sector + offset + i;
         let byte_off = (i * SECTOR_SIZE as u64) as usize;
 
         let ok = if cmd == READ {
