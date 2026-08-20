@@ -17,6 +17,98 @@
 
 ### 已解决的历史问题
 - ~~LLVM noalias 优化导致 super block 数据竞争~~（bug-023）
+
+### 本次会话修复（让内核跑通完整 glibc LFS，2026-08-17）
+
+基线：musl busybox(lfs3.img) 能 boot，但 glibc 动态链接完全跑不起来。
+逐个定位并修复，最终 glibc bash + fork/exec `ls` + 信号投递全链路通过：
+
+1. **init 不是 PID 1**：`sched::kernel_thread` 直接读 `LAST_PID`（不增），
+   而 sched_selftest 的 worker 线程先抢走 pid 1/2，init(fs_init_thread)
+   拿到 pid 3，busybox/sysvinit 报 `must be run as PID 1`。加
+   `sched::reset_last_pid()`，在创建 init 线程前清零计数器。
+2. **动态链接器（ld.so）文本段没加载**：execve 的 PT_INTERP 加载只用
+   `read()` 读了一页进 `ibuf`，再从这一页按 `ifoff+..` 拷贝——只要段在文件
+   偏移 >= 一页（glibc ld-linux 的 `.text` 在 offset 0x1000），条件恒假，
+   整段文本装成零页。改成 `lseek(ifd)+循环 read`（对齐主加载器）。
+3. **初始栈没 16 字节对齐**：SysV ABI 要求入口 %rsp%16==0；不齐会让 ld.so
+   `_dl_start` 的 `movaps` 触发 #GP。aux_top 改 16 对齐 + 顶部按需垫一槽。
+4. **AT_ENTRY 传错**：execve 把 `entry` 先存主程序入口、加载解释器后又覆盖成
+   ld.so 入口，导致 auxv 的 AT_ENTRY=ld.so 自己入口。加 `main_entry` 变量。
+5. **check_range 3GB 上限拒绝高位地址**：动态链接器/共享库被映到 0x7f_…
+   高位，`user_buf` 的 3GB 护栏把 ld.so `.rodata` 里的 writev iovec 全挡成
+   -EFAULT（glibc 错误只打出程序名）。改成「低 3GB 恒等映射直过 + 高位走
+   `verify_area` 查页表」。
+6. **pread64/pwrite64 是返回 0 的存根**：glibc `_dl_map_object_from_fd` 用
+   `__pread64_nocancel` 读共享库 ELF 头/程序头，存根返回 0 →「cannot read
+   file data」。实现成 lseek+read+恢复 f_pos。
+7. **mmap 文件映射读错偏移**：file-backed mmap 靠 `read(fd)` 的 f_pos 推进，
+   只对 offset==0 连续页碰巧对；动态链接器按段偏移 mmap libc 读到错页。
+   改成 lseek(file_off)+read，并允许越过文件末尾（BSS 读作 0）。
+8. **phdr_prot_to_flags 从不设 NX**：PF_X/PF_R 都被当 PRESENT 用，数据段
+   全部可执行。改成 `PRESENT|USER + (PF_W→RW) + (!PF_X→NO_EXEC)`。
+9. **mmap/brk 是 eager 分配**：glibc malloc 初始化时 `mmap(NULL, ~1.4GB,
+   RW, ANON)` 预留主竞技场，Linux 下只占虚拟空间；内核每页都 get_free_page，
+   256MB 内存一次吃光、fork 全部 EAGAIN。实现惰性分配：`map_reserved`（叶子
+   PTE PRESENT=0+RESERVED bit9）+ 缺页处理里 `resolve_reserved` 按需落实，
+   fork 的 cow_copy_page_table 也复制 RESERVED 页。
+10. **rt_sigprocmask 三个操作符全写反**：SIG_BLOCK 写成覆盖、SIG_UNBLOCK
+    写成或、SIG_SETMASK 写成 old&~set，导致 glibc 启动后几乎所有信号（含
+    SIGSEGV）都被屏蔽，用户态异常永远无法投递 → #GP 死循环。改成标准语义。
+11. **SigAction 字段序错**：`#[repr(C)] SigAction` 是 handler/mask/flags/
+    restorer，而 x86_64 `struct sigaction` 是 handler/flags/restorer/mask，
+    内核把 sa_flags 当 mask 读、sa_restorer 当 flags 读。改字段序。
+12. **栈堆重叠**：栈被放在 `max_va+0x10000`（数据段之后），而 brk 堆也从
+    那里向上长；malloc sbrk 把堆顶进栈区，setup_frame 往栈上写的信号蹦床
+    （`mov $15,%rax; syscall`）砸进 malloc 的 WORD_LIST.next，变成 glibc
+    读到「代码字节」的野指针 → `ls` SIGSEGV。栈移到 0x7FFF_FF00_0000 高位。
+
+另：brk 失败改返回 `-ENOMEM`（原来返回 old_brk 正地址，glibc 判失败失效）；
+mmap file-backed ENOMEM 回滚已映射页（原来泄漏）。
+
+**验证**：glibc 动态 bash 跑 `echo HELLO; ls -la /; echo LS_OK; echo BASH_DONE`
+全通过、exit 0；t1_dyn(t1_static) fork+malloc 正常；默认 selftest boot ok。
+
+**剩余已知问题（未解决）**：
+- **ext2/ext4 写路径已修复（2026-08-17 晚）**。mke2fs -b 4096 的文件系统块
+  与固定 1024 字节缓冲缓存的缩放 bug 已全部修完（bug-050..055）：
+  (a) bitmap 位图块号双重缩放（gd.*_bitmap 已被 read_super_full 缩放，又乘
+  scale）；(b) alloc_block 返回 fs 块号但调用方当 1024 块号用、write_inode 把
+  i_block 写成 u16 2 字节而非 u32 4 字节（统一约定 i.data[]=fs 块号、bmap 按
+  sub 块换算、write_inode 按 u32 写回）；(c) add_entry 新块 rec_len 写错且不
+  清零；(d) create 不设 S_IFREG；(e) read_inode 只读 i_block[0] 丢 1..8 块；
+  (f) 空闲计数不回写（新增 ext2 write_super + s_dirt）、unlink/rmdir 泄漏
+  inode、mkdir/rmdir 不改 nlink/used_dirs_count。
+  验证：init_fs 探针 open/write/reopen/read "hello" 通过；init_fs2 探针
+  mkdir + 5000 字节写读回 + 多文件 + unlink + rmdir 全部通过；e2fsck -fn
+  五个 pass 全过、零错误零警告。
+- **posix_spawn 子进程克隆栈读垃圾（已修复，bug-058/059）**：根因不是
+  CLONE_VM 共享页表，而是两层内核栈 bug：
+  1. clone/fork 用 `get_free_page()` 只分配 1 页当内核栈，但
+     `KERNEL_STACK_SIZE=8192` 是两页；第二页没分配，被父进程缺页
+     resolve_reserved 拿去当子栈，clone 写 pt_regs（rsp=child_stack/ss=0x23）
+     正好覆盖子栈里的 fn/arg。改为 `sched::alloc_kstack()`（KSTACK 池，4 页
+     连续对齐），release 用 `free_kstack()`。
+  2. clone 从没设 `(*child).kernel_stack = stack_page`，子进程继承父进程的
+     栈基址，release 把父进程(fsinit)的槽位 free 掉，下一次 clone 拿到重叠栈
+     → 内核 #UD panic。已在布置 tss.rsp/rsp0 后补上。
+  配套（bug-056 保留）：CLONE_VFORK 挂起父进程 + 立刻 schedule、execve/do_exit
+  唤醒父进程、execve 不 free 共享的 old_pml4。
+  验证：静态 init 连做 3 次 `system("echo ...")` 全部 exit 0；fork 5 次
+  waitpid 全回收；ext2 写读回 + e2fsck -fn 五个 pass 干净。
+- **ext2 多块组分配已实现**：`alloc_block`/`alloc_inode` 改为跨组遍历
+  （`alloc_block_any`/`alloc_inode_any`，先组 0 再读 GDT 里组 1..N 的描述符），
+  free 按块号/inode 号反推组。块号 >65535 截断已由 bug-057 修掉（i.data 改
+  u32、12 直接块）。已知小缺陷：`write_super` 只回写组 0 的 free 计数到超级块
+  （超级块里应是各组之和），组描述符本身是对的。
+- lfs3(musl busybox) 的 `/sbin/init` 现在以 PID 1 运行后会继续走到控制台
+  初始化，然后在 `rip=0x6f0f4`（低位、低于 0x400000 的首个 LOAD 段）触发
+  NX 取指缺页退出。疑似 musl 静态二进制在低地址的某段蹦床（`__restore_rt`
+  或类似）未被映射为 USER|EXEC；glibc 路径不受影响。
+- 测试根里用的 coreutils 是 cargo 的 uutils 多调用二进制，argv[0] 需要是
+  精确 applet 名才选对函数，`ls` 会打出 `<unknown binary name>` 的 usage；
+  内核 execve 传 argv 本身是对的（已用 argc/argv 探针验证 argc=3 全对）。
+  真实 LFS 用 GNU coreutils 独立二进制，不受影响。
 - ~~内存溢出（OOM）导致 panic~~
 - ~~execve 硬编码 argv（argc=1/argv[0]="/bin/sh"）导致外部命令拿不到参数~~
 - ~~sendfile 是返回 0 的存根，busybox cat 用 sendfile 时静默无输出~~
@@ -75,12 +167,8 @@
 - 默认引导（单 1MB 镜像）：干净落到 selftest，`boot ok`。
 
 ### 已知未解决问题
-- `ls`/`cat`（exec 后做较多 malloc 的命令）在 `rip=0x42c08e` 触发
-  `general protection: sig 11 err=0x0`（#GP，非 #PF）。故障指令
-  `mov -0x8(%rdi),%rax`，rdi 为非规范垃圾指针（如 `0x7410473b4838772b`），
-  是 glibc malloc fastbin/tcache 取到腐败 chunk。`true`（几乎不 malloc）
-  正常，故 fork+execve+COW 链路本身没问题；这是 brk/malloc 堆布局或
-  glibc 交互的独立 bug，COW 修复后才暴露出来（之前子进程死在 err=0x15）。
+- ~~ls/cat #GP（glibc malloc 腐败 chunk）~~ —— 见「本次会话修复」第 12 条：
+  根因是栈堆重叠（信号蹦床字节砸进 malloc 的链表指针），栈移到高位后已修。
 
 ### 调试输出规范
 - 写路径/系统调用路径的调试串口打印必须用 `pr_debug!`/`pr_warn!` 等

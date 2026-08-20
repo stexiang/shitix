@@ -494,8 +494,17 @@ pub unsafe fn sync_supers(dev: u16) {
             if dev == 0 || !dirt {
                 continue;
             }
-            // 原版是 sb->s_op->write_super(sb)
-            super::minix::write_super(n);
+            // 原版是 sb->s_op->write_super(sb)。按 s_magic 分派：
+            // ext2/ext4(0xEF53) 走 ext4::write_super 只回写空闲计数；
+            // 其它走 minix::write_super。绝不能用 minix 超级块格式去写 ext2
+            // 超级块（会把 0xEF53 magic 覆盖掉）。
+            let magic = { let p = sb(n); p.s_magic };
+            if magic == 0xEF53 {
+                #[cfg(feature = "extra-drivers")]
+                super::ext4::ops::full::write_super(n);
+            } else {
+                super::minix::write_super(n);
+            }
         }
     }
 }

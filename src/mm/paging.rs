@@ -23,6 +23,10 @@ pub mod flags {
     pub const DIRTY: u64 = 1 << 6;
     /// 2MB/1GB 大页标记（原版 32 位内核未用到，setup.S 建映射时用了）
     pub const HUGE: u64 = 1 << 7;
+    /// 延迟分配标记：叶子 PTE 里 PRESENT=0 但置此位，表示「虚拟地址已保留、
+    /// 物理页待首次访问时再分配」（对应 Linux mmap/brk 的惰性语义）。
+    /// 用 bit 9（x86_64 软件可用位），不与 PRESENT/RW/USER 冲突。
+    pub const RESERVED: u64 = 1 << 9;
     pub const NO_EXEC: u64 = 1 << 63;
 
     /// 同原版 `PAGE_SHARED`：present + rw + user
@@ -171,6 +175,81 @@ pub unsafe fn map_page(pml4: usize, vaddr: usize, paddr: usize, prot: u64) -> bo
         set_entry(pt, pt_index(vaddr), (page_base(paddr) as u64) | prot | flags::PRESENT);
     }
     invalidate_page(vaddr);
+    true
+}
+
+/// 保留一段虚拟地址空间，但不分配物理页（惰性分配）。
+///
+/// 对应 Linux `mmap`/`brk` 的语义：调用只记账，物理页等真正访问时由
+/// [`resolve_reserved`]（page fault handler 里）再分配。glibc 的 malloc
+/// 会在初始化时 `mmap(NULL, ~1.4GB, RW, ANON)` 预留一大段主竞技场，Linux
+/// 下这只占虚拟空间；若内核这里按旧实现每页都 `get_free_page` 一张物理页，
+/// 256MB 内存直接被这段预留吃光，后续 fork 全部 EAGAIN。
+///
+/// # Safety
+/// 同 [`map_page`]。
+pub unsafe fn map_reserved(pml4: usize, vaddr: usize, prot: u64) -> bool {
+    let user = prot & flags::USER != 0;
+    // SAFETY: 同 map_page；中间级由 next_level 建表。
+    unsafe {
+        let Some(pdpt) = next_level(pml4, pml4_index(vaddr), user) else { return false };
+        let Some(pd) = next_level(pdpt, pdpt_index(vaddr), user) else { return false };
+        let Some(pt) = next_level(pd, pd_index(vaddr), user) else { return false };
+        // 叶子 PTE：PRESENT=0 + RESERVED + 保留 RW/USER/NO_EXEC，物理地址 0。
+        let leaf = flags::RESERVED | (prot & (flags::RW | flags::USER | flags::NO_EXEC));
+        set_entry(pt, pt_index(vaddr), leaf);
+    }
+    true
+}
+
+/// 查询虚拟地址是否处于「已保留但未分配」状态。
+///
+/// # Safety
+/// 同 [`translate`]。
+pub unsafe fn is_reserved(pml4: usize, vaddr: usize) -> bool {
+    // SAFETY: 逐级查 PRESENT 再下钻。
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 { return false; }
+        let pdpt = (e & ADDR_MASK) as usize;
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 { return false; }
+        let pd = (e & ADDR_MASK) as usize;
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 { return false; }
+        let pt = (e & ADDR_MASK) as usize;
+        let e = entry(pt, pt_index(vaddr));
+        e & flags::RESERVED != 0
+    }
+}
+
+/// 把一个「已保留」的虚拟页落实为物理页。
+///
+/// 供 page fault handler 在首次访问惰性分配页时调用。返回 true 表示已分配
+/// 并映射好；false 表示该地址不是保留页或内存耗尽。
+///
+/// # Safety
+/// 同 [`map_page`]；必须只在「该页确实处于 reserved 状态」时调用。
+pub unsafe fn resolve_reserved(pml4: usize, vaddr: usize) -> bool {
+    // SAFETY: 逐级查 PRESENT。
+    unsafe {
+        let Some(pdpt) = next_level(pml4, pml4_index(vaddr), true) else { return false };
+        let Some(pd) = next_level(pdpt, pdpt_index(vaddr), true) else { return false };
+        let Some(pt) = next_level(pd, pd_index(vaddr), true) else { return false };
+        let idx = pt_index(vaddr);
+        let leaf = entry(pt, idx);
+        if leaf & flags::RESERVED == 0 {
+            return false; // 不是保留页
+        }
+        let pg = get_free_page();
+        if pg == 0 {
+            return false;
+        }
+        // 保留时的 RW/USER/NO_EXEC 原样带上，再加 PRESENT（物理地址 = pg）。
+        let prot = leaf & (flags::RW | flags::USER | flags::NO_EXEC);
+        set_entry(pt, idx, (pg as u64) | prot | flags::PRESENT);
+        invalidate_page(vaddr);
+    }
     true
 }
 
@@ -443,6 +522,18 @@ pub unsafe fn cow_copy_page_table(src_pml4: usize, dst_pml4: usize) -> bool {
 
                 for pt_i in 0..512usize {
                     let pte = unsafe { entry(src_pt, pt_i) };
+                    // 惰性保留页（PRESENT=0 + RESERVED）：fork 时子进程也要保留
+                    // 同一段虚拟空间，否则子进程的 brk 堆/匿名映射区在 fork 后
+                    // 直接「消失」，malloc 等一访问就是未映射的 SIGSEGV/野指针。
+                    if pte & flags::RESERVED != 0 {
+                        let vaddr = (pml4_i << 39) | (pdpt_i << 30)
+                            | (pd_i << 21) | (pt_i << 12);
+                        let prot = pte & (flags::RW | flags::USER | flags::NO_EXEC);
+                        if !unsafe { map_reserved(dst_pml4, vaddr, prot) } {
+                            return false;
+                        }
+                        continue;
+                    }
                     if pte & flags::PRESENT == 0 || pte & flags::USER == 0 {
                         continue;
                     }

@@ -194,14 +194,17 @@ impl SigActionFlags {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SigAction {
-    /// 处理函数
+    /// 处理函数（sa_handler）
     pub handler: SignalHandler,
-    /// 旧信号掩码（原版 sa_mask）
-    pub mask: u64,
-    /// 标志（原版 sa_flags）
+    /// 标志（sa_flags）——x86_64 `struct sigaction` 里紧跟 sa_handler，
+    /// 排在 sa_restorer/sa_mask 之前。旧实现把 mask 放在这里，导致内核把
+    /// glibc/musl 的 sa_flags 当 mask 读、把 sa_restorer 当 flags 读，
+    /// SA_SIGINFO 判定读到蹦床地址的垃圾位。
     pub flags: SigActionFlags,
-    /// 恢复函数（原版 sa_restorer）
+    /// 恢复函数（sa_restorer）
     pub restorer: Option<extern "C" fn()>,
+    /// 旧信号掩码（sa_mask 首个 8 字节）
+    pub mask: u64,
 }
 
 impl SigAction {

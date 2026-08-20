@@ -571,7 +571,13 @@
       "file": "src/fs/ext4/selftest.rs",
       "root_cause": "测试构造 GroupDesc 64 位时，设 d[34]=1 想让 block_bitmap_hi=1。但 group_desc.rs 的 rd32(32) 按 little-endian u32 读 offset 32，即 u32::from_le_bytes([d[32],d[33],d[34],d[35]])。d[34]=1 → rd32(32)=0x0001_0000，block_bitmap = (0x0001_0000u64 << 32) | 1 ≠ 0x1_0000_0001。",
       "fix": "d[34]=1 改为 d[32]=1，使 rd32(32)=1，block_bitmap = (1u64 << 32) | 1 = 0x1_0000_0001。",
-      "tags": ["ext4","group-desc","selftest","little-endian","field-offset"],
+      "tags": [
+        "ext4",
+        "group-desc",
+        "selftest",
+        "little-endian",
+        "field-offset"
+      ],
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-07",
@@ -584,8 +590,18 @@
       "file": "src/signal.rs",
       "root_cause": "send_sig 无条件 `(*task).signal |= 1<<signum`，漏了原版 kernel/signal.c:generate() 置位前的过滤：SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} 时**不置位**（默认忽略）。do_exit→notify_parent 给父进程发 SIGCHLD 置了位，而 sys_wait4 醒来后只要看到任何未屏蔽待处理信号就返回 -EINTR，于是父进程被自己等的那个孩子打断，永远收不到尸。",
       "fix": "send_sig 里补上 generate() 的过滤：SIG_IGN 且非 SIGCHLD → 丢；SIG_DFL 且 ∈{SIGCHLD,SIGCONT,SIGWINCH} → 丢（SIGCONT 顺带把 Stopped 放回 Running）。notify_parent 的唤醒是独立的 wake_up_waiter 调用，不置位也照样叫醒父进程，与原版 send_sig + wake_up_interruptible 分开调的结构一致。",
-      "tags": ["signal","fork","wait4","exit","EINTR","generate","linux-fidelity"],
-      "related_bugs": ["bug-032"],
+      "tags": [
+        "signal",
+        "fork",
+        "wait4",
+        "exit",
+        "EINTR",
+        "generate",
+        "linux-fidelity"
+      ],
+      "related_bugs": [
+        "bug-032"
+      ],
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "fixed"
@@ -597,8 +613,17 @@
       "file": "src/signal.rs",
       "root_cause": "Signal::mask() 和 BLOCKABLE 用原版的 `1 << (sig-1)`（位号 = 信号号 - 1），而 send_sig / dequeue_signal / sigaddset / sigdelset 用 `1 << sig`（位号 = 信号号）。于是经 BLOCKABLE 或 SigSet 设进 blocked 的位和 send_sig 置进 signal 的位整体错开 1，`signal & !blocked` 算出来的待处理集合是错的：屏蔽 SIGTERM 实际屏蔽的是 SIGSTKFLT。原版用 32 位字装 31 个信号必须从 bit 0 起算，我们是 64 位没这个约束，两套写法就这么并存下来了。",
       "fix": "统一到「位号 == 信号号」（bit 0 空着不用）：改 Signal::mask() 为 `1 << sig`、BLOCKABLE 同步。选这个方向而不是原版的 sig-1，是因为改动面小（2 处 vs 5+ 处热路径），且 do_signal 里 trailing_zeros() 拿到的直接就是信号号。约定写进了 Signal::mask() 的文档注释。",
-      "tags": ["signal","sigmask","blocked","bit-convention","off-by-one","latent"],
-      "related_bugs": ["bug-031"],
+      "tags": [
+        "signal",
+        "sigmask",
+        "blocked",
+        "bit-convention",
+        "off-by-one",
+        "latent"
+      ],
+      "related_bugs": [
+        "bug-031"
+      ],
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "fixed"
@@ -610,7 +635,14 @@
       "file": "src/signal.rs",
       "root_cause": "照原版把 `struct sigaction sigaction[32]` 按任务铺成静态数组：SigAction 32 字节 × 32 信号 × NR_TASKS 16 = 16KB BSS，一口气吃掉全部剩余余量。原版 task_struct 本身就占一页、表内联在里面，不存在独立的静态数组。",
       "fix": "改成按需分页：`SIGACTION_TABLES: [usize; NR_TASKS]` 只存页地址（128 字节），首次 set_task_signal 才 get_free_page，release/reset 时 free_page。绝大多数任务从生到死不调 sigaction()，全默认动作不需要任何存储。余量回到 ~19KB（Stage 2 净增 4.2KB，基本都是代码）。",
-      "tags": ["signal","bss","kernel_end","memory-budget","lazy-alloc","kernel.ld"],
+      "tags": [
+        "signal",
+        "bss",
+        "kernel_end",
+        "memory-budget",
+        "lazy-alloc",
+        "kernel.ld"
+      ],
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-07",
@@ -623,8 +655,19 @@
       "file": "src/mm/paging.rs",
       "root_cause": "next_level() 对已存在的页表条目（PRESENT）直接 return 物理地址而不检查/追加 USER 位。clone_kernel_pdpt 从启动 PML4 拷贝了不带 USER 的条目，map_page 调用 next_level 时 entry 已 PRESENT，走快速返回路径，USER 位从未被写入。CPU 硬件在每级（PML4→PDPT→PD→PT）都检查 U/S 位——PML4[0] 缺 USER → #PF。",
       "fix": "在 next_level 的 PRESENT 分支里追加：if user && (e & USER == 0) { set_entry(table, idx, e | USER); }。",
-      "tags": ["paging","USER-bit","page-fault","ring-3","next_level","linux-fidelity"],
-      "related_bugs": ["bug-035","bug-036","bug-037"],
+      "tags": [
+        "paging",
+        "USER-bit",
+        "page-fault",
+        "ring-3",
+        "next_level",
+        "linux-fidelity"
+      ],
+      "related_bugs": [
+        "bug-035",
+        "bug-036",
+        "bug-037"
+      ],
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "fixed"
@@ -636,8 +679,18 @@
       "file": "src/exit.rs, src/sched/mod.rs",
       "root_cause": "do_exit 在 schedule() 之前 free 了 PML4 页；switch_to_task 对 next_cr3==0（内核任务）不做 CR3 切换，导致父进程（内核线程）一直用子进程的 CR3 跑。release 里 free_page(pml4) 之后内核访问触发 TLB miss → 读到已回收的 PML4 页 → #PF → die_if_kernel panic。",
       "fix": "1) pml4 free 移到 release()（父进程上下文，此时已调度过但 CR3 可能还是旧的）；2) switch_to_task 改：next_cr3==0 时切回 boot CR3(0x4000)，确保用户→内核切换正确恢复内核页表。",
-      "tags": ["paging","CR3","use-after-free","TLB","schedule","release"],
-      "related_bugs": ["bug-034","bug-036"],
+      "tags": [
+        "paging",
+        "CR3",
+        "use-after-free",
+        "TLB",
+        "schedule",
+        "release"
+      ],
+      "related_bugs": [
+        "bug-034",
+        "bug-036"
+      ],
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "fixed"
@@ -649,8 +702,16 @@
       "file": "src/syscall/sys.rs",
       "root_cause": "sys::exit 自己实现了 inline Zombie+schedule 逻辑，不调用 exit::do_exit。do_exit 里有完整的 notify_parent（SIGCHLD + wake_up_waiter），sys::exit 里只有 set_need_resched + schedule。父进程在 sys_wait4 里 Interruptible 睡眠，等不到唤醒。",
       "fix": "sys::exit 改成直接调用 crate::exit::do_exit(code)。",
-      "tags": ["syscall","exit","wait4","notify_parent","zombie"],
-      "related_bugs": ["bug-034"],
+      "tags": [
+        "syscall",
+        "exit",
+        "wait4",
+        "notify_parent",
+        "zombie"
+      ],
+      "related_bugs": [
+        "bug-034"
+      ],
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "fixed"
@@ -662,11 +723,482 @@
       "file": "src/exit.rs",
       "root_cause": "encode_status 对 code ∈ [1,31] 直接当作信号号返回（status = code），对 ≥32 的才编码为高 8 位退出码。sys_exit 传下来的退出码若恰好落在 1..=31（如 exit(5)），wait4 汇报的状态字看起来像「被信号 5 杀」而不是「正常退出码 5」。",
       "fix": "用户自检改用 exit(42) 避开此区间；encode_status 的重写留给后续阶段（需要区分「do_exit(sig) 的信号终止」与「exit(code) 的正常退出」，可能需要在 exit_code 之外加一个 sentinel）。",
-      "tags": ["exit","wait4","status-encoding","off-by-design"],
+      "tags": [
+        "exit",
+        "wait4",
+        "status-encoding",
+        "off-by-design"
+      ],
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-08-07",
       "status": "known_workaround"
+    },
+    {
+      "id": "bug-038",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "init 不是 PID 1：busybox/sysvinit 报 must be run as PID 1",
+      "file": "src/sched/mod.rs, src/lib.rs",
+      "root_cause": "kernel_thread 直接读 LAST_PID 不增，selftest worker 线程抢走 pid 1/2",
+      "fix": "新增 reset_last_pid()，创建 init 前清零",
+      "tags": [
+        "pid",
+        "init"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-039",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "动态链接器 ld.so 文本段未加载（glibc 动态程序取指到零页）",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "PT_INTERP 加载只读一页进 ibuf 再按偏移拷，段偏移>=一页时条件恒假",
+      "fix": "改成 lseek(ifd)+循环 read 读文件内容",
+      "tags": [
+        "elf",
+        "interp",
+        "dynamic-link"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-040",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "初始栈未 16 字节对齐 → ld.so movaps #GP",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "aux_top 只 8 对齐，argc 槽奇偶不定，入口 rsp%16!=0",
+      "fix": "aux_top 16 对齐 + 顶部按 envc+argc 奇偶垫一槽",
+      "tags": [
+        "stack",
+        "abi",
+        "alignment"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-041",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "AT_ENTRY 传成 ld.so 自身入口",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "entry 变量被解释器入口覆盖后还用于 AT_ENTRY",
+      "fix": "加 main_entry 存主程序入口",
+      "tags": [
+        "auxv",
+        "at_entry"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-042",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "check_range 3GB 上限拒绝高位地址（ld.so .rodata writev iovec 被挡 EFAULT）",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "用户指针护栏只收 <3GB 恒等映射地址",
+      "fix": "低 3GB 直过 + 高位走 verify_area 查页表",
+      "tags": [
+        "check_range",
+        "verify_area",
+        "usercopy"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-043",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "pread64/pwrite64 是返回 0 的存根 → glibc cannot read file data",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "存根返回 0",
+      "fix": "实现成 lseek+read/write+恢复 f_pos",
+      "tags": [
+        "pread64",
+        "syscall"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-044",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "mmap file-backed 读错偏移",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "靠 read(fd) 的 f_pos 推进，非零 offset 段读错页",
+      "fix": "lseek(file_off)+read，允许越过文件末尾",
+      "tags": [
+        "mmap",
+        "dynamic-link"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-045",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "phdr_prot_to_flags 从不设 NX（数据段可执行）",
+      "file": "src/elf/mod.rs",
+      "root_cause": "PF_X/PF_R 都被当 PRESENT",
+      "fix": "改成 PRESENT|USER + PF_W→RW + !PF_X→NO_EXEC",
+      "tags": [
+        "nx",
+        "elf"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-046",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "mmap/brk eager 分配吃光 256MB（glibc malloc 预留 1.4GB）",
+      "file": "src/mm/paging.rs, src/syscall/sys.rs, src/traps.rs",
+      "root_cause": "每页都立即 get_free_page",
+      "fix": "实现惰性分配 map_reserved + resolve_reserved，COW 复制 RESERVED 页",
+      "tags": [
+        "lazy-alloc",
+        "mmap",
+        "brk"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-047",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "rt_sigprocmask 三个操作符全写反 → SIGSEGV 被屏蔽 → #GP 死循环",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "SIG_BLOCK 写成覆盖、UNBLOCK 写成或、SETMASK 写成 old&~set",
+      "fix": "改成 BLOCK=或 UNBLOCK=差 SETMASK=替换",
+      "tags": [
+        "signal",
+        "sigprocmask"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-048",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "SigAction 字段序错（handler/mask/flags/restorer vs handler/flags/restorer/mask）",
+      "file": "src/signal.rs",
+      "root_cause": "repr(C) 字段序与 x86_64 struct sigaction 不符",
+      "fix": "改为 handler/flags/restorer/mask",
+      "tags": [
+        "sigaction",
+        "abi"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-049",
+      "timestamp": "2026-08-17T20:30:00",
+      "error_message": "栈堆重叠 → 信号蹦床字节砸进 malloc 链表 → ls SIGSEGV",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "栈放在 max_va+0x10000 与 brk 堆重叠",
+      "fix": "栈移到 0x7FFF_FF00_0000 高位",
+      "tags": [
+        "stack",
+        "heap",
+        "signal-trampoline"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T20:30:00"
+    },
+    {
+      "id": "bug-050",
+      "timestamp": "2026-08-17T23:00:00",
+      "error_message": "ext2(4096 字节块)写路径：位图块号双重缩放，alloc_inode/alloc_block 读到位图错误块",
+      "file": "src/fs/ext4/bitmap.rs",
+      "root_cause": "read_super_full 已把 gd.block_bitmap/inode_bitmap/inode_table 按 scale(4) 缩放到 1024 字节块号，但 alloc/free_block/inode 又乘了一次 scale，读到位图错误块（把 inode 位图读到块 48 而非 12）",
+      "fix": "移除位图块号的 *scale；free_blocks_count 也不再乘 scale（它是计数不是块号）",
+      "tags": [
+        "ext2",
+        "ext4",
+        "bitmap",
+        "block-size"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:00:00"
+    },
+    {
+      "id": "bug-051",
+      "timestamp": "2026-08-17T23:00:00",
+      "error_message": "ext2 写路径：alloc_block 返回文件系统块号，但调用方按 1024 字节块号用；write_inode 把 i_block 写成 u16 二字节而非 u32 四字节",
+      "file": "src/fs/ext4/ops.rs",
+      "root_cause": "缓冲缓存固定 1024 字节块，文件系统块 4096 字节；alloc_block 返回 fs 块号，add_entry/getblk 却当 1024 块号；write_inode 旧实现按 u16 2 字节偏移写 9 个直接块，破坏 on-disk i_block(u32 12 直接+3 间接)",
+      "fix": "统一约定：i.data[k]=文件系统物理块号、bmap 按 block/scale 取 i.data 再 *scale+sub 返回 1024 块号；write_inode 按 u32 4 字节偏移写回 fs 块号",
+      "tags": [
+        "ext2",
+        "ext4",
+        "bmap",
+        "i_block",
+        "block-size"
+      ],
+      "related_bugs": [
+        "bug-050"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:00:00"
+    },
+    {
+      "id": "bug-052",
+      "timestamp": "2026-08-17T23:00:00",
+      "error_message": "ext2 新建目录块：add_entry 首条 rec_len 写成 BLOCK_SIZE-rec_len、且新块未清零，e2fsck 报 directory corrupted",
+      "file": "src/fs/ext4/namei.rs",
+      "root_cause": "add_entry 新块路径首条目录项 rec_len 误写 1024-16=1008；块内残留未清零；且只写 1024 子块不写满 4096 文件系统块",
+      "fix": "整块(scale 个子块)清零；首条 rec_len 占满整个文件系统块(fs_block_size)，对齐 e2fsck 与内核 DirIter 的解析",
+      "tags": [
+        "ext2",
+        "ext4",
+        "directory",
+        "rec_len"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:00:00"
+    },
+    {
+      "id": "bug-053",
+      "timestamp": "2026-08-17T23:00:00",
+      "error_message": "ext2 create 不设 S_IFREG → 新建文件 mode=0666 无类型位，e2fsck 报 invalid mode",
+      "file": "src/fs/ext4/namei.rs",
+      "root_cause": "ext4 create 直接把权限位 m 赋给 i_mode，不像 minix 那样 (m & !S_IFMT)|S_IFREG",
+      "fix": "i_mode = (m & !mode::S_IFMT) | mode::S_IFREG",
+      "tags": [
+        "ext2",
+        "ext4",
+        "inode",
+        "mode"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:00:00"
+    },
+    {
+      "id": "bug-054",
+      "timestamp": "2026-08-17T23:00:00",
+      "error_message": "ext2 多块目录/文件：inode 被重新读入后丢失 1..8 号块，a.txt/b.txt 目录项丢失",
+      "file": "src/fs/ext4/ops.rs",
+      "root_cause": "read_inode 经典分支只读 i_block[0] 进 i.data[0]，i.data[1..8] 置 0；inode 在 create/write 之间被 iput+iget 重读后，add_entry 之前分配的新块全丢",
+      "fix": "read_inode/read_super_full 经典分支把 i_block[0..8] 全部读进 i.data[]",
+      "tags": [
+        "ext2",
+        "ext4",
+        "read_inode",
+        "multi-block"
+      ],
+      "related_bugs": [
+        "bug-051"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:00:00"
+    },
+    {
+      "id": "bug-055",
+      "timestamp": "2026-08-17T23:00:00",
+      "error_message": "ext2 空闲计数从不回写 + unlink/rmdir 泄漏 inode、mkdir/rmdir 不改 nlink/used_dirs_count",
+      "file": "src/fs/ext4/ops.rs",
+      "root_cause": "sync_supers 对 0xEF53 直接跳过（历史原因是 minix::write_super 会覆盖 ext2 magic），且 alloc/free 路径不置 s_dirt；unlink/rmdir 只 truncate 不 free_inode，mkdir/rmdir 不维护父目录 nlink 与组描述符 used_dirs_count",
+      "fix": "新增 ext2 write_super 回写超级块与组 0 描述符的 free_blocks/free_inodes/used_dirs；alloc/free 置 s_dirt；unlink/rmdir 补 free_inode，mkdir/rmdir 维护 nlink 与 used_dirs_count；ext4_file_write 后 sync_dev",
+      "tags": [
+        "ext2",
+        "ext4",
+        "superblock",
+        "free-count",
+        "leak"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:00:00"
+    },
+    {
+      "id": "bug-056",
+      "timestamp": "2026-08-17T23:40:00",
+      "error_message": "glibc posix_spawn(system) 用 CLONE_VM|CLONE_VFORK，父进程未挂起 -> __spawnix 立即 munmap 子栈，子进程 pop 读不到 fn/arg",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "内核 clone 不实现 CLONE_VFORK：父进程 clone 返回后继续跑，glibc __spawnix 在子进程跑起来前 munmap 子栈",
+      "fix": "clone 里 CLONE_VFORK 时把父进程挂起(Interruptible)+立刻 schedule 让子进程先跑；子进程 execve(ops) 或 do_exit(exit.rs) 时唤醒父进程；execve 对 vfork 子进程不 free 共享的 old_pml4。新增 task.vfork_parent 字段",
+      "tags": [
+        "clone",
+        "vfork",
+        "posix-spawn",
+        "glibc"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:40:00"
+    },
+    {
+      "id": "bug-057",
+      "timestamp": "2026-08-17T23:40:00",
+      "error_message": "ext2 块号 >65535（>256MB 文件系统，如 2.4GB gccroot）会被 i.data 的 u16 截断，>9 直接块也放不下",
+      "file": "src/fs/inode.rs",
+      "root_cause": "VFS Inode.data 是 [u16;9]（minix 遗留），ext2/ext4 用它存直接块号，块号 >65535 截断、>9 直接块放不下",
+      "fix": "data 改 [u32;12]；ext2 write_inode/read_inode/extend_inode_block 用 12 直接块；free_block/free_inode 块号参数 u16->u32；minix/proc/tmpfs 适配 u32",
+      "tags": [
+        "ext2",
+        "ext4",
+        "inode",
+        "block-number"
+      ],
+      "related_bugs": [
+        "bug-051"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-17T23:40:00"
+    },
+    {
+      "id": "bug-058",
+      "timestamp": "2026-08-18T21:40:00",
+      "error_message": "posix_spawn 子进程 __clone pop %rax 读到栈地址本身而非 fn（子栈与内核栈重叠）",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "clone/fork 用 get_free_page() 只分配 1 页当内核栈，但 KERNEL_STACK_SIZE=8192 是两页。第二页没分配，会被父进程缺页 resolve_reserved 拿去当子栈；clone 写 pt_regs（rsp=child_stack/ss=0x23）正好覆盖子栈里的 fn/arg",
+      "fix": "clone/fork 改用 sched::alloc_kstack()（预划的 KSTACK 池，KSTACK_SIZE=4 页，连续对齐）；release 改用 free_kstack()。KSTACK_PAGES 池由 page_alloc::init 划出",
+      "tags": [
+        "clone",
+        "posix-spawn",
+        "kstack",
+        "stack-overlap"
+      ],
+      "related_bugs": [
+        "bug-056"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-18T21:40:00"
+    },
+    {
+      "id": "bug-059",
+      "timestamp": "2026-08-18T21:40:00",
+      "error_message": "连续第二次 system()（posix_spawn）内核 panic：invalid operand，RIP 落到 0x228 等垃圾地址",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "clone 只做 *child = *parent.clone() 却从没设 (*child).kernel_stack = stack_page，子进程继承了父进程的内核栈基址。release() 按 kernel_stack free_kstack 就把父进程(fsinit)的栈槽位 free 掉，下一次 clone 拿到重叠的栈",
+      "fix": "clone 在布置完 tss.rsp/tss.rsp0 后补 (*child).kernel_stack = stack_page",
+      "tags": [
+        "clone",
+        "kstack",
+        "use-after-free",
+        "release"
+      ],
+      "related_bugs": [
+        "bug-058"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-18T21:40:00"
+    },
+    {
+      "id": "bug-060",
+      "timestamp": "2026-08-19T16:00:00",
+      "error_message": "大目录里靠后的头文件(stdio.h/stdlib.h/string.h) open 返回 ENOENT；gcc 找不到 stdio.h",
+      "file": "src/fs/ext4/namei.rs",
+      "root_cause": "目录项按文件系统块(fs_block_size=4096)布局、不按 1024 字节缓冲块对齐，但 find_entry/add_entry/fill_dirent 都按 1024 字节分块读，跨 1024 边界的目录项被截断",
+      "fix": "find_entry/add_entry/fill_dirent 改为读整个 fs_block(scale 个 1024 块拼进 4096 栈缓冲)再解析；add_entry 的写回用 getblk 逐子块回写",
+      "tags": [
+        "ext2",
+        "ext4",
+        "directory",
+        "readdir",
+        "block-size"
+      ],
+      "related_bugs": [
+        "bug-051"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-19T16:00:00"
+    },
+    {
+      "id": "bug-061",
+      "timestamp": "2026-08-19T16:00:00",
+      "error_message": "gcc 找不到 cc1：'cannot execute cc1: posix_spawnp: No such file or directory'（getenv PATH=null）",
+      "file": "src/lib.rs",
+      "root_cause": "fs_init_thread 用 execve(path,0,0) 起 /init，argv=envp=NULL，init/sh/gcc 全无环境变量，posix_spawnp 在空 PATH 里找不到后端",
+      "fix": "fs_init_thread 传最小 envp=['PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin', NULL]",
+      "tags": [
+        "execve",
+        "envp",
+        "path",
+        "gcc"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-19T16:00:00"
+    },
+    {
+      "id": "bug-062",
+      "timestamp": "2026-08-19T18:00:00",
+      "error_message": "gcc 报 'Cannot create temporary file: File exists'（mkstemps 每次同名）",
+      "file": "src/syscall/sys.rs",
+      "root_cause": "getrandom 存根恒写 0，glibc mkstemps 的随机后缀每次一样，第二次编译临时名冲突 EEXIST",
+      "fix": "getrandom 用 rdtsc + 静态计数做种子、xorshift 展开伪随机字节",
+      "tags": [
+        "getrandom",
+        "mkstemps",
+        "gcc"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-08-19T18:00:00"
+    },
+    {
+      "id": "bug-063",
+      "timestamp": "2026-08-19T18:00:00",
+      "error_message": "cc1plus 读 C++ 头文件 'Bad address'（EFAULT）；copy_to_user/verify_area 对惰性分配页失败",
+      "file": "src/mm/area.rs",
+      "root_cause": "glibc 的 read/write 缓冲是 mmap/brk 惰性分配页（RESERVED、PRESENT=0），copy_from/to_user 与 verify_area 直接 translate 拿到 None 就 EFAULT；内核态缺页只处理了 COW 没处理 RESERVED",
+      "fix": "copy_from/to_user 与 verify_area 遇到 RESERVED 页先 resolve_reserved 再重查；traps.rs 内核态缺页也补 resolve_reserved；另发现 read/write/pipe 走 user_buf/pipe 直接访问用户地址（非 translate），惰性页靠缺页 resolve，这是链接器崩溃的疑点",
+      "tags": [
+        "lazy-alloc",
+        "copy-to-user",
+        "EFAULT",
+        "gcc"
+      ],
+      "related_bugs": [
+        "bug-009"
+      ],
+      "occurrences": 1,
+      "last_seen": "2026-08-19T20:00:00"
+    },
+    {
+      "id": "bug-064",
+      "title": "execve argv/envp 高位地址被 check_range 1GB 护栏拒绝",
+      "fix": "user_path/put_user/argv/envp 指针数组都改走 user_ok（低 1GB 恒等映射直过 + 高位 verify_area 查页表）；之前 collect2 拿不到任何参数，strlen(argv[0]=NULL) SIGSEGV",
+      "last_seen": "2026-08-19T21:30:00"
+    },
+    {
+      "id": "bug-065",
+      "title": "execve 栈槽位区在参数多时溢出顶页",
+      "fix": "argv/envp 很多（collect2 有 55~59 参数）时槽位区从顶页溢出，旧实现 top_page 物理指针负偏移写到垃圾地址，argv 数组读成 NULL；改 i 为 isize + slot() 闭包按虚拟地址 translate 逐槽求物理地址，支持跨页",
+      "last_seen": "2026-08-19T21:30:00"
+    },
+    {
+      "id": "bug-066",
+      "title": "extend_inode_block 不处理间接块（已修复）",
+      "fix": "只设 i.data[0..12] 直接块，blk>=48(间接块)时啥都不做，bmap 恒 0 → ext4_file_write 逐 1024 块重复 alloc_block_any 泄漏块、>48KB 文件被截断；需补 i_block[12..15] 间接块分配+write_inode 回写。修复：data 扩到 [u32;15]（12 直接+3 间接指针），read_inode/write_inode 读写 15 指针，extend_inode_block 实现一/二/三级间接块分配（set_indirect/get_indirect），bmap_phys 用内存 i.data 而非磁盘 i_block。验证：gcc 与 g++ 都能编译+链接+运行（HELLO_C/HELLO_CPP）",
+      "last_seen": "2026-08-19T23:00:00",
+      "status": "fixed"
+    },
+    {
+      "id": "bug-067",
+      "title": "退出路径 __run_exit_handlers call *rax 跳到 0x163fa0",
+      "root_cause": "execve 不清 rdx（SysV ABI 的 rtld_fini 寄存器）。内核发起的 execve /init 走 syscall3(EXECVE,path,0,envp)，rdx 留成 envp 的内核栈地址；静态二进制 _start 把 rdx 当 rtld_fini 传给 __libc_start_main，后者 __cxa_atexit(内核栈地址) 注册成首个退出处理函数，exit 时 PTR_DEMANGLE 后 call *rax 跳进内核栈地址 → #PF(0x163fa0=init 的 pt_regs.r8 槽地址)。此前误判成 fork-after-posix_spawn 的 COW/堆写入——其实是注册时就写坏，与 system()/fork 无关（动态二进制不受影响，ld.so 不读 rdx）",
+      "fix": "execve 改完 rip/rsp/cs/rflags/ss/rax 后清掉 rdx 及 rdi/rsi/rcx/r8/r9/r10/r11（调用者保存参数寄存器，防止泄漏内核地址）。验证：reg_fixed 静态 init 3×system+fork+waitpid 后 REGRESSION DONE、exit 0；gcc/g++ 编译链照常",
+      "status": "fixed",
+      "last_seen": "2026-08-20T20:30:00"
     }
   ]
 }

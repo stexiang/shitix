@@ -46,6 +46,12 @@ pub fn do_exit(code: ExitCode) -> ! {
 
     // SAFETY: 正在终止当前进程；单核不抢占，这段独占任务表。
     unsafe {
+        // VFORK：子进程退出，唤醒被挂起的父进程（若子进程没走到 execve）。
+        let vp = (*sched::task_ptr(nr)).vfork_parent;
+        if vp != 0 {
+            (*sched::task_ptr(nr)).vfork_parent = 0;
+            (*sched::task_ptr(vp)).state = TaskState::Running;
+        }
         // 关闭所有打开的文件。对应原版 do_exit 里那个
         // `for (i=0 ; i<NR_OPEN ; i++) if (current->filp[i]) sys_close(i)`。
         // FD 表目前还是全局的（见 fs::open），所以这里只在最后一个用户
@@ -184,7 +190,7 @@ pub fn release(task_idx: usize) -> i32 {
         // init_task 的栈是 head.S 的静态栈（kernel_stack == 0），不能还给分配器。
         let stack = (*task).kernel_stack;
         if stack != 0 {
-            crate::mm::free_page(stack as usize);
+            crate::sched::free_kstack(stack as usize);
             (*task).kernel_stack = 0;
         }
 

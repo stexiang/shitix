@@ -447,14 +447,17 @@ pub fn is_valid_elf64(data: &[u8]) -> bool {
         && u16::from_le_bytes([data[18], data[19]]) == 62  // x86_64
 }
 
-/// PF_* → page protection 标志转换
+/// PF_* → page protection 标志转换。
+///
+/// 每个被映射的用户段都应当是 present + user-accessible；
+/// `PF_W` 决定可写（RW），`PF_X` 决定可执行（不设 NO_EXEC）。
+/// 旧实现把 `PRESENT` 当成「可执行」的标志位来用——PF_X/PF_R 都置 PRESENT，
+/// 从不为数据段设 NO_EXEC，于是每个段都可执行（W^X 失效）。
 pub fn phdr_prot_to_flags(p_flags: u32) -> u64 {
     use crate::mm::paging::flags;
-    let mut prot = flags::USER;
-    if p_flags & 1 != 0 { prot |= flags::PRESENT; }    // PF_X
-    if p_flags & 2 != 0 { prot |= flags::RW; }          // PF_W
-    if p_flags & 4 != 0 { prot |= flags::PRESENT; }     // PF_R: 只读也是 present
-    if prot & flags::PRESENT == 0 { prot |= flags::PRESENT; } // 兜底
+    let mut prot = flags::USER | flags::PRESENT;
+    if p_flags & 2 != 0 { prot |= flags::RW; }          // PF_W → 可写
+    if p_flags & 1 == 0 { prot |= flags::NO_EXEC; }     // !PF_X → 禁止取指
     prot
 }
 

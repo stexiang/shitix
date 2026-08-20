@@ -451,9 +451,11 @@ pub unsafe fn read_inode(n: usize) {
         if mode::is_chr(raw.i_mode) || mode::is_blk(raw.i_mode) {
             // 见函数文档：设备文件的 i_zone[0] 是设备号
             i.i_rdev = raw.i_zone[0];
-            i.data = [0; 9];
+            i.data = [0; 15];
         } else {
-            i.data = raw.i_zone;
+            let mut d = [0u32; 15];
+            for k in 0..9 { d[k] = raw.i_zone[k] as u32; }
+            i.data = d;
         }
 
         // 原版按类型选 i_op（那一串 if/else if）
@@ -507,7 +509,7 @@ pub unsafe fn write_inode(n: usize) {
             if mode::is_chr(i.i_mode) || mode::is_blk(i.i_mode) {
                 zone[0] = i.i_rdev;
             } else {
-                zone = i.data;
+                for k in 0..9 { zone[k] = i.data[k] as u16; }
             }
             MinixInode {
                 i_mode: i.i_mode,
@@ -665,7 +667,7 @@ unsafe fn inode_getblk(n: usize, nr: usize, create: bool) -> usize {
                 buffer::brelse(result);
                 continue;
             }
-            inode::inode(n).data[nr] = tmp as u16;
+            inode::inode(n).data[nr] = tmp as u32;
             let i = inode::inode(n);
             i.i_ctime = sched::current_time();
             i.i_dirt = true;

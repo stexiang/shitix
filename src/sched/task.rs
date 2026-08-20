@@ -126,6 +126,9 @@ pub struct Task {
     // ---- 亲子链。原版 `p_opptr/p_pptr/p_cptr/p_ysptr/p_osptr` ----
     /// 父进程在 task 数组里的下标（原版是指针，我们用下标避免自引用结构）
     pub parent: usize,
+    /// CLONE_VFORK：被挂起的父进程下标。0 表示本进程不是 vfork 子进程；
+    /// 非 0 时父进程处于 Stopped，等本进程 execve 或退出后把它唤醒。
+    pub vfork_parent: usize,
 
     // ---- 调度链。原版 `next_task`/`prev_task` 双向环 ----
     /// 下一个任务的下标，构成环。原版 `struct task_struct *next_task`
@@ -213,6 +216,7 @@ impl Task {
             session: 0,
             comm: [0; COMM_LEN],
             parent: 0,
+            vfork_parent: 0,
             next: 0,
             prev: 0,
             utime: 0,

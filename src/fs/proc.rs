@@ -67,9 +67,9 @@ unsafe fn proc_iget(kind: ProcKind, pid: u32, is_dir: bool) -> usize {
         (*ip).i_gid = 0;
         (*ip).i_size = 0;
         (*ip).i_blksize = 1024;
-        (*ip).data[0] = kind as u16;
-        (*ip).data[1] = (pid & 0xFFFF) as u16;
-        (*ip).data[2] = ((pid >> 16) & 0xFFFF) as u16;
+        (*ip).data[0] = kind as u32;
+        (*ip).data[1] = (pid & 0xFFFF) as u32;
+        (*ip).data[2] = ((pid >> 16) & 0xFFFF) as u32;
         if is_dir {
             (*ip).i_mode = mode::S_IFDIR | 0o555;
             (*ip).i_nlink = 2;
@@ -85,7 +85,7 @@ unsafe fn proc_iget(kind: ProcKind, pid: u32, is_dir: bool) -> usize {
 #[inline]
 fn inode_kind(n: usize) -> ProcKind {
     // SAFETY: inode index is valid, data[0] was set by proc_iget
-    let k = unsafe { inode::inode(n).data[0] };
+    let k = unsafe { inode::inode(n).data[0] } as u16;
     unsafe { core::mem::transmute(k) }
 }
 

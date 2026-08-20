@@ -166,6 +166,12 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     // 在不睡的执行流里从来不被走到，等于没测。
     //
     // 所以这里起一个内核线程当 init 用，主流程等它跑完。
+    //
+    // init 必须是 pid 1：前面 sched_selftest 的 worker 内核线程已经占用
+    // 并消费了 pid 1/2（它们退出后 LAST_PID 不会回退），这里清零计数器
+    // 让 fs_init_thread 拿到 pid 1。busybox init / sysvinit 都硬检查
+    // `getpid() == 1`，拿不到就直接报「must be run as PID 1」退出。
+    sched::reset_last_pid();
     let init_thread = sched::kernel_thread("fsinit", fs_init_thread, 0, 15);
     if init_thread.is_err() {
         panic!("cannot create fs init thread");
@@ -755,40 +761,46 @@ fn fs_init_thread(_arg: u64) {
         if !mounted {
             // 合并镜像：内核占起始 1MB（2048 扇区），根文件系统紧随其后。
             // 只在主盘容量明显大于 1MB 时才试——纯引导镜像（1MB）后面没有根文件系统，
-            // 硬试只会刷一屏「out of range」警告。
-            let master_sectors = drivers::block::hd::drive_size(0);
-            if master_sectors > 2048 {
-                sprintln!("LFS: slave drive absent, trying combined image on master...");
-                unsafe { drivers::block::hd::set_offset(0, 2048) };
-                let ide_master = fs::mkdev(3, 0);
-                mounted = unsafe { fs::mount_root(ide_master, 0) };
-                if !mounted {
-                    // 失败则复位偏移，避免影响后续（如果有）对 master 的访问
-                    unsafe { drivers::block::hd::set_offset(0, 0) };
+            // 硬试只会刷一屏「out of range」警告。hd 驱动只在 extra-drivers 下编译。
+            #[cfg(feature = "extra-drivers")]
+            {
+                let master_sectors = drivers::block::hd::drive_size(0);
+                if master_sectors > 2048 {
+                    sprintln!("LFS: slave drive absent, trying combined image on master...");
+                    unsafe { drivers::block::hd::set_offset(0, 2048) };
+                    let ide_master = fs::mkdev(3, 0);
+                    mounted = unsafe { fs::mount_root(ide_master, 0) };
+                    if !mounted {
+                        // 失败则复位偏移，避免影响后续（如果有）对 master 的访问
+                        unsafe { drivers::block::hd::set_offset(0, 0) };
+                    }
                 }
             }
         }
         unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(FS_INIT_DONE), 1); }
 
         if mounted {
+            // 最小启动环境：必须带 PATH，否则 exec 出的 sh/gcc 里
+            // posix_spawnp 在空环境里找不到 cc1/cc1plus 等后端。
+            let envp: [*const u8; 2] = [
+                b"PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin\0".as_ptr(),
+                core::ptr::null(),
+            ];
+            let exec_with_env = |path: &'static [u8]| -> i64 {
+                unsafe {
+                    syscall::syscall3(syscall::nr::EXECVE,
+                        path.as_ptr() as u64, 0, envp.as_ptr() as u64)
+                }
+            };
             // Try /init first, fall back to /bin/sh
             sprintln!("LFS: execve /init...");
-            let ret = unsafe {
-                syscall::syscall3(syscall::nr::EXECVE,
-                    b"/init\0".as_ptr() as u64, 0, 0)
-            };
+            let ret = exec_with_env(b"/init\0");
             if ret < 0 {
                 sprintln!("LFS: /init failed ({}), trying /sbin/init...", ret);
-                let ret = unsafe {
-                    syscall::syscall3(syscall::nr::EXECVE,
-                        b"/sbin/init\0".as_ptr() as u64, 0, 0)
-                };
+                let ret = exec_with_env(b"/sbin/init\0");
                 if ret < 0 {
                     sprintln!("LFS: /sbin/init failed ({}), trying /bin/sh...", ret);
-                    let ret = unsafe {
-                        syscall::syscall3(syscall::nr::EXECVE,
-                            b"/bin/sh\0".as_ptr() as u64, 0, 0)
-                    };
+                    let ret = exec_with_env(b"/bin/sh\0");
                     sprintln!("LFS: /bin/sh returned {}", ret);
                 }
             }

@@ -1,6 +1,5 @@
 #!/bin/bash
-# Master LFS build script for shitix kernel
-# Usage: ./build-lfs-full.sh [--no-docker] [--image-size MB]
+# Master LFS build script for shitix kernel - with multicore & direct image creation
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,31 +7,37 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 IMG="${ROOT_DIR}/target/boot/lfs-full.img"
 DOCKER_TAG="shitix-lfs-full"
 IMG_SIZE_MB="${1:-512}"
-[[ "$IMG_SIZE_MB" =~ ^[0-9]+$ ]] || IMG_SIZE_MB=512
+JOBS=$(nproc)
+REBUILD=false
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --jobs) JOBS="$2"; shift 2 ;;
+        --rebuild) REBUILD=true; shift ;;
+        --image-size) IMG_SIZE_MB="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[[ "$JOBS" =~ ^[0-9]+$ ]] || JOBS=$(nproc)
 
 cd "$SCRIPT_DIR"
 
 echo "========================================="
 echo "  shitix Full LFS Build"
-echo "  Image size: ${IMG_SIZE_MB}MB"
+echo "  Image size: ${IMG_SIZE_MB}MB (will be auto‑sized)"
+echo "  Parallel jobs: $JOBS"
 echo "========================================="
 
-# Step 1: Build Docker image
+# Step 1: Build Docker image with multicore
 echo ""
-echo "=== Step 1: Building LFS Docker image ==="
-echo "This will download and compile all LFS packages from source."
-echo "Estimated time: 2-4 hours depending on CPU"
-echo ""
-
-if ! docker image inspect "$DOCKER_TAG" &>/dev/null; then
-    docker build -f Dockerfile.full -t "$DOCKER_TAG" . 2>&1 | \
-        grep -E "Step|==>|ERROR|error|complete|Download" || true
+echo "=== Step 1: Building LFS Docker image (using $JOBS cores) ==="
+export DOCKER_BUILDKIT=1
+BUILD_ARGS=(--build-arg JOBS="$JOBS" --build-arg MAKEFLAGS="-j$JOBS")
+if docker image inspect "$DOCKER_TAG" &>/dev/null && [[ "$REBUILD" != true ]]; then
+    echo "Docker image exists, skipping build. Use --rebuild to force."
 else
-    echo "Docker image $DOCKER_TAG already exists, skipping build."
-    echo "Use --rebuild to force rebuild."
-    if [[ "${2:-}" == "--rebuild" ]]; then
-        docker build --no-cache -f Dockerfile.full -t "$DOCKER_TAG" .
-    fi
+    docker build "${BUILD_ARGS[@]}" -f Dockerfile.full -t "$DOCKER_TAG" .
 fi
 
 # Step 2: Extract rootfs
@@ -45,35 +50,18 @@ docker rm "$CONTAINER" >/dev/null
 
 ROOTFS_SIZE=$(du -sm "$TMPDIR" | awk '{print $1}')
 echo "Rootfs size: ${ROOTFS_SIZE}MB"
-if [ $ROOTFS_SIZE -gt $IMG_SIZE_MB ]; then
-    IMG_SIZE_MB=$((ROOTFS_SIZE + 64))
-    echo "Increasing image to ${IMG_SIZE_MB}MB"
-fi
 
-# Step 3: Create ext2 image
-echo ""
-echo "=== Step 3: Creating ${IMG_SIZE_MB}MB ext2 image ==="
-mkdir -p "$(dirname "$IMG")"
-dd if=/dev/zero of="$IMG" bs=1M count=$IMG_SIZE_MB status=none
-mkfs.ext2 -q -F -b 4096 "$IMG"
+# ---- Prepare device nodes and init inside TMPDIR ----
+echo "=== Preparing device nodes and /init ==="
+mkdir -p "$TMPDIR/proc" "$TMPDIR/tmp" "$TMPDIR/run" "$TMPDIR/sys" "$TMPDIR/dev" 2>/dev/null || true
+chmod 1777 "$TMPDIR/tmp"
+mknod "$TMPDIR/dev/null" c 1 3 2>/dev/null || true
+mknod "$TMPDIR/dev/zero" c 1 5 2>/dev/null || true
+mknod "$TMPDIR/dev/tty" c 5 0 2>/dev/null || true
+mknod "$TMPDIR/dev/console" c 5 1 2>/dev/null || true
+chmod 666 "$TMPDIR/dev/null" "$TMPDIR/dev/zero" "$TMPDIR/dev/tty" 2>/dev/null || true
 
-# Step 4: Populate
-echo "=== Step 4: Populating image ==="
-MNTDIR=$(mktemp -d)
-mount -o loop "$IMG" "$MNTDIR"
-cp -a "$TMPDIR"/. "$MNTDIR"/
-
-# Ensure device nodes exist
-mkdir -p "$MNTDIR/proc" "$MNTDIR/tmp" "$MNTDIR/run" "$MNTDIR/sys" \
-    "$MNTDIR/dev" 2>/dev/null || true
-chmod 1777 "$MNTDIR/tmp"
-mknod "$MNTDIR/dev/null" c 1 3 2>/dev/null || true
-mknod "$MNTDIR/dev/zero" c 1 5 2>/dev/null || true
-mknod "$MNTDIR/dev/tty" c 5 0 2>/dev/null || true
-mknod "$MNTDIR/dev/console" c 5 1 2>/dev/null || true
-chmod 666 "$MNTDIR/dev/null" "$MNTDIR/dev/zero" "$MNTDIR/dev/tty" 2>/dev/null || true
-
-# Create /init as a compiled binary (kernel can't exec scripts)
+# Compile init and copy into TMPDIR
 cat > /tmp/init_lfs_full.c << 'CEOF'
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -95,12 +83,27 @@ CEOF
 docker run --rm -v /tmp:/tmp alpine:3.19 sh -c \
     'apk add --no-cache musl-dev gcc >/dev/null 2>&1 && gcc -static -nostartfiles -o /tmp/init_lfs_full /tmp/init_lfs_full.c && echo "init compiled"'
 
-cp /tmp/init_lfs_full "$MNTDIR/init"
-chmod +x "$MNTDIR/init"
+cp /tmp/init_lfs_full "$TMPDIR/init"
+chmod +x "$TMPDIR/init"
 
-umount "$MNTDIR"
-rmdir "$MNTDIR"
+# Step 3: Create ext2 image directly from TMPDIR (no mount!)
+echo ""
+echo "=== Step 3: Creating ext2 image (direct) ==="
+mkdir -p "$(dirname "$IMG")"
+
+# Compute needed image size: rootfs size + 20% overhead + 64MB safety
+ROOTFS_BYTES=$(du -sb "$TMPDIR" | awk '{print $1}')
+IMG_SIZE_BYTES=$((ROOTFS_BYTES * 12 / 10 + 64 * 1024 * 1024))
+IMG_SIZE_MB=$(( (IMG_SIZE_BYTES + 1048575) / 1048576 ))   # round up to MB
+echo "Image size: ${IMG_SIZE_MB}MB"
+
+# Create a sparse file of that size, then format with -d
+truncate -s "${IMG_SIZE_MB}M" "$IMG"
+mkfs.ext2 -F -b 4096 -d "$TMPDIR" "$IMG" 2>&1 | grep -v "discarding" || true
+
+# Clean up
 rm -rf "$TMPDIR"
+rm -f /tmp/init_lfs_full /tmp/init_lfs_full.c
 
 echo ""
 echo "========================================="

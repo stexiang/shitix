@@ -48,7 +48,17 @@ pub fn verify_area(pml4: usize, vaddr: u64, len: u64, mode: AccessMode) -> i64 {
                     return -(EFAULT as i64);
                 }
             }
-            None => return -(EFAULT as i64),
+            None => {
+                // 惰性分配页（mmap/brk 的 RESERVED、PRESENT=0）：落实物理页后
+                // 下一轮循环重新 get_page_flags 拿到 PRESENT。glibc 的 read/write
+                // 缓冲区常是 malloc 刚 mmap 出来的保留页，不 resolve 会 EFAULT。
+                if unsafe { paging::is_reserved(pml4, cur as usize) }
+                    && unsafe { paging::resolve_reserved(pml4, cur as usize) }
+                {
+                    continue;
+                }
+                return -(EFAULT as i64);
+            }
         }
         cur += crate::mm::PAGE_SIZE as u64;
     }
@@ -84,9 +94,15 @@ pub unsafe fn copy_from_user(kern_dst: *mut u8, user_src: u64, len: usize, pml4:
         let off = (src_va & 0xFFF) as usize;
         let chunk = core::cmp::min(len - copied, crate::mm::PAGE_SIZE - off);
 
-        let phys = unsafe {
-            paging::translate(pml4, src_va as usize)
-        };
+        let mut phys = unsafe { paging::translate(pml4, src_va as usize) };
+        if phys.is_none() {
+            // 惰性分配页（mmap/brk 的 RESERVED、PRESENT=0）：先落实再重查。
+            if paging::is_reserved(pml4, src_va as usize)
+                && unsafe { paging::resolve_reserved(pml4, src_va as usize) }
+            {
+                phys = unsafe { paging::translate(pml4, src_va as usize) };
+            }
+        }
         let Some(phys_addr) = phys else {
             return -(EFAULT as i64);
         };
@@ -120,9 +136,15 @@ pub unsafe fn copy_to_user(user_dst: u64, kern_src: *const u8, len: usize, pml4:
         let off = (dst_va & 0xFFF) as usize;
         let chunk = core::cmp::min(len - copied, crate::mm::PAGE_SIZE - off);
 
-        let phys = unsafe {
-            paging::translate(pml4, dst_va as usize)
-        };
+        let mut phys = unsafe { paging::translate(pml4, dst_va as usize) };
+        if phys.is_none() {
+            // 惰性分配页：先落实再重查。
+            if paging::is_reserved(pml4, dst_va as usize)
+                && unsafe { paging::resolve_reserved(pml4, dst_va as usize) }
+            {
+                phys = unsafe { paging::translate(pml4, dst_va as usize) };
+            }
+        }
         let Some(phys_addr) = phys else {
             return -(EFAULT as i64);
         };

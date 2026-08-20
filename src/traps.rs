@@ -252,6 +252,19 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
                         }
                     }
                 }
+
+                // 惰性分配：mmap/brk 保留（PRESENT=0 + RESERVED）的页第一次被
+                // 访问时在这里落实物理页。glibc malloc 预留的大段竞技场、线程栈
+                // 等只会被触碰一小部分，剩下的保留页永远不分配，内存就不会被
+                // 一次吃光。
+                if pml4 != 0 && !is_present && is_user {
+                    if crate::mm::paging::is_reserved(pml4, fault_addr as usize) {
+                        if unsafe { crate::mm::paging::resolve_reserved(pml4, fault_addr as usize) } {
+                            crate::pr_debug!("lazy page fault resolved at {:#x}", fault_addr);
+                            return;
+                        }
+                    }
+                }
             }
         }
         
@@ -271,9 +284,20 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
             let is_write = (error_code & 2) != 0;
             let is_present = (error_code & 1) != 0;
             let is_user_page = (error_code & 4) == 0;  // supervisor 访问用户页
-            if is_write && is_present && is_user_page {
-                let pml4 = unsafe { (*sched::task_ptr(sched::current_index())).pml4 };
-                if pml4 != 0 {
+            let pml4 = unsafe { (*sched::task_ptr(sched::current_index())).pml4 };
+            if pml4 != 0 {
+                // 内核对用户惰性分配页（mmap/brk 的 RESERVED、PRESENT=0）的读写：
+                // copy_from_user/copy_to_user 会直接访问还没落实物理页的保留页。
+                // 这里先 resolve_reserved 落实，再重试访问（与用户态惰性缺页同路）。
+                if !is_present
+                    && crate::mm::paging::is_reserved(pml4, fault_addr as usize)
+                {
+                    if unsafe { crate::mm::paging::resolve_reserved(pml4, fault_addr as usize) } {
+                        crate::pr_debug!("lazy supervisor fault resolved at {:#x}", fault_addr);
+                        return;
+                    }
+                }
+                if is_write && is_present && is_user_page {
                     if let Some(true) = unsafe { crate::umm::try_handle_cow_fault(fault_addr, pml4) } {
                         crate::pr_debug!("COW supervisor fault handled at {:#x}", fault_addr);
                         return;

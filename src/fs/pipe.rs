@@ -119,14 +119,18 @@ pub fn pipe_read(idx: usize, buf: *mut u8, count: usize) -> i64 {
             if (*m).len > 0 {
                 let n = core::cmp::min(count - total as usize, (*m).len);
                 let first = core::cmp::min(n, PIPE_BUF_SIZE - (*m).read_pos);
-                core::ptr::copy_nonoverlapping(
-                    ring.add((*m).read_pos), buf.add(total as usize), first);
+                // 走 copy_to_user（translate 逐页 + 惰性解析），不要直接解引用用户
+                // 地址：直接 copy_nonoverlapping 会读内核恒等映射而不是用户页表。
+                let pml4 = (*crate::sched::task_ptr(crate::sched::current_index())).pml4;
+                let r1 = crate::mm::area::copy_to_user(buf as u64 + total as u64, ring.add((*m).read_pos), first, pml4);
+                if r1 < 0 { return r1; }
                 (*m).read_pos = ((*m).read_pos + first) % PIPE_BUF_SIZE;
                 (*m).len -= first;
                 total += first as i64;
                 if first < n {
                     let second = n - first;
-                    core::ptr::copy_nonoverlapping(ring, buf.add(total as usize), second);
+                    let r2 = crate::mm::area::copy_to_user(buf as u64 + total as u64, ring, second, pml4);
+                    if r2 < 0 { return r2; }
                     (*m).read_pos = second;
                     (*m).len -= second;
                     total += second as i64;
@@ -156,15 +160,17 @@ pub fn pipe_write(idx: usize, buf: *const u8, count: usize) -> i64 {
             if free > 0 {
                 let n = core::cmp::min(count - total as usize, free);
                 let first = core::cmp::min(n, PIPE_BUF_SIZE - (*m).write_pos);
-                core::ptr::copy_nonoverlapping(
-                    buf.add(total as usize), ring.add((*m).write_pos), first);
+                // 走 copy_from_user（translate 逐页 + 惰性解析），避免直接解引用用户地址。
+                let pml4 = (*crate::sched::task_ptr(crate::sched::current_index())).pml4;
+                let r1 = crate::mm::area::copy_from_user(ring.add((*m).write_pos), buf as u64 + total as u64, first, pml4);
+                if r1 < 0 { return r1; }
                 (*m).write_pos = ((*m).write_pos + first) % PIPE_BUF_SIZE;
                 (*m).len += first;
                 total += first as i64;
                 if first < n {
                     let second = n - first;
-                    core::ptr::copy_nonoverlapping(
-                        buf.add(total as usize), ring, second);
+                    let r2 = crate::mm::area::copy_from_user(ring, buf as u64 + total as u64, second, pml4);
+                    if r2 < 0 { return r2; }
                     (*m).write_pos = second;
                     (*m).len += second;
                     total += second as i64;

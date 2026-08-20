@@ -44,11 +44,13 @@ unsafe fn find_entry_in_block(blk_buf: usize, name: &[u8]) -> Option<(usize, usi
 
 /// 在目录中查找一项。遍历目录的所有数据块。
 ///
-/// 返回 `(缓冲下标, 项在块内的字节偏移)`。调用方负责 `brelse` 缓冲。
+/// 返回匹配项的 inode 号。目录项按**文件系统块**（fs_block_size）布局，
+/// 不按 1024 字节缓冲块对齐，所以必须把整个 fs_block 读进连续缓冲再解析，
+/// 否则跨 1024 边界的目录项会被截断（大目录里靠后的 stdio.h 之类查不到）。
 ///
 /// # Safety
 /// 只能在进程上下文调用。`dir` 是已 `iget` 的目录 inode。
-pub unsafe fn find_entry(dir: usize, name: &[u8]) -> Option<(usize, usize)> {
+pub unsafe fn find_entry(dir: usize, name: &[u8]) -> Option<u32> {
     if name.len() > EXT4_NAME_LEN {
         return None;
     }
@@ -57,31 +59,40 @@ pub unsafe fn find_entry(dir: usize, name: &[u8]) -> Option<(usize, usize)> {
         let sb_nr = inode::inode(dir).i_sb;
         let dev = sb(sb_nr).s_dev;
         let size = inode::inode(dir).i_size as u64;
-        let mut off = 0u64;
-        while off < size {
-            let block = (off / BLOCK_SIZE as u64) as u32;
-            let phys = crate::fs::ext4::ops::full::bmap(dir, block, false);
-            if phys == 0 {
-                off = (block as u64 + 1) * BLOCK_SIZE as u64;
-                continue;
-            }
+        let info = crate::fs::ext4::ops::full::ext4_info(sb_nr);
+        let fs_block = if info.fs_block_size > 0 { info.fs_block_size as u64 } else { BLOCK_SIZE as u64 };
+        let scale = (fs_block / BLOCK_SIZE as u64).max(1);
 
-            let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
-                Some(b) => b, None => break,
-            };
-            let data = bh(bn).data();
-            let mut found = None;
-            for entry in DirIter::new(data) {
-                if entry.is_empty() || entry.name_len as usize != name.len() { continue; }
-                let ns = entry.name_off;
-                if ns + name.len() <= data.len() && &data[ns..ns + name.len()] == name {
-                    found = Some((bn, entry.name_off - EXT4_DIR_ENTRY_HEADER_LEN));
-                    break;
+        let mut lblock = 0u64;
+        while lblock * fs_block < size {
+            // 只支持 fs_block <= 4096（当前 ext2/ext4 测试都 ≤4096）；
+            // 更大的块回退到按 1024 分块读（可能漏跨边界项，但不会溢出）。
+            if scale <= 4 {
+                let mut buf = [0u8; 4096];
+                let nbytes = (scale as usize) * BLOCK_SIZE;
+                let mut valid = true;
+                for sub in 0..scale {
+                    let phys = crate::fs::ext4::ops::full::bmap(dir, (lblock * scale + sub) as u32, false);
+                    if phys == 0 { valid = false; break; }
+                    let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                        Some(b) => b, None => { valid = false; break; }
+                    };
+                    let d = bh(bn).data();
+                    let s = (sub as usize) * BLOCK_SIZE;
+                    buf[s..s + BLOCK_SIZE].copy_from_slice(&d[..BLOCK_SIZE]);
+                    buffer::brelse(bn);
+                }
+                if valid {
+                    for entry in DirIter::new(&buf[..nbytes]) {
+                        if entry.is_empty() || entry.name_len as usize != name.len() { continue; }
+                        let ns = entry.name_off;
+                        if ns + name.len() <= nbytes && &buf[ns..ns + name.len()] == name {
+                            return Some(entry.inode);
+                        }
+                    }
                 }
             }
-            if found.is_some() { return found; }
-            buffer::brelse(bn);
-            off = (block as u64 + 1) * BLOCK_SIZE as u64;
+            lblock += 1;
         }
         None
     }
@@ -98,10 +109,7 @@ pub unsafe fn lookup(dir: usize, name: &[u8]) -> Result<usize, i32> {
             return Err(ENOTDIR);
         }
         match find_entry(dir, name) {
-            Some((b, _off)) => {
-                let raw = &bh(b).data()[_off..];
-                let ino = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                buffer::brelse(b);
+            Some(ino) => {
                 if ino == 0 {
                     return Err(ENOENT);
                 }
@@ -135,9 +143,10 @@ pub unsafe fn create(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
         }
 
         // 分配一个 inode
+        let dev = crate::fs::super_block::sb(sb_nr).s_dev;
         let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
         let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
-        let ino = match bitmap::alloc_inode(sb_data, gd, 0) {
+        let ino = match crate::fs::ext4::ops::full::alloc_inode_any(sb_nr) {
             Some(ino) => ino,
             None => return Err(ENOSPC),
         };
@@ -146,11 +155,12 @@ pub unsafe fn create(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
         let ip = inode::iget(sb_nr, ino);
         if ip == NIL {
             // 回退 inode 分配
-            bitmap::free_inode(sb_data, gd, 0, (ino - 1) as u16);
+            crate::fs::ext4::ops::full::free_inode_any(sb_nr, ino);
             return Err(EIO);
         }
         let i = inode::inode(ip);
-        i.i_mode = m;
+        // create 收到的 m 是权限位（如 0666），不含类型位；补上 S_IFREG。
+        i.i_mode = (m & !mode::S_IFMT) | mode::S_IFREG;
         i.i_nlink = 1;
         i.i_uid = 0;  // TODO: 从当前进程获取
         i.i_gid = 0;
@@ -163,7 +173,6 @@ pub unsafe fn create(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
         // 把目录项加到目录中
         add_entry(dir, ino, name, file_type::EXT4_FT_REG_FILE)?;
 
-        let _ = m;
         Ok(ip)
     }
 }
@@ -183,16 +192,17 @@ pub unsafe fn mknod(dir: usize, name: &[u8], m: u16, _rdev: u16) -> Result<usize
             return Err(EEXIST);
         }
 
+        let dev = crate::fs::super_block::sb(sb_nr).s_dev;
         let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
         let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
-        let ino = match bitmap::alloc_inode(sb_data, gd, 0) {
+        let ino = match crate::fs::ext4::ops::full::alloc_inode_any(sb_nr) {
             Some(ino) => ino,
             None => return Err(ENOSPC),
         };
 
         let ip = inode::iget(sb_nr, ino);
         if ip == NIL {
-            bitmap::free_inode(sb_data, gd, 0, (ino - 1) as u16);
+            crate::fs::ext4::ops::full::free_inode_any(sb_nr, ino);
             return Err(EIO);
         }
         let i = inode::inode(ip);
@@ -228,31 +238,48 @@ pub unsafe fn mkdir(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
         let i = inode::inode(ip);
         i.i_nlink = 2; // . 和 ..
         i.i_dirt = true;
+        // 父目录多了一个子目录，链接数 +1（子目录的 ".." 指向父目录）。
+        inode::inode(dir).i_nlink += 1;
+        inode::inode(dir).i_dirt = true;
 
         // 为新目录分配一个数据块并写入 "." 和 ".." 项
         let sb_nr = i.i_sb;
+        let dev = crate::fs::super_block::sb(sb_nr).s_dev;
         let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
+        gd.used_dirs_count = gd.used_dirs_count.saturating_add(1);
         let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
 
-        let phys = match bitmap::alloc_block(sb_data, gd, 0) {
+        let phys = match crate::fs::ext4::ops::full::alloc_block_any(sb_nr) {
             Some(b) => b,
             None => {
                 // 回退
                 i.i_nlink = 0;
-                bitmap::free_inode(sb_data, gd, 0, (i.i_ino - 1) as u16);
+                crate::fs::ext4::ops::full::free_inode_any(sb_nr, i.i_ino);
                 inode::iput(ip);
                 return Err(ENOSPC);
             }
         };
 
-        i.i_size = 1024;
-        // 直接块指针：data[0] = 物理块号
-        unsafe { ptr::write_volatile(&raw mut i.data[0], phys as u16); }
+        // 直接块指针：data[0] = 文件系统物理块号（与 read_inode 同单位）。
+        unsafe { ptr::write_volatile(&raw mut i.data[0], phys as u32); }
 
-        // 写 ".." 和 ".." 目录项
+        // 写 "." 和 ".." 目录项。phys 是文件系统块号，缓冲缓存固定 1024
+        // 字节块。先清零整块（scale 个子块），再在子块 0 写两条目录项，
+        // ".." 的 rec_len 占满到文件系统块尾（对齐 add_entry 的布局）。
         let dev = unsafe { sb(sb_nr).s_dev };
-        let fiz = phys as u32;
-        if let Some(buf_bn) = unsafe { buffer::bread(dev, fiz, 1024) } {
+        let fs_block_size = crate::fs::ext4::ops::full::ext4_info(sb_nr).fs_block_size;
+        let scale = if fs_block_size > 0 { (fs_block_size / 1024) as u32 } else { 1 };
+        i.i_size = fs_block_size as u32;
+        for sub in 0..scale {
+            if let Some(bn) = unsafe { buffer::getblk(dev, phys as u32 * scale + sub, 1024) } {
+                let raw = unsafe { buffer::bh(bn).data_mut() };
+                for b in raw.iter_mut() { *b = 0; }
+                unsafe { buffer::bh(bn).b_uptodate = true };
+                unsafe { buffer::mark_buffer_dirty(bn) };
+                unsafe { buffer::brelse(bn) };
+            }
+        }
+        if let Some(buf_bn) = unsafe { buffer::getblk(dev, phys as u32 * scale, 1024) } {
             let dir_data = unsafe { buffer::bh(buf_bn).data_mut() };
             // "." entry
             dir_data[0..4].copy_from_slice(&i.i_ino.to_le_bytes());
@@ -261,15 +288,16 @@ pub unsafe fn mkdir(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
             dir_data[6] = 1;
             dir_data[7] = file_type::EXT4_FT_DIR;
             dir_data[8] = b'.';
-            // ".." entry
+            // ".." entry（收尾到文件系统块尾）
             let dotdot_offset = dot_rec_len as usize;
             dir_data[dotdot_offset..dotdot_offset + 4].copy_from_slice(&inode::inode(dir).i_ino.to_le_bytes());
-            let remaining = (1024 - dotdot_offset) as u16;
+            let remaining = (fs_block_size - dotdot_offset) as u16;
             dir_data[dotdot_offset + 4..dotdot_offset + 6].copy_from_slice(&remaining.to_le_bytes());
             dir_data[dotdot_offset + 6] = 2;
             dir_data[dotdot_offset + 7] = file_type::EXT4_FT_DIR;
             dir_data[dotdot_offset + 8] = b'.';
             dir_data[dotdot_offset + 9] = b'.';
+            unsafe { buffer::bh(buf_bn).b_uptodate = true };
             unsafe { buffer::mark_buffer_dirty(buf_bn) };
             unsafe { buffer::brelse(buf_bn) };
         }
@@ -287,81 +315,118 @@ unsafe fn add_entry(dir: usize, ino: u32, name: &[u8], ftype: u8) -> Result<(), 
 
     unsafe {
         let size = inode::inode(dir).i_size as u64;
-        let last_block = if size == 0 { 0u32 } else { ((size - 1) / BLOCK_SIZE as u64) as u32 };
+        let info = crate::fs::ext4::ops::full::ext4_info(sb_nr);
+        let fs_block_size = if info.fs_block_size > 0 { info.fs_block_size } else { BLOCK_SIZE };
+        let scale = if fs_block_size > 0 { (fs_block_size / 1024) } else { 1 };
+        let n_fs_blocks = if size == 0 { 0u64 } else { (size + fs_block_size as u64 - 1) / fs_block_size as u64 };
 
-        // Use buffer cache to read/write directory blocks
-        if size > 0 {
-            let phys = crate::fs::ext4::ops::full::bmap(dir, last_block, true);
-            if phys != 0 {
-                if let Some(bn) = buffer::bread(dev, phys, BLOCK_SIZE) {
-                    let raw = buffer::bh(bn).data_mut();
-                    let mut off = 0usize;
-                    while off + EXT4_DIR_ENTRY_HEADER_LEN <= BLOCK_SIZE {
-                        let rec = u16::from_le_bytes([raw[off + 4], raw[off + 5]]) as usize;
-                        if rec == 0 || off + rec > BLOCK_SIZE { break; }
-                        let ino_existing = u32::from_le_bytes([raw[off],raw[off+1],raw[off+2],raw[off+3]]);
-                        let existing_name_len = raw[off + 6] as usize;
-                        let existing_rec = rec;
+        // 目录项按文件系统块（fs_block_size）布局，必须整块扫描，否则跨 1024
+        // 边界 / rec_len=fs_block_size 的项会被误判，导致每项都追加新块甚至漏项。
+        for blk in 0..n_fs_blocks {
+            if scale > 4 { break; }
+            let mut buf = [0u8; 4096];
+            let nbytes = scale * BLOCK_SIZE;
+            let mut valid = true;
+            for sub in 0..scale {
+                let phys = crate::fs::ext4::ops::full::bmap(dir, (blk * scale as u64 + sub as u64) as u32, true);
+                if phys == 0 { valid = false; break; }
+                let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                    Some(b) => b, None => { valid = false; break; }
+                };
+                let d = buffer::bh(bn).data();
+                let s = (sub as usize) * BLOCK_SIZE;
+                buf[s..s + BLOCK_SIZE].copy_from_slice(&d[..BLOCK_SIZE]);
+                buffer::brelse(bn);
+            }
+            if !valid { continue; }
 
-                        if ino_existing == 0 && existing_rec >= rec_len {
-                            raw[off..off+4].copy_from_slice(&ino.to_le_bytes());
-                            raw[off+6] = name.len() as u8; raw[off+7] = ftype;
-                            let noff = off + EXT4_DIR_ENTRY_HEADER_LEN;
-                            raw[noff..noff+name.len()].copy_from_slice(name);
+            let mut off = 0usize;
+            while off + EXT4_DIR_ENTRY_HEADER_LEN <= nbytes {
+                let rec = u16::from_le_bytes([buf[off + 4], buf[off + 5]]) as usize;
+                if rec == 0 || off + rec > nbytes { break; }
+                let ino_existing = u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
+                let existing_name_len = buf[off + 6] as usize;
+                let existing_rec = rec;
+
+                let write_back = |buf: &[u8; 4096]| {
+                    for sub in 0..scale {
+                        let phys = crate::fs::ext4::ops::full::bmap(dir, (blk * scale as u64 + sub as u64) as u32, true);
+                        if phys == 0 { continue; }
+                        if let Some(bn) = buffer::getblk(dev, phys, BLOCK_SIZE) {
+                            let d = buffer::bh(bn).data_mut();
+                            let s = (sub as usize) * BLOCK_SIZE;
+                            d[..BLOCK_SIZE].copy_from_slice(&buf[s..s + BLOCK_SIZE]);
                             buffer::bh(bn).b_uptodate = true;
                             buffer::mark_buffer_dirty(bn);
                             buffer::brelse(bn);
-                            crate::fs::buffer::sync_dev(dev);
-                            return Ok(());
                         }
-
-                        if ino_existing != 0 && existing_rec >= ext4_dir_rec_len(existing_name_len as u8) as usize + rec_len {
-                            let new_off = off + ext4_dir_rec_len(existing_name_len as u8) as usize;
-                            let remaining = existing_rec - ext4_dir_rec_len(existing_name_len as u8) as usize;
-                            raw[off+4..off+6].copy_from_slice(&ext4_dir_rec_len(existing_name_len as u8).to_le_bytes());
-                            raw[new_off..new_off+4].copy_from_slice(&ino.to_le_bytes());
-                            raw[new_off+4..new_off+6].copy_from_slice(&(remaining as u16).to_le_bytes());
-                            raw[new_off+6] = name.len() as u8; raw[new_off+7] = ftype;
-                            let noff = new_off + EXT4_DIR_ENTRY_HEADER_LEN;
-                            raw[noff..noff+name.len()].copy_from_slice(name);
-                            buffer::bh(bn).b_uptodate = true;
-                            buffer::mark_buffer_dirty(bn);
-                            buffer::brelse(bn);
-                            crate::fs::buffer::sync_dev(dev);
-                            return Ok(());
-                        }
-                        off += existing_rec;
                     }
-                    buffer::brelse(bn);
+                    crate::fs::buffer::sync_dev(dev);
+                };
+
+                if ino_existing == 0 && existing_rec >= rec_len {
+                    buf[off..off+4].copy_from_slice(&ino.to_le_bytes());
+                    buf[off+6] = name.len() as u8; buf[off+7] = ftype;
+                    let noff = off + EXT4_DIR_ENTRY_HEADER_LEN;
+                    buf[noff..noff+name.len()].copy_from_slice(name);
+                    write_back(&buf);
+                    return Ok(());
                 }
+
+                if ino_existing != 0 && existing_rec >= ext4_dir_rec_len(existing_name_len as u8) as usize + rec_len {
+                    let new_off = off + ext4_dir_rec_len(existing_name_len as u8) as usize;
+                    let remaining = existing_rec - ext4_dir_rec_len(existing_name_len as u8) as usize;
+                    buf[off+4..off+6].copy_from_slice(&ext4_dir_rec_len(existing_name_len as u8).to_le_bytes());
+                    buf[new_off..new_off+4].copy_from_slice(&ino.to_le_bytes());
+                    buf[new_off+4..new_off+6].copy_from_slice(&(remaining as u16).to_le_bytes());
+                    buf[new_off+6] = name.len() as u8; buf[new_off+7] = ftype;
+                    let noff = new_off + EXT4_DIR_ENTRY_HEADER_LEN;
+                    buf[noff..noff+name.len()].copy_from_slice(name);
+                    write_back(&buf);
+                    return Ok(());
+                }
+                off += existing_rec;
             }
         }
 
         // Need a new block
         let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
         let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
-        let phys = match bitmap::alloc_block(sb_data, gd, 0) {
+        let fs_block_size = crate::fs::ext4::ops::full::ext4_info(sb_nr).fs_block_size;
+        let scale = if fs_block_size > 0 { (fs_block_size / 1024) as u32 } else { 1 };
+        let phys = match crate::fs::ext4::ops::full::alloc_block_any(sb_nr) {
             Some(b) => b, None => return Err(ENOSPC),
         };
-        let new_block = (size / BLOCK_SIZE as u64) as u32;
+        // phys 是文件系统块号；extend_inode_block 以 fs 块为粒度索引。
+        let new_block = (size / fs_block_size as u64) as u32;
         crate::fs::ext4::ops::full::extend_inode_block(dir, new_block, phys as u32);
 
-        if let Some(bn) = buffer::getblk(dev, phys as u32, BLOCK_SIZE) {
+        // 新块是 fs_block_size 字节（如 4096）的文件系统块，但缓冲缓存固定
+        // 1024 字节。先把整块（scale 个子块）清零，再在子块 0 写第一条目录项，
+        // rec_len 占满整个文件系统块——这样 e2fsck 按 4096 字节块解析时能看到
+        // 一条收尾到块尾的合法目录项，内核按 1024 字节子块读时 DirIter 也会把
+        // 越过子块尾的 rec_len 截到子块尾，不会误读残留。
+        for sub in 0..scale {
+            if let Some(bn) = buffer::getblk(dev, phys as u32 * scale + sub, BLOCK_SIZE) {
+                let raw = buffer::bh(bn).data_mut();
+                for b in raw.iter_mut() { *b = 0; }
+                buffer::bh(bn).b_uptodate = true;
+                buffer::mark_buffer_dirty(bn);
+                buffer::brelse(bn);
+            }
+        }
+        if let Some(bn) = buffer::getblk(dev, phys as u32 * scale, BLOCK_SIZE) {
             let raw = buffer::bh(bn).data_mut();
             raw[0..4].copy_from_slice(&ino.to_le_bytes());
-            raw[4..6].copy_from_slice(&((BLOCK_SIZE - rec_len) as u16).to_le_bytes());
+            raw[4..6].copy_from_slice(&(fs_block_size as u16).to_le_bytes());
             raw[6] = name.len() as u8; raw[7] = ftype;
             raw[8..8+name.len()].copy_from_slice(name);
-            let tail = (EXT4_DIR_ENTRY_HEADER_LEN + name.len() + 3) & !3;
-            if tail + EXT4_DIR_ENTRY_HEADER_LEN <= BLOCK_SIZE {
-                raw[tail+4..tail+6].copy_from_slice(&((BLOCK_SIZE - tail) as u16).to_le_bytes());
-            }
             buffer::bh(bn).b_uptodate = true;
             buffer::mark_buffer_dirty(bn);
             buffer::brelse(bn);
         }
 
-        inode::inode(dir).i_size = (new_block as u32 + 1) * 1024;
+        inode::inode(dir).i_size = (new_block as u32 + 1) * fs_block_size as u32;
         inode::inode(dir).i_dirt = true;
         // Sync to flush dirty parent directory buffer before it gets reused
         crate::fs::buffer::sync_dev(dev);
@@ -427,7 +492,23 @@ pub unsafe fn rmdir(dir: usize, name: &[u8]) -> i32 {
             if n > 2 { inode::iput(ip); return Err(ENOTEMPTY); }
         }
         remove_entry(dir, name)?;
-        i.i_nlink = 0; i.i_dirt = true;
+        // 父目录链接数 -1、已用目录数 -1。
+        inode::inode(dir).i_nlink -= 1;
+        inode::inode(dir).i_dirt = true;
+        {
+            let sb_nr = i.i_sb;
+            let ino = i.i_ino;
+            i.i_nlink = 0;
+            i.i_dirt = true;
+            // 释放数据块（truncate 里逐个 free_block），再把 inode 还回位图。
+            crate::fs::ext4::ops::full::truncate(ip);
+            let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
+            gd.used_dirs_count = gd.used_dirs_count.saturating_sub(1);
+            let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
+            let dev = sb(sb_nr).s_dev;
+            crate::fs::ext4::ops::full::free_inode_any(sb_nr, ino);
+            crate::fs::buffer::sync_dev(dev);
+        }
         inode::iput(ip);
         Ok(())
     })();
@@ -442,7 +523,17 @@ pub unsafe fn unlink(dir: usize, name: &[u8]) -> i32 {
         if mode::is_dir(i.i_mode) { inode::iput(ip); return Err(EPERM); }
         remove_entry(dir, name)?;
         i.i_nlink -= 1; i.i_dirt = true;
-        if i.i_nlink == 0 { crate::fs::ext4::ops::full::truncate(ip); }
+        if i.i_nlink == 0 {
+            let sb_nr = i.i_sb;
+            let ino = i.i_ino;
+            crate::fs::ext4::ops::full::truncate(ip);
+            // 数据块已在 truncate 里释放，这里把 inode 还回位图。
+            let gd = &mut crate::fs::ext4::ops::full::ext4_info_mut(sb_nr).ext4_gd;
+            let sb_data = &crate::fs::ext4::ops::full::ext4_info(sb_nr).ext4_sb;
+            let dev = sb(sb_nr).s_dev;
+            crate::fs::ext4::ops::full::free_inode_any(sb_nr, ino);
+            crate::fs::buffer::sync_dev(dev);
+        }
         inode::iput(ip);
         Ok(())
     })();

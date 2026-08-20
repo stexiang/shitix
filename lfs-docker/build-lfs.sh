@@ -10,8 +10,8 @@ IMG_SIZE_MB=256
 
 cd "$SCRIPT_DIR"
 
-echo "==> Building LFS Docker image..."
-docker build -t "$DOCKER_TAG" . 2>&1 | grep -E "Step|ERROR|error|DONE" || true
+#echo "==> Building LFS Docker image..."
+#docker build -t "$DOCKER_TAG" . 2>&1 | grep -E "Step|ERROR|error|DONE" || true
 
 echo "==> Extracting rootfs from Docker image..."
 CONTAINER=$(docker create "$DOCKER_TAG" true 2>/dev/null || echo "")

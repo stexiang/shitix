@@ -187,26 +187,37 @@ pub unsafe fn fill_dirent(n: usize, pos: u64, out: &mut crate::fs::Dirent) -> i6
         }
         let dev = sb(sb_nr).s_dev;
         let size = inode::inode(n).i_size as u64;
+        let info = crate::fs::ext4::ops::full::ext4_info(sb_nr);
+        let fs_block = if info.fs_block_size > 0 { info.fs_block_size as u64 } else { BLOCK_SIZE as u64 };
+        let scale = (fs_block / BLOCK_SIZE as u64).max(1);
         let mut off = pos;
 
         while off < size {
-            let block = (off / BLOCK_SIZE as u64) as u32;
-            let phys = crate::fs::ext4::ops::full::bmap(n, block, false);
-            if phys == 0 {
-                off = (block as u64 + 1) * BLOCK_SIZE as u64;
-                continue;
+            let block_fs = (off / fs_block) as u32;
+            // 读整个文件系统块，目录项不按 1024 字节对齐，必须整块解析。
+            let mut buf = [0u8; 4096];
+            let nbytes = (scale as usize) * BLOCK_SIZE;
+            let mut valid = scale <= 4;
+            if valid {
+                for sub in 0..scale {
+                    let phys = crate::fs::ext4::ops::full::bmap(n, (block_fs as u64 * scale + sub) as u32, false);
+                    if phys == 0 { valid = false; break; }
+                    let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                        Some(b) => b, None => { valid = false; break; }
+                    };
+                    let d = bh(bn).data();
+                    let s = (sub as usize) * BLOCK_SIZE;
+                    buf[s..s + BLOCK_SIZE].copy_from_slice(&d[..BLOCK_SIZE]);
+                    buffer::brelse(bn);
+                }
             }
-            let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
-                Some(b) => b,
-                None => return -(crate::klib::errno::EIO as i64),
-            };
-            let data = bh(bn).data();
-            let block_base = (block as u64) * BLOCK_SIZE as u64;
-            let cur = (off - block_base) as usize;
+            if !valid { off = (block_fs as u64 + 1) * fs_block; continue; }
 
+            let block_base = (block_fs as u64) * fs_block;
+            let cur = (off - block_base) as usize;
             // 从块内偏移 cur 起找第一个有效（inode!=0）目录项。
             let mut chosen: Option<(Ext4DirEntry, usize)> = None;
-            for e in DirIter::new(data) {
+            for e in DirIter::new(&buf[..nbytes]) {
                 let e_off = e.name_off - EXT4_DIR_ENTRY_HEADER_LEN;
                 if e_off < cur { continue; }
                 if !e.is_empty() {
@@ -218,19 +229,17 @@ pub unsafe fn fill_dirent(n: usize, pos: u64, out: &mut crate::fs::Dirent) -> i6
                 let nlen = (e.name_len as usize).min(out.d_name.len());
                 let nstart = e.name_off;
                 out.d_ino = e.inode as u64;
-                out.d_off = (e_off + e.rec_len as usize) as i64;
+                out.d_off = (block_base + e_off as u64 + e.rec_len as u64) as i64;
                 out.d_reclen = core::mem::size_of::<crate::fs::Dirent>() as u16;
                 out.d_type = e.file_type; // EXT4_FT_* 与 DT_* 同值
                 out.d_name = [0; 32];
-                if nstart + nlen <= data.len() {
-                    out.d_name[..nlen].copy_from_slice(&data[nstart..nstart + nlen]);
+                if nstart + nlen <= nbytes {
+                    out.d_name[..nlen].copy_from_slice(&buf[nstart..nstart + nlen]);
                 }
-                buffer::brelse(bn);
-                return (e_off + e.rec_len as usize) as i64;
+                return (block_base + e_off as u64 + e.rec_len as u64) as i64;
             }
             // 本块没有更多有效项：跳到下一块
-            buffer::brelse(bn);
-            off = (block as u64 + 1) * BLOCK_SIZE as u64;
+            off = (block_fs as u64 + 1) * fs_block;
         }
         0
     }

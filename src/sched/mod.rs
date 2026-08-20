@@ -802,7 +802,7 @@ unsafe fn reap_kstack() {
 ///
 /// # Safety
 /// 只能在关中断的情况下调用（[`kernel_thread`] 已经关了）。
-unsafe fn alloc_kstack() -> usize {
+pub unsafe fn alloc_kstack() -> usize {
     // SAFETY: 契约保证已关中断、单核独占这两个静态量。
     unsafe {
         reap_kstack();
@@ -826,7 +826,7 @@ unsafe fn alloc_kstack() -> usize {
 ///
 /// # Safety
 /// 同 [`alloc_kstack`]；`addr` 必须是它返回过的地址。
-unsafe fn free_kstack(addr: usize) {
+pub unsafe fn free_kstack(addr: usize) {
     // SAFETY: 契约转交。
     unsafe {
         let base = *core::ptr::addr_of!(KSTACK_BASE);
@@ -1181,6 +1181,22 @@ static mut STARTUP_TIME: u32 = 0;
 pub unsafe fn set_startup_time(t: u32) {
     // SAFETY: 契约保证独占。
     unsafe { *core::ptr::addr_of_mut!(STARTUP_TIME) = t }
+}
+
+/// 把 PID 计数器清零。
+///
+/// init 进程（第一个用户态进程）**必须**是 pid 1——busybox init 和
+/// sysvinit 都硬检查 `getpid() == 1`。而 boot 期那些 selftest 内核线程
+/// （sched 的 worker 等）已经抢先占用了 pid 1/2，它们退出后槽位虽然
+/// 释放，`LAST_PID` 却没回退。所以在创建 init 之前把计数器归零，
+/// 让 `find_empty_process` 下一次分配拿到 pid 1。
+///
+/// # Safety
+/// 必须在「没有其他任务持有 1..=N 的 pid」且单线程（或关中断）时调用。
+/// boot 期在创建 init 前调用满足该前提。
+pub fn reset_last_pid() {
+    // SAFETY: 契约由调用者保证（boot 期单线程）。
+    unsafe { *core::ptr::addr_of_mut!(LAST_PID) = 0; }
 }
 
 /// 分配一个新的 PID

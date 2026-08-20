@@ -76,7 +76,7 @@ unsafe fn tmpfs_iget(is_dir: bool, perm: u16) -> usize {
         (*ip).i_gid = 0;
         (*ip).i_size = 0;
         (*ip).i_blksize = PAGE_SIZE as u32;
-        (*ip).data = [0; 9];
+        (*ip).data = [0; 15];
         if is_dir {
             (*ip).i_mode = mode::S_IFDIR | perm;
             (*ip).i_nlink = 2;
@@ -212,7 +212,7 @@ pub unsafe fn write(n: usize, pos: u64, buf: &[u8]) -> i64 {
         if page_count == 0 {
             // Allocate first page
             if let Some(pg) = alloc_data_page() {
-                (*ip).data[0] = pg as u16;
+                (*ip).data[0] = pg as u32;
                 (*ip).data[1] = 1;
                 start_page = pg;
                 page_count = 1;
@@ -234,7 +234,7 @@ pub unsafe fn write(n: usize, pos: u64, buf: &[u8]) -> i64 {
                 DATA_PAGES[next] = [0; PAGE_SIZE];
             }
             page_count += 1;
-            (*ip).data[1] = page_count as u16;
+            (*ip).data[1] = page_count as u32;
         }
 
         let mut offset = pos as usize;

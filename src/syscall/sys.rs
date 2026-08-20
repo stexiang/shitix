@@ -107,7 +107,20 @@ pub struct Stat {
 const IDENTITY_LIMIT: u64 = 0xC000_0000; // 3GB — covers kernel identity map + user space
 
 fn check_range(ptr: u64, len: u64) -> bool {
-    ptr != 0 && len <= IDENTITY_LIMIT && ptr.checked_add(len).is_some_and(|e| e <= IDENTITY_LIMIT)
+    if ptr == 0 {
+        return false;
+    }
+    // 低 3GB：恒等映射段。内核 selftest 把内核 rodata 当「用户指针」传也走这里，
+    // 必须保留（旧行为）；真实用户进程的低地址同样在此区间。
+    if len <= IDENTITY_LIMIT && ptr.checked_add(len).is_some_and(|e| e <= IDENTITY_LIMIT) {
+        return true;
+    }
+    // 高位地址（动态链接器 / 共享库被加载到 0x7f_... 等）不在恒等映射里，
+    // 但内核态 CR3 == 当前进程 PML4，可以直接访问。这里查用户页表确认真的
+    // 映射了（PRESENT|USER）。旧实现只看 3GB 上限，把 ld.so 的 .rodata 里那些
+    // writev 的 iovec 字符串全挡成 -EFAULT，导致 glibc 错误信息只打出程序名。
+    let pml4 = crate::mm::paging::current_pml4();
+    crate::mm::area::verify_area(pml4, ptr, len, crate::mm::area::AccessMode::Read) == 0
 }
 
 /// 把用户传来的路径指针借成字节切片，顺带做 [`check_range`] 校验。
@@ -116,24 +129,40 @@ fn check_range(ptr: u64, len: u64) -> bool {
 ///
 /// # Safety
 /// 返回的切片只在本次系统调用期间使用；调用方不得让它逃出去。
+/// 判断 `[ptr, ptr+len)` 在当前任务下是否可读/可写。
+///
+/// 低 1GB（恒等映射）直接放行——这是老 `check_range` 的语义：内核态静态字符串
+/// （fs_init_thread 用 "init"/"/init" exec）和用户低段（堆、静态二进制）都覆盖在
+/// 恒等映射里。0x7f_… 高位（动态链接器/共享库/父进程栈/argv/envp）走 `verify_area`
+/// 查当前任务用户页表（顺带 resolve 惰性页）。
+///
+/// # Safety
+/// 只用于当前任务的系统调用上下文（`sched::current()` 有效）。
+unsafe fn user_ok(ptr: u64, len: u64, mode: crate::mm::area::AccessMode) -> bool {
+    if check_range(ptr, len) {
+        return true;
+    }
+    let pml4 = unsafe { (*crate::sched::task_ptr(crate::sched::current_index())).pml4 };
+    crate::mm::area::verify_area(pml4, ptr, len, mode) == 0
+}
+
 unsafe fn user_path<'a>(ptr: u64) -> Result<&'a [u8], i64> {
-    if !check_range(ptr, 1) {
+    if !user_ok(ptr, 1, crate::mm::area::AccessMode::Read) {
         return Err(-(EFAULT as i64));
     }
-    // SAFETY: check_range 保证起始地址在恒等映射内可读；strnlen 有上界，
-    // 不会越过 PATH_MAX 继续扫。
+    // SAFETY: user_ok 确认起始地址可读；strnlen 有上界，不会越过 4096 继续扫。
     let n = unsafe { crate::klib::string::strnlen(ptr as *const u8, 4096) };
     if n == 0 || n >= 4096 {
         return Err(-(EINVAL as i64));
     }
-    if !check_range(ptr, n as u64) {
+    if !user_ok(ptr, n as u64, crate::mm::area::AccessMode::Read) {
         return Err(-(EFAULT as i64));
     }
     // SAFETY: 同上，n 是刚量出来的长度，整段可读。
     Ok(unsafe { core::slice::from_raw_parts(ptr as *const u8, n) })
 }
 
-/// 把用户缓冲区借成可写切片，带 [`check_range`] 校验。
+/// 把用户缓冲区借成可写切片，带 [`user_ok`] 校验。
 ///
 /// # Safety
 /// 同 [`user_path`]。
@@ -141,14 +170,15 @@ unsafe fn user_buf_mut<'a>(ptr: u64, len: u64) -> Result<&'a mut [u8], i64> {
     if len == 0 {
         return Ok(&mut []);
     }
-    if !check_range(ptr, len) {
+    if !user_ok(ptr, len, crate::mm::area::AccessMode::Write) {
         return Err(-(EFAULT as i64));
     }
-    // SAFETY: check_range 保证整段在恒等映射内可读写。
+    // SAFETY: user_ok 确认整段可写（低 1GB 直过 / 高位查页表），当前 CR3 即该
+    // 任务 pml4，直接解引用等价于按用户页表访问。
     Ok(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) })
 }
 
-/// 把用户缓冲区借成只读切片，带 [`check_range`] 校验。
+/// 把用户缓冲区借成只读切片，带 [`user_ok`] 校验。
 ///
 /// # Safety
 /// 同 [`user_path`]。
@@ -156,7 +186,7 @@ unsafe fn user_buf<'a>(ptr: u64, len: u64) -> Result<&'a [u8], i64> {
     if len == 0 {
         return Ok(&[]);
     }
-    if !check_range(ptr, len) {
+    if !user_ok(ptr, len, crate::mm::area::AccessMode::Read) {
         return Err(-(EFAULT as i64));
     }
     // SAFETY: 同上。
@@ -319,6 +349,13 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     if at_phdr != 0 && pie_base > 0 { at_phdr += pie_base as u64; }
     if pie_base > 0 { entry += pie_base as u64; }
 
+    // 主程序入口（AT_ENTRY 用）。动态链接时下面会把 `entry` 覆盖成解释器
+    // （ld.so）的入口，但 AT_ENTRY 必须是**主程序**的入口——ld.so 加载完所有
+    // 库后要跳到这里。旧代码用同一个 `entry` 变量，AT_ENTRY 被写成了 ld.so
+    // 自己的入口，ld.so 完成重定位后跳回自己 → 循环/错乱（表现为 stderr 只
+    // 打出程序名 "/init" 就退 1）。
+    let main_entry = entry;
+
     // 6a. 如果有 PT_INTERP，加载动态链接器
     const INTERP_PIE_BASE: usize = 0x7f_0000_0000;
     if let Some(ipath) = interp_path {
@@ -348,20 +385,37 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                                 let ifoff = iphd.p_offset as usize;
                                 let iprot = crate::elf::phdr_prot_to_flags(iphd.p_flags);
                                 let istart = ivaddr & !0xFFF;
-                                let iend = page_align(ivaddr + imemsz) + 16 * PAGE_SIZE;
+                                let iend = page_align(ivaddr + imemsz);
                                 for va in (istart..iend).step_by(PAGE_SIZE) {
                                     let pg = get_free_page();
                                     if pg == 0 { break; }
                                     if !unsafe { paging::map_page(new_pml4, va, pg, iprot) } {
                                         free_page(pg); break;
                                     }
-                                    if va >= ivaddr && va < ivaddr + ifilesz {
-                                        let cs = if va < ivaddr { ivaddr - va } else { 0 };
-                                        let ce = core::cmp::min(PAGE_SIZE, ivaddr + ifilesz - va);
-                                        if ifoff + (va - ivaddr) + cs + (ce - cs) <= idata.len() {
-                                            unsafe { core::ptr::copy_nonoverlapping(
-                                                idata.as_ptr().add(ifoff + (va - ivaddr) + cs),
-                                                pg as *mut u8, ce - cs); }
+                                    // 从解释器**文件**读入段内容（不是从 ibuf 那一页缓冲）。
+                                    // 旧实现只用 read(ifd) 读了一页进 ibuf，再按 `ifoff + ...`
+                                    // 从 ibuf 拷——只要段在文件里的偏移 >= 一页（比如 glibc 的
+                                    // ld-linux 把 .text 放在 offset 0x1000），条件
+                                    // `ifoff+.. <= idata.len()` 就恒不成立，整段文本被装成
+                                    // 零页，ld.so 从入口开始跑的全是 0x00 字节。
+                                    // 这里对齐主程序加载器（第 8 步）的做法：lseek + 循环 read。
+                                    if va < ivaddr + ifilesz && va + PAGE_SIZE > ivaddr {
+                                        let copy_start = if va < ivaddr { ivaddr - va } else { 0 };
+                                        let copy_end = core::cmp::min(PAGE_SIZE, ivaddr + ifilesz - va);
+                                        let copy_len = copy_end - copy_start;
+                                        if copy_len > 0 {
+                                            let file_src = ifoff + (va - ivaddr) + copy_start;
+                                            unsafe {
+                                                crate::fs::read_write::lseek(ifd as usize, file_src as i64, crate::fs::SEEK_SET);
+                                                let dest = core::slice::from_raw_parts_mut(
+                                                    (pg as *mut u8).add(copy_start), copy_len);
+                                                let mut filled = 0usize;
+                                                while filled < copy_len {
+                                                    let n = crate::fs::read_write::read(ifd as usize, &mut dest[filled..]);
+                                                    if n <= 0 { break; }
+                                                    filled += n as usize;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -378,24 +432,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         }
     }
 
-    // 7. Map zero page writable.
-    //
-    // 历史：busybox 静态 glibc 早期 init 会经空指针读写/取指 NULL（观察到
-    // fork 子进程 robust-list 初始化读 %fs:0x10 为 0 后写 *(0+0x2d8)）。
-    // 不映第 0 页时这些访问直接 SIGSEGV，子进程起不来；映成 USER|RW 能让
-    // shell 与 echo/true 跑通。代价是 fork 子进程会把空指针写穿第 0 页、
-    // 级联腐败 malloc arena，导致 ls/cat 在 __libc_malloc 里 #GP（rip=0x42c08e）。
-    //
-    // 这是临时缓解，根治需要：(a) 排查 glibc TLS 自指针 %fs:0x10 为何为 0
-    //    （多半是 execve 的 auxv/TLS 布局与 glibc 预期不符）；
-    // (b) 移植 signal.c，让 SIGCHLD 等信号正确投递而非把父进程 RIP 打成 0。
-    // 两项做完即可删掉本块、恢复 NULL 保护。
-    {
-        let pg = get_free_page();
-        if pg != 0 {
-            unsafe { paging::map_page(new_pml4, 0, pg, paging::flags::SHARED); }
-        }
-    }
+    // 7. (第 0 页映射已移除：恢复 NULL 保护。)
 
     // 8. 加载主程序的 PT_LOAD 段
     let mut max_va: usize = 0;
@@ -491,7 +528,12 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     //    只给一页会溢出。分配 16 页（64KB）栈区，把 argv/envp/auxv 写在最顶页。
     const STACK_PAGES: usize = 16;
     let stack_top_off = STACK_PAGES * PAGE_SIZE;          // 栈区大小
-    let stack_base_va = core::cmp::max(USERSPACE_START as usize + 0x2000, max_va + 0x10000);
+    // 栈必须放在**高位地址**，远离数据段/堆（brk 在 max_va 之后向上长）。
+    // 旧实现 `max(max_va + 0x10000, ...)` 把栈正好放在数据段之后——而 brk
+    // 堆也从那里向上长，malloc 一旦 sbrk 就把堆顶进栈区，setup_frame 往栈
+    // 上写的信号帧蹦床字节（mov $15,%rax; syscall）直接砸进 malloc 出的
+    // WORD_LIST.next，变成 glibc 读到「代码字节」的野指针（0xf0000000...）。
+    let stack_base_va = 0x7FFF_FF00_0000usize;              // 高位规范地址，远离堆与 mmap
     let stack_top_va = stack_base_va + stack_top_off;     // 栈区最高虚拟地址（exclusive）
     // 仅映射栈页（每页一张物理页）。失败则逐页回滚。
     let mut mapped = 0usize;
@@ -531,7 +573,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     // 早先这里把 argv 硬编码成 argc=1/argv[0]="/bin/sh"，导致 cat 等程序拿不到
     // 命令行参数（永远只读 stdin）。现在从用户空间读真正的 argv/envp。
     let n_slots = PAGE_SIZE / 8;
-    let argc_slot: usize;
+    let argc_slot: isize;
     let execfn_va: u64;
     let platform_va: u64;
     let argv0_va: u64;
@@ -557,7 +599,10 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // 把一条用户字符串拷到栈字符串区，返回它的虚拟地址。
         // 失败（坏指针）时跳过该项（写一个空串占位），不致命。
         let mut put_user = |uptr: u64, cur: &mut *mut u8| -> u64 {
-            if uptr == 0 || !check_range(uptr, 1) {
+            // argv/envp 字符串在 0x7f_… 高位（父进程栈/堆），filename 在低段内核
+            // 静态字符串——两者都靠 user_ok（低 1GB 直过 + 高位查页表）判定。
+            let readable = uptr != 0 && user_ok(uptr, 1, crate::mm::area::AccessMode::Read);
+            if !readable {
                 // 空串占位
                 let p = cur.sub(1);
                 *p = 0;
@@ -576,7 +621,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
             // 对齐：保证后续 8 字节槽位区从 8 对齐开始（字符串区任意对齐都行，
             // 但 aux_top 算法要求字符串区结束后能 &!7）。
             let p = cur.sub(len);
-            if check_range(uptr, n as u64) {
+            if user_ok(uptr, n as u64, crate::mm::area::AccessMode::Read) {
                 core::ptr::copy_nonoverlapping(uptr as *const u8, p, n);
             }
             *p.add(n) = 0;
@@ -599,7 +644,9 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         if argv_arr != 0 {
             loop {
                 if argc >= MAX_ARGS { break; }
-                if !check_range(argv_arr + (argc as u64) * 8, 8) { break; }
+                // 指针数组本身在 0x7f_… 高位（父进程栈），check_range 1GB 会判无效
+                // 导致 argc=0；用 user_ok（低段直过 + 高位查页表）。
+                if !user_ok(argv_arr + (argc as u64) * 8, 8, crate::mm::area::AccessMode::Read) { break; }
                 let p = core::ptr::read_volatile((argv_arr + (argc as u64) * 8) as *const u64);
                 if p == 0 { break; } // NULL 终止
                 let va = put_user(p, &mut cur);
@@ -620,7 +667,7 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         if envp_arr != 0 {
             loop {
                 if envc >= MAX_ARGS { break; }
-                if !check_range(envp_arr + (envc as u64) * 8, 8) { break; }
+                if !user_ok(envp_arr + (envc as u64) * 8, 8, crate::mm::area::AccessMode::Read) { break; }
                 let p = core::ptr::read_volatile((envp_arr + (envc as u64) * 8) as *const u64);
                 if p == 0 { break; }
                 let va = put_user(p, &mut cur);
@@ -632,63 +679,82 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         execfn_va = put_user(filename_ptr, &mut cur);
 
         // 2) auxv/argv/argc 槽位区：从字符串区下方往下写。
-        let aux_top = (cur as usize) & !0x7; // 8 对齐
-        let mut i = (aux_top - (top_page as usize)) / 8 - 1; // 最高可用槽
-        let s = top_page as *mut u64;
-        s.add(i).write_volatile(0); i -= 1; // AT_NULL val
-        s.add(i).write_volatile(0); i -= 1; // AT_NULL key
-        s.add(i).write_volatile(0); i -= 1; // AT_HWCAP2(26) val
-        s.add(i).write_volatile(26); i -= 1; // AT_HWCAP2 key
-        s.add(i).write_volatile(0xbfebfbff | (1<<0) | (1<<9) | (1<<19)); i -= 1; // AT_HWCAP(16) val (SSE/SSE2/etc)
-        s.add(i).write_volatile(16); i -= 1; // AT_HWCAP key
-        s.add(i).write_volatile(100); i -= 1; // AT_CLKTCK(17) val
-        s.add(i).write_volatile(17); i -= 1; // AT_CLKTCK key
-        s.add(i).write_volatile(random_va); i -= 1; // AT_RANDOM(25) val
-        s.add(i).write_volatile(25); i -= 1; // AT_RANDOM key
-        s.add(i).write_volatile(platform_va); i -= 1; // AT_PLATFORM(15) val
-        s.add(i).write_volatile(15); i -= 1; // AT_PLATFORM key
-        s.add(i).write_volatile(execfn_va); i -= 1; // AT_EXECFN(31) val
-        s.add(i).write_volatile(31); i -= 1; // AT_EXECFN key
-        s.add(i).write_volatile(entry); i -= 1; // AT_ENTRY(9) val
-        s.add(i).write_volatile(9); i -= 1;    // AT_ENTRY key
-        s.add(i).write_volatile(interp_base); i -= 1; // AT_BASE(7) val
-        s.add(i).write_volatile(7); i -= 1;    // AT_BASE key
-        s.add(i).write_volatile(4096); i -= 1; // AT_PAGESZ(6) val
-        s.add(i).write_volatile(6); i -= 1;    // AT_PAGESZ key
-        s.add(i).write_volatile(phnum as u64); i -= 1; // AT_PHNUM(5) val
-        s.add(i).write_volatile(5); i -= 1;    // AT_PHNUM key
-        s.add(i).write_volatile(56); i -= 1;   // AT_PHENT(4) val
-        s.add(i).write_volatile(4); i -= 1;    // AT_PHENT key
-        s.add(i).write_volatile(at_phdr); i -= 1; // AT_PHDR(3) val
-        s.add(i).write_volatile(3); i -= 1;    // AT_PHDR key
-        s.add(i).write_volatile(0); i -= 1;    // AT_EGID(14) val
-        s.add(i).write_volatile(14); i -= 1;   // AT_EGID key
-        s.add(i).write_volatile(0); i -= 1;    // AT_GID(13) val
-        s.add(i).write_volatile(13); i -= 1;   // AT_GID key
-        s.add(i).write_volatile(0); i -= 1;    // AT_EUID(12) val
-        s.add(i).write_volatile(12); i -= 1;   // AT_EUID key
-        s.add(i).write_volatile(0); i -= 1;    // AT_UID(11) val
-        s.add(i).write_volatile(11); i -= 1;   // AT_UID key
-        s.add(i).write_volatile(0); i -= 1;    // AT_SECURE(23) val
-        s.add(i).write_volatile(23); i -= 1;   // AT_SECURE key
+        // 16 字节对齐 aux_top：这样最高槽号 i 恒为奇数（见下），配合「必要时
+        // 顶部垫一槽」能让 argc 最终落在偶数槽 → 入口 rsp 16 字节对齐。
+        let aux_top = (cur as usize) & !0xF;
+        // i 用 isize：argv/envp 很多时（gcc collect2 有 55~59 个参数），槽位区会
+        // 从顶页往下溢出到下一页。此时 i 会变负，旧实现 `top_page as *mut u64` 的
+        // `s.add(i)` 直接当物理地址用，负偏移会写到顶页下方 64KB 开外的垃圾地址，
+        // argv 数组读出来全是 NULL。改用 translate 按虚拟地址逐槽求物理地址。
+        let mut i: isize = ((aux_top - (top_page as usize)) / 8 - 1) as isize; // 最高可用槽
+        let slot = |idx: isize| -> *mut u64 {
+            let va = (stack_top_va as isize - PAGE_SIZE as isize) + idx * 8;
+            unsafe { paging::translate(new_pml4, va as usize) }.unwrap_or(0) as *mut u64
+        };
+        // SysV ABI：入口 %rsp 必须 16 字节对齐，而 %rsp 指向 argc 槽，其地址
+        // = top_page + argc_slot*8（top_page 页对齐），故 argc_slot 必须为偶数。
+        // 总槽数 = 顶部填充(0/1) + auxv36 + envp_NULL1 + envc + argv_NULL1
+        //          + argc + argc1 = (P + 39 + envc + argc)。i 恒奇，要 argc_slot
+        // 为偶需 (envc+argc+P) 为奇：envc+argc 为偶时 P=1，为奇时 P=0。
+        // 不垫这一槽，glibc ld.so 的 _dl_start 里 `movaps %xmm0,-0x70(%rbp)`
+        // 会因 rsp 未对齐触发 #GP。
+        if (envc + argc) & 1 == 0 {
+            slot(i).write_volatile(0); i -= 1; // 顶部填充槽（不被引用）
+        }
+        slot(i).write_volatile(0); i -= 1; // AT_NULL val
+        slot(i).write_volatile(0); i -= 1; // AT_NULL key
+        slot(i).write_volatile(0); i -= 1; // AT_HWCAP2(26) val
+        slot(i).write_volatile(26); i -= 1; // AT_HWCAP2 key
+        slot(i).write_volatile(0xbfebfbff | (1<<0) | (1<<9) | (1<<19)); i -= 1; // AT_HWCAP(16) val (SSE/SSE2/etc)
+        slot(i).write_volatile(16); i -= 1; // AT_HWCAP key
+        slot(i).write_volatile(100); i -= 1; // AT_CLKTCK(17) val
+        slot(i).write_volatile(17); i -= 1; // AT_CLKTCK key
+        slot(i).write_volatile(random_va); i -= 1; // AT_RANDOM(25) val
+        slot(i).write_volatile(25); i -= 1; // AT_RANDOM key
+        slot(i).write_volatile(platform_va); i -= 1; // AT_PLATFORM(15) val
+        slot(i).write_volatile(15); i -= 1; // AT_PLATFORM key
+        slot(i).write_volatile(execfn_va); i -= 1; // AT_EXECFN(31) val
+        slot(i).write_volatile(31); i -= 1; // AT_EXECFN key
+        slot(i).write_volatile(main_entry); i -= 1; // AT_ENTRY(9) val（主程序入口）
+        slot(i).write_volatile(9); i -= 1;    // AT_ENTRY key
+        slot(i).write_volatile(interp_base); i -= 1; // AT_BASE(7) val
+        slot(i).write_volatile(7); i -= 1;    // AT_BASE key
+        slot(i).write_volatile(4096); i -= 1; // AT_PAGESZ(6) val
+        slot(i).write_volatile(6); i -= 1;    // AT_PAGESZ key
+        slot(i).write_volatile(phnum as u64); i -= 1; // AT_PHNUM(5) val
+        slot(i).write_volatile(5); i -= 1;    // AT_PHNUM key
+        slot(i).write_volatile(56); i -= 1;   // AT_PHENT(4) val
+        slot(i).write_volatile(4); i -= 1;    // AT_PHENT key
+        slot(i).write_volatile(at_phdr); i -= 1; // AT_PHDR(3) val
+        slot(i).write_volatile(3); i -= 1;    // AT_PHDR key
+        slot(i).write_volatile(0); i -= 1;    // AT_EGID(14) val
+        slot(i).write_volatile(14); i -= 1;   // AT_EGID key
+        slot(i).write_volatile(0); i -= 1;    // AT_GID(13) val
+        slot(i).write_volatile(13); i -= 1;   // AT_GID key
+        slot(i).write_volatile(0); i -= 1;    // AT_EUID(12) val
+        slot(i).write_volatile(12); i -= 1;   // AT_EUID key
+        slot(i).write_volatile(0); i -= 1;    // AT_UID(11) val
+        slot(i).write_volatile(11); i -= 1;   // AT_UID key
+        slot(i).write_volatile(0); i -= 1;    // AT_SECURE(23) val
+        slot(i).write_volatile(23); i -= 1;   // AT_SECURE key
         // envp 终止 NULL
-        s.add(i).write_volatile(0); i -= 1;
+        slot(i).write_volatile(0); i -= 1;
         // envp[envc-1 .. 0]（逆序写）
         for k in (0..envc).rev() {
-            s.add(i).write_volatile(envp_vas[k]); i -= 1;
+            slot(i).write_volatile(envp_vas[k]); i -= 1;
         }
         // argv 终止 NULL
-        s.add(i).write_volatile(0); i -= 1;
+        slot(i).write_volatile(0); i -= 1;
         // argv[argc-1 .. 0]（逆序写）
         for k in (0..argc).rev() {
-            s.add(i).write_volatile(argv_vas[k]); i -= 1;
+            slot(i).write_volatile(argv_vas[k]); i -= 1;
         }
         // argc
-        s.add(i).write_volatile(argc as u64);
+        slot(i).write_volatile(argc as u64);
         argc_slot = i;
     }
     // user_rsp 指向 argc 槽的虚拟地址。
-    let user_rsp = stack_top_va as u64 - ((n_slots - argc_slot) * 8) as u64;
+    let user_rsp = stack_top_va as u64 - ((n_slots as isize - argc_slot) * 8) as u64;
 
     // 8. 设置当前任务使用新页表，并立即加载 CR3。
     unsafe {
@@ -698,9 +764,17 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // execve 不会切任务，所以 switch_to_task 不会替我们换 CR3——
         // 必须在这里立即加载，否则 iretq 后 CPU 还在用旧的（可能是 boot）CR3。
         core::arch::asm!("mov cr3, {}", in(reg) new_pml4 as u64, options(preserves_flags));
-        // CR3 已切换到新 PML4，现在安全释放旧 PML4
-        if old_pml4 != 0 && old_pml4 != new_pml4 {
+        // CR3 已切换到新 PML4，现在安全释放旧 PML4。
+        // VFORK 子进程的 old_pml4 是与被挂起父进程共享的页表，不能 free
+        // （父进程 resume 后还要用它），留给父进程。
+        if old_pml4 != 0 && old_pml4 != new_pml4 && (*me).vfork_parent == 0 {
             crate::mm::free_page(old_pml4);
+        }
+        // VFORK：子进程已完成 exec，唤醒被挂起的父进程。
+        if (*me).vfork_parent != 0 {
+            let vp = (*me).vfork_parent;
+            (*me).vfork_parent = 0;
+            (*sched::task_ptr(vp)).state = crate::sched::task::TaskState::Running;
         }
         // 清掉 TLS：新程序从「无 TLS」状态开始，父进程遗留的 fs_base/gs_base
         // 指向已随 exec 失效的旧地址空间，留着会让新程序在第一次 %fs 访问
@@ -723,6 +797,20 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     regs.rflags = 0x202;
     regs.ss = USER_DS as u64;
     regs.rax = 0;
+    // rdx 是 SysV ABI 的「rtld_fini」寄存器：静态二进制 _start 会把入口时的
+    // rdx 当 atexit 函数指针传给 __libc_start_main。内核发起的 execve（LFS boot
+    // 用 syscall3(EXECVE,path,0,envp)）会把 rdx 留成 envp 的内核栈地址，静态
+    // glibc 注册成退出处理函数，exit 时 call *%rax 跳进内核栈地址 → #PF。
+    // Linux 在 start_thread 里显式清 dx，这里对齐：清掉所有可能泄漏内核地址的
+    // 调用者保存参数寄存器（rdi/rsi/rdx/rcx/r8/r9/r10/r11）。
+    regs.rdx = 0;
+    regs.rdi = 0;
+    regs.rsi = 0;
+    regs.rcx = 0;
+    regs.r8 = 0;
+    regs.r9 = 0;
+    regs.r10 = 0;
+    regs.r11 = 0;
 
     // 清理
     unsafe {
@@ -1136,14 +1224,13 @@ pub fn brk(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
                 // 的 4KB 表项（见 paging::next_level 的 HUGE 分支）。用 translate() 会把
                 // 这些内核拆分页误判为已映射；这里必须用 is_user_mapped，否则 brk 分配
                 // 出的堆页仍是内核专用页，用户态一访问就 err=0x5。
-                if !paging::is_user_mapped(pml4, va) {
-                    let pg = get_free_page();
-                    if pg == 0 { return old_brk as i64; }
-                    // map_page 会覆盖该 PTE（哪怕是内核拆分页），换上新的用户物理页。
-                    // 不释放被覆盖的内核物理页——它属于内核恒等映射，由内核自身管理。
-                    if !paging::map_page(pml4, va, pg, paging::flags::SHARED) {
-                        free_page(pg);
-                        return old_brk as i64;
+                if !paging::is_user_mapped(pml4, va) && !paging::is_reserved(pml4, va) {
+                    // 惰性分配：堆页先保留，等首次访问再由 page fault 落实物理页。
+                    if !paging::map_reserved(pml4, va, paging::flags::SHARED) {
+                        // 失败必须返回负 errno（ENOMEM），不能返回 old_brk 这个
+                        // 正地址——glibc 的 sbrk 靠 `brk()<0` 判失败，返回旧
+                        // 断点会被当成成功，__curbrk 被推进到一个没映射的地址。
+                        return -(crate::klib::errno::ENOMEM as i64);
                     }
                 }
                 va += crate::mm::PAGE_SIZE;
@@ -1340,42 +1427,75 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             if f == crate::fs::inode::NIL { return -(EBADF as i64); }
             let ino = unsafe { crate::fs::file_table::filp(f).f_inode };
             if ino == crate::fs::inode::NIL { return -(EBADF as i64); }
-            // Check file size bounds
             let fsize = unsafe { crate::fs::inode::inode(ino).i_size as u64 };
-            let map_end = offset + len;
-            if map_end > fsize && fsize > 0 { return -(EINVAL as i64); }
 
+            let mut mapped = 0usize;
             for i in 0..npages {
                 let pg = get_free_page();
-                if pg == 0 { return -(ENOMEM as i64); }
+                if pg == 0 {
+                    // ENOMEM 时回滚已映射的页，别泄漏（旧实现直接 return 漏掉）。
+                    for k in 0..mapped {
+                        let va = map_addr + k * crate::mm::PAGE_SIZE;
+                        if let Some(phys) = paging::translate(pml4, va) {
+                            paging::unmap_page(pml4, va);
+                            free_page(phys);
+                        }
+                    }
+                    return -(ENOMEM as i64);
+                }
                 let va = map_addr + i * crate::mm::PAGE_SIZE;
                 if !paging::map_page(pml4, va, pg, pg_flags) {
-                    free_page(pg); return -(ENOMEM as i64);
+                    free_page(pg);
+                    for k in 0..mapped {
+                        let va = map_addr + k * crate::mm::PAGE_SIZE;
+                        if let Some(phys) = paging::translate(pml4, va) {
+                            paging::unmap_page(pml4, va);
+                            free_page(phys);
+                        }
+                    }
+                    return -(ENOMEM as i64);
                 }
-                // Read file content into this page
+                mapped += 1;
+                // 从文件读取本页内容。
+                // 关键 bug 修复：mmap 的 `offset` 语义是「从文件的 offset 处开始
+                // 映射」，与 fd 的 f_pos 无关。旧实现直接 read(fd,..) 靠 f_pos 推进，
+                // 只对 offset==0 且逐页连续的情况碰巧正确；动态链接器按段文件偏移
+                // mmap libc 的每个 LOAD 段（offset 常非 0），靠 f_pos 会读到错页，
+                // 把 libc 的代码装成别的数据。这里 lseek 到 file_off 再读。
+                //
+                // 同时允许映射越过文件末尾（POSIX 语义：越界字节读作 0）：glibc
+                // 的段映射 memsz>=filesz（BSS 在文件末尾之外），旧代码 `map_end>fsize
+                // → EINVAL` 会误拒这种合法映射。
                 let file_off = offset + (i * crate::mm::PAGE_SIZE) as u64;
-                let read_len = core::cmp::min(crate::mm::PAGE_SIZE as u64, len - (i * crate::mm::PAGE_SIZE) as u64);
-                let buf = unsafe { core::slice::from_raw_parts_mut(pg as *mut u8, crate::mm::PAGE_SIZE) };
-                let ret = unsafe { crate::fs::read_write::read(fd as usize, &mut buf[..read_len as usize]) };
-                // Note: read advances f_pos, so only the first read is at the right offset.
-                // For page-aligned, zero-offset mappings this works; for arbitrary offsets,
-                // lseek before read would be needed. The dynamic linker always maps from offset 0.
-                if ret < 0 { free_page(pg); paging::unmap_page(pml4, va); return ret; }
-                // Zero remaining bytes (BSS-like)
-                for j in read_len as usize..crate::mm::PAGE_SIZE { buf[j] = 0; }
+                let map_bytes = core::cmp::min(crate::mm::PAGE_SIZE as u64, len - (i * crate::mm::PAGE_SIZE) as u64);
+                let avail = if file_off < fsize { fsize - file_off } else { 0 };
+                let read_len = core::cmp::min(map_bytes, avail) as usize;
+                if read_len > 0 {
+                    let buf = unsafe { core::slice::from_raw_parts_mut(pg as *mut u8, read_len) };
+                    unsafe {
+                        crate::fs::read_write::lseek(fd as usize, file_off as i64, crate::fs::SEEK_SET);
+                        let mut filled = 0usize;
+                        while filled < read_len {
+                            let n = crate::fs::read_write::read(fd as usize, &mut buf[filled..]);
+                            if n <= 0 { break; }
+                            filled += n as usize;
+                        }
+                    }
+                }
+                // 剩余部分（BSS / 越过文件末尾）保持 0（get_free_page 已清零）。
             }
             return map_addr as i64;
         }
 
-        // MAP_ANONYMOUS: zero-filled pages
+        // MAP_ANONYMOUS: 惰性分配（先保留虚拟空间，物理页等首次访问时
+        // 由 page fault 的 resolve_reserved 再落实）。glibc 初始化 malloc
+        // 主竞技场会一次 mmap ~1.4GB，若这里每页都立刻 get_free_page，
+        // 256MB 内存直接吃光。
         if flags & MAP_ANONYMOUS == 0 { return -(ENOSYS as i64); }
 
         for i in 0..npages {
-            let pg = get_free_page();
-            if pg == 0 { return -(ENOMEM as i64); }
             let va = map_addr + i * crate::mm::PAGE_SIZE;
-            if !paging::map_page(pml4, va, pg, pg_flags) {
-                free_page(pg);
+            if !unsafe { paging::map_reserved(pml4, va, pg_flags) } {
                 return -(ENOMEM as i64);
             }
         }
@@ -1920,12 +2040,17 @@ pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if args.a2 < need {
         return -(EINVAL as i64);
     }
-    if !check_range(args.a1, need) {
+    // 用 user_ok（低 1GB 直过 + 高位查页表）而非 check_range 1GB：
+    // readdir 的缓冲可能是高位 malloc/mmap 出来的，1GB 护栏会误拒。
+    if !unsafe { user_ok(args.a1, need, crate::mm::area::AccessMode::Write) } {
         return -(EFAULT as i64);
     }
     // 一次只返回一项：fs 层的 readdir 就是单项语义（原版 1.0.9 的
     // `sys_readdir` 同样一次一项，getdents 是 1.2 之后才有的批量接口）。
-    let mut d = crate::fs::Dirent { d_ino: 0, d_off: 0, d_reclen: need as u16, d_type: 0, d_name: [0; 32] };
+    // 用 zeroed() 而不是结构体字面量：Dirent 带 #[repr(C)]，d_name 之后的
+    // 尾随 padding（对齐到 8）字面量不初始化，会把内核栈垃圾写进用户缓冲。
+    let mut d: crate::fs::Dirent = unsafe { core::mem::zeroed() };
+    d.d_reclen = need as u16;
     // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
     let r = unsafe { crate::fs::read_write::readdir(fd as usize, &mut d) };
     if r <= 0 {
@@ -2149,7 +2274,7 @@ pub fn recvmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 实现 fork() 系统调用。
 pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::EAGAIN;
-    use crate::sched::task::{KERNEL_STACK_SIZE, STACK_MAGIC, TaskState};
+    use crate::sched::task::{STACK_MAGIC, TaskState};
     const CLONE_SIGHAND: u64 = 0x800;
     let flags = 0u64; // fork never sets CLONE_SIGHAND
 
@@ -2191,8 +2316,9 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
 
             let parent_nr = sched::current_nr();
 
-            // 先把栈拿到手，失败了就不用回滚任务表。
-            let stack_page = crate::mm::get_free_page();
+            // 先把栈拿到手，失败了就不用回滚任务表。内核栈从池里取
+            // （连续、对齐），不能用单页 get_free_page（KSTACK_SIZE=4 页）。
+            let stack_page = sched::alloc_kstack();
             if stack_page == 0 {
                 crate::pr_warn!("sys_fork: out of memory for kernel stack");
                 return -(EAGAIN as i64);
@@ -2237,7 +2363,7 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
                     || !crate::mm::paging::cow_copy_page_table((*parent).pml4, child_pml4)
                 {
                     if child_pml4 != 0 { crate::mm::free_page(child_pml4); }
-                    crate::mm::free_page(stack_page);
+                    sched::free_kstack(stack_page);
                     return -(EAGAIN as i64);
                 }
                 (*child).pml4 = child_pml4;
@@ -2280,7 +2406,7 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             //   [tss.rsp + 0 .. +48]  switch_to 的 7 个保存槽
             //   [tss.rsp + 56]        返回地址 = ret_from_fork
             //   [tss.rsp + 64 ..]     pt_regs（ret_from_sys_call 要用）
-            let stack_top = stack_page as u64 + KERNEL_STACK_SIZE as u64;
+            let stack_top = stack_page as u64 + crate::sched::KSTACK_SIZE as u64;
             // 栈底魔数，供 stack_ok() / die_if_kernel 检测溢出。
             core::ptr::write_volatile(stack_page as *mut u64, STACK_MAGIC);
 
@@ -2577,7 +2703,23 @@ pub fn getrandom(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let buf = args.a0 as *mut u8;
     let len = args.a1 as usize;
     if buf.is_null() { return -(EINVAL as i64); }
-    unsafe { core::ptr::write_bytes(buf, 0, len.min(256)); }
+    let n = len.min(256);
+    unsafe {
+        // 伪随机：rdtsc + 静态计数做种子，xorshift 展开。glibc mkstemps 靠
+        // 这个生成临时文件后缀，若恒返回 0（旧实现），gcc 每次都用同一个
+        // 临时名，第二次编译就 EEXIST「File exists」。
+        let mut lo: u32 = 0; let mut hi: u32 = 0;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+        static mut CTR: u64 = 0x9E3779B97F4A7C15;
+        let mut s = ((hi as u64) << 32 | lo as u64).wrapping_add(*core::ptr::addr_of!(CTR));
+        *core::ptr::addr_of_mut!(CTR) = (*core::ptr::addr_of!(CTR)).wrapping_add(0x9E3779B97F4A7C15);
+        for i in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *buf.add(i) = (s >> 32) as u8;
+        }
+    }
     len as i64
 }
 
@@ -2955,10 +3097,33 @@ pub fn sched_setaffinity(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 // --- 纯占位：对应子系统未移植，统一返回 -ENOSYS -----------------------------
 
 // rt_sigaction 等见下面 LFS Critical Syscalls 段
-/// 指定偏移读，不改 f_pos。要先给 fs 层加一个不动 f_pos 的读路径。
-pub fn pread64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 指定偏移写，不改 f_pos。同 [`pread64`]。
-pub fn pwrite64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 指定偏移读，不改 f_pos。对应 `sys_pread64()`。
+///
+/// glibc 的动态链接器 `_dl_map_object_from_fd` 用 `__pread64_nocancel` 读
+/// 共享库的 ELF 头/程序头——不是从 f_pos 0 读，而是带偏移的定位读。旧存根
+/// 返回 0，ld.so 读到空数据 → 「cannot read file data」。
+pub fn pread64(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    let fd = args.a0;
+    let offset = args.a3;
+    // 保存当前 f_pos，读完恢复（POSIX：pread 不改变文件偏移）。
+    let old_pos = unsafe { crate::fs::read_write::lseek(fd as usize, 0, crate::fs::SEEK_CUR) };
+    unsafe { crate::fs::read_write::lseek(fd as usize, offset as i64, crate::fs::SEEK_SET); }
+    let sub = SysArgs { a0: fd, a1: args.a1, a2: args.a2, a3: 0, a4: 0, a5: 0 };
+    let r = read(&sub, regs);
+    unsafe { crate::fs::read_write::lseek(fd as usize, old_pos, crate::fs::SEEK_SET); }
+    r
+}
+/// 指定偏移写，不改 f_pos。对应 `sys_pwrite64()`。同 [`pread64`] 的 f_pos 保存/恢复。
+pub fn pwrite64(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    let fd = args.a0;
+    let offset = args.a3;
+    let old_pos = unsafe { crate::fs::read_write::lseek(fd as usize, 0, crate::fs::SEEK_CUR) };
+    unsafe { crate::fs::read_write::lseek(fd as usize, offset as i64, crate::fs::SEEK_SET); }
+    let sub = SysArgs { a0: fd, a1: args.a1, a2: args.a2, a3: 0, a4: 0, a5: 0 };
+    let r = write(&sub, regs);
+    unsafe { crate::fs::read_write::lseek(fd as usize, old_pos, crate::fs::SEEK_SET); }
+    r
+}
 /// 内核内文件到文件的搬运。需要 fs 层的 splice 基础设施。
 pub fn sendfile(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::{EBADF, EINVAL, ENOMEM, EOVERFLOW};
@@ -3061,7 +3226,7 @@ pub fn sendfile(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// clone syscall — 创建进程/线程。flags 控制资源共享。
 pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::EAGAIN;
-    use crate::sched::task::{KERNEL_STACK_SIZE, STACK_MAGIC, TaskState};
+    use crate::sched::task::{STACK_MAGIC, TaskState};
 
     let flags = args.a0 as u64;
     let child_stack = args.a1; // 新线程的用户栈
@@ -3101,12 +3266,14 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     };
     let Some(child_nr) = child_nr else { return -(EAGAIN as i64); };
 
-    let stack_page = if flags & CLONE_VM != 0 {
-        // Thread: use the provided user stack pointer as kernel stack base
-        // (kernel stack = a page below child_stack_top, for simplicity)
-        crate::mm::get_free_page()
-    } else {
-        crate::mm::get_free_page()
+    // 内核栈从预划的池里取（连续、对齐）。不能用 get_free_page 单页：
+    // KSTACK_SIZE 是 4 页，单页分配会让第 2..4 页与别的 get_free_page 分配
+    // 重叠，clone 的 pt_regs 写会覆盖掉用户栈（bug：posix_spawn 子栈读垃圾）。
+    let stack_page = unsafe {
+        let f = crate::irq::local_irq_save();
+        let s = sched::alloc_kstack();
+        crate::irq::restore_flags(f);
+        s
     };
     if stack_page == 0 { return -(EAGAIN as i64); }
 
@@ -3151,6 +3318,15 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         } else {
             (*child).pid = sched::allocate_pid();
             (*child).parent = parent_nr;
+        }
+
+        // CLONE_VFORK：挂起父进程，直到子进程 execve 或退出。glibc 的
+        // posix_spawn(system) 用 CLONE_VM|CLONE_VFORK：子进程在父进程的
+        // 地址空间里跑，父进程必须停住，否则父进程 __spawnix 里立即 munmap
+        // 子栈会把子进程还在用的栈页卸掉。
+        if flags & CLONE_VFORK != 0 {
+            (*child).vfork_parent = parent_nr;
+            (*parent).state = TaskState::Interruptible;
         }
 
         if flags & CLONE_PARENT != 0 {
@@ -3216,7 +3392,7 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         }
 
         // 布置子进程内核栈
-        let stack_top = stack_page as u64 + KERNEL_STACK_SIZE as u64;
+        let stack_top = stack_page as u64 + crate::sched::KSTACK_SIZE as u64;
         core::ptr::write_volatile(stack_page as *mut u64, STACK_MAGIC);
 
         let mut sp = stack_top as *mut u64;
@@ -3241,6 +3417,10 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
 
         (*child).tss.rsp = sp as u64;
         (*child).tss.rsp0 = stack_top;
+        // 关键：把内核栈基址记进 PCB，release() 靠它 free_kstack。
+        // 漏掉会继承父进程的 kernel_stack，子进程退出时 free 错槽位
+        //（free 掉父进程/fsinit 的栈），下一个 clone 就拿到重叠的栈。
+        (*child).kernel_stack = stack_page as u64;
 
         // 挂进调度环
         let old_next = (*sched::task_ptr(parent_nr)).next;
@@ -3249,7 +3429,14 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         (*sched::task_ptr(parent_nr)).next = child_nr;
         (*sched::task_ptr(old_next)).prev = child_nr;
 
-        (*child).pid as i64
+        let child_pid = (*child).pid as i64;
+        // VFORK：父进程立刻让出 CPU，让子进程先跑（execve/退出会唤醒父进程）。
+        // 不这样做父进程会在 schedule 前继续返回用户态，glibc __spawnix 立即
+        // munmap 子栈，而子进程还没开始用那个栈。
+        if flags & CLONE_VFORK != 0 {
+            sched::schedule();
+        }
+        child_pid
     }
 }
 /// 进程跟踪。需要 `arch_ptrace` 与调试寄存器支持。
@@ -3367,10 +3554,14 @@ pub fn rt_sigprocmask(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         }
         if set_ptr != 0 {
             let set = core::ptr::read_volatile(set_ptr as *const u64);
+            // 三个操作符此前全写反了（SIG_BLOCK 写成覆盖、SIG_UNBLOCK 写成
+            // 或、SIG_SETMASK 写成 old&~set），导致 glibc 启动时把几乎所有
+            // 信号（含 SIGSEGV）都屏蔽掉，异常无法投递 → 用户态 #GP 死循环。
+            // Linux 语义：BLOCK=并集，UNBLOCK=差集，SETMASK=替换。
             match how {
-                0 => (*t).blocked = set,                             // SIG_BLOCK
-                1 => (*t).blocked |= set,                            // SIG_UNBLOCK
-                2 => (*t).blocked = (old | set) ^ set,               // SIG_SETMASK
+                0 => (*t).blocked |= set,                             // SIG_BLOCK
+                1 => (*t).blocked &= !set,                            // SIG_UNBLOCK
+                2 => (*t).blocked = set,                              // SIG_SETMASK
                 _ => return -(EINVAL as i64),
             }
         }

@@ -95,8 +95,9 @@ pub struct Inode {
     pub i_op: FsType,
 
     /// 文件系统私有数据。minix 用作 `i_zone[9]`（7 直接 + 1 一级间接 +
-    /// 1 二级间接）。原版 `union u` 里的 `minix_inode_info`。
-    pub data: [u16; 9],
+    /// 1 二级间接）；ext2/ext4 用作直接块号（12 个直接块指针，u32）。
+    /// 原版 `union u` 里的 `minix_inode_info`。
+    pub data: [u32; 15],
 
     /// 槽位是否在用。原版靠 `i_count` 与 `first_inode` 链区分，
     /// 我们是定长表，需要一个显式标记（同 `TaskState::Unused` 的用意）。
@@ -126,7 +127,7 @@ impl Inode {
             i_sb: NIL,
             i_mount: NIL,
             i_op: FsType::None,
-            data: [0; 9],
+            data: [0; 15],
             in_use: false,
         }
     }
