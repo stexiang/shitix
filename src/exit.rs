@@ -194,10 +194,13 @@ pub fn release(task_idx: usize) -> i32 {
             (*task).kernel_stack = 0;
         }
 
-        // 释放用户页表 PML4 页（在父进程上下文回收，此时 CR3 已切走，安全）。
-        // TODO: 递归释放 PDPT/PD/PT 子树（目前只回收 PML4 页自身）。
+        // 释放用户地址空间的全部用户页 + PDPT/PD/PT 子树，再回收 PML4 页。
+        // （在父进程上下文回收，此时 CR3 已切走，安全。）之前只 free_page(pml4)
+        // 回收 PML4 页自身，用户物理页与页表页全部泄漏，gcc/g++ 连跑几次就把
+        // 空闲页耗尽。
         let pml4 = (*task).pml4;
         if pml4 != 0 {
+            unsafe { crate::mm::paging::free_user_pages(pml4) };
             crate::mm::free_page(pml4);
             (*task).pml4 = 0;
             (*task).tss.cr3 = 0;

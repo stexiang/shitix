@@ -894,8 +894,8 @@ pub unsafe fn try_handle_cow_fault(fault_addr: u64, pml4: usize) -> Option<bool>
             // 再拷贝整页：否则拷贝起点带偏移，会把源页后半段 + 下一物理页前半段
             // 错位写进新页，导致 TLS 自指针等字段落到垃圾上（fork 子进程
             // robust-list 初始化读到 self=0 的根因）。
-            let src = (phys & !(crate::mm::page::PAGE_SIZE - 1)) as *const u8;
-            let dst = new_page as *mut u8;
+            let src = (crate::mm::paging::PHYS_MAP_BASE + (phys & !(crate::mm::page::PAGE_SIZE - 1))) as *const u8;
+            let dst = (crate::mm::paging::PHYS_MAP_BASE + new_page) as *mut u8;
             // SAFETY: 两边都是有效的、页对齐的物理页面，各拷贝 PAGE_SIZE 字节。
             unsafe {
                 core::ptr::copy_nonoverlapping(src, dst, crate::mm::page::PAGE_SIZE);

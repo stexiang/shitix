@@ -17,6 +17,7 @@
 //!     里那套「低端内存 + BIOS 洞」的硬编码假设
 
 use super::page::{PAGE_SHIFT, PAGE_SIZE, map_nr, page_align};
+use super::paging::PHYS_MAP_BASE;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 保留页标记。同原版 `MAP_PAGE_RESERVED`。
@@ -370,7 +371,7 @@ unsafe fn push_free(base: usize) {
             base, high
         );
         if cfg!(debug_assertions) {
-            let cookie = core::ptr::read_volatile((base + 8) as *const usize);
+            let cookie = core::ptr::read_volatile((PHYS_MAP_BASE + base + 8) as *const usize);
             assert!(
                 cookie != FREE_COOKIE,
                 "page {:#x} freed twice (already on free list)",
@@ -378,13 +379,13 @@ unsafe fn push_free(base: usize) {
             );
         }
         let head = free_list_head();
-        core::ptr::write_volatile(base as *mut usize, head);
-        core::ptr::write_volatile((base + 8) as *mut usize, FREE_COOKIE);
+        core::ptr::write_volatile((PHYS_MAP_BASE + base) as *mut usize, head);
+        core::ptr::write_volatile((PHYS_MAP_BASE + base + 8) as *mut usize, FREE_COOKIE);
         // next 的冗余副本。链表指针存在页内容里，一旦有旧主人在 free
         // 之后继续写，链就断在这里；两份副本不一致就能立刻说出「被写坏
         // 的宽度」（只坏 8 字节 = 单个指针写；连 cookie 一起坏 = 大块
         // memset/memcpy）。
-        core::ptr::write_volatile((base + 16) as *mut usize, !head);
+        core::ptr::write_volatile((PHYS_MAP_BASE + base + 16) as *mut usize, !head);
         set_free_list_head(base);
     }
 }
@@ -435,15 +436,15 @@ unsafe fn get_free_page_locked() -> usize {
             );
         }
         // SAFETY: page 是页对齐、< HIGH_MEMORY 的空闲页，头 8 字节存着下一项。
-        let next = core::ptr::read_volatile(page as *const usize);
+        let next = core::ptr::read_volatile((PHYS_MAP_BASE + page) as *const usize);
         if cfg!(debug_assertions) {
-            let mirror = core::ptr::read_volatile((page + 16) as *const usize);
+            let mirror = core::ptr::read_volatile((PHYS_MAP_BASE + page + 16) as *const usize);
             assert!(
                 mirror == !next,
                 "free page {:#x}: next={:#x} but mirror={:#x} (link overwritten)",
                 page, next, mirror
             );
-            let cookie = core::ptr::read_volatile((page + 8) as *const usize);
+            let cookie = core::ptr::read_volatile((PHYS_MAP_BASE + page + 8) as *const usize);
             assert!(
                 cookie == FREE_COOKIE,
                 "page {:#x} on free list was written after being freed \
@@ -463,7 +464,7 @@ unsafe fn get_free_page_locked() -> usize {
         );
         // 抹掉 cookie，避免这一页被派出去后原封不动地拿回来时
         // 「重复 free」检查漏判。
-        core::ptr::write_volatile((page + 8) as *mut usize, 0);
+        core::ptr::write_volatile((PHYS_MAP_BASE + page + 8) as *mut usize, 0);
         *mm_ent(nr) = 1;
         // COW 引用计数：新派发的页归单一所有者，初始化为 1。
         // 这样 fork 时 cow_copy_page_table 的 page_ref_inc 会把它抬到 2，
@@ -483,7 +484,7 @@ pub fn get_free_page() -> usize {
     // 极远（实测：ramdisk init 在第 19/21/26 页突然 OOM，而空闲页 65214）。
     if page != 0 {
         // SAFETY: page 是刚从空闲链表摘下的一整页，独占持有，清零安全。
-        unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE) }
+        unsafe { core::ptr::write_bytes((PHYS_MAP_BASE + page) as *mut u8, 0, PAGE_SIZE) }
     }
     page
 }

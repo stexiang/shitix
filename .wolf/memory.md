@@ -427,3 +427,5 @@
 
 | Time | Action | File(s) | Outcome | ~Tokens |
 |------|--------|---------|---------|--------|
+| 17:28 | 构建交互式 /init：lfs-docker/init.c 改为自包含（_start + 内联 syscall，-nostdlib -static），fork/execve /bin/sh -i + wait4 respawn 循环；编译出 13.5KB 静态 ELF，注入 lfs3.img 的 /init（e2fsck 干净、字节一致） | lfs-docker/init.c, lfs-docker/init, lfs3.img | 交互 shell init 就绪 | ~8k |
+| 18:05 | make install 自动加引导扇区：install.sh 检测 ROOTIMG(或 loop 挂载回推)的扇区0 0xAA55，缺失则生成 combined 镜像(1MB 内核前缀 + rootfs 后缀)；Makefile install 目标补传 CONFIG_ROOTIMG | scripts/install.sh, Makefile | 单盘可引导镜像自动生成，实测启动到 BusyBox sh | ~6k |

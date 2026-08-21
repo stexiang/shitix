@@ -197,7 +197,12 @@ pub struct Framebuffer {
 impl Framebuffer {
     pub fn map(info: &FbInfo) -> Option<Self> {
         let pages = (info.pitch as usize * info.height as usize + 0xFFF) / 0x1000;
-        let vaddr = 0xFFFF_8000_0000_0000usize;
+        // 必须避开 PHYS_MAP_BASE（0xffff_8000_0000_0000）：那里是物理 0..1GB 的
+        // 高半区直接映射，页表（entry/set_entry）和页分配器的空闲链表指针都靠
+        // `PHYS_MAP_BASE + phys` 访问。把 LFB 映到 PHYS_MAP_BASE 会覆盖掉低 3MB
+        // 的直接映射（物理 0x4000 页表、mem_map 等），后续 map_page 的页表访问
+        // 就撞进帧缓冲 → 卡死。选一个独立的高半区规范地址。
+        let vaddr = 0xFFFF_9000_0000_0000usize;
         let pml4 = paging::current_pml4();
         if pml4 == 0 { return None; }
         unsafe {

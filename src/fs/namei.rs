@@ -77,7 +77,7 @@ fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 ///
 /// # Safety
 /// 只能在进程上下文调用。`ip` 是已 `iget` 的 inode。
-unsafe fn read_symlink_target(ip: usize) -> Option<([u8; 256], usize)> {
+pub unsafe fn read_symlink_target(ip: usize) -> Option<([u8; 256], usize)> {
     // SAFETY: 契约转交。
     unsafe {
         let iop = core::ptr::addr_of!((*inode::inode_ptr(ip)).i_op).read_volatile();

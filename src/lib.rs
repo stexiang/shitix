@@ -94,6 +94,13 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as usize;
     println!("kernel image ends at {:#x}", kernel_end);
 
+    // 建高半区直接映射（物理 0..1GB → PHYS_MAP_BASE..）。必须在 mm::init 之前：
+    // page_alloc::init 建空闲链表时 push_free 走的就是高半区映射，晚于它建链
+    // 会 fault（高半区还没映射）。此后低 1GB 恒等映射会被用户 ELF 覆盖，
+    // 内核一律改走高半区访问物理内存。
+    // SAFETY: 启动早期、恒等映射（低 1GB）完好，用固定物理页 0x7000 直写。
+    mm::paging::init_high_map();
+
     // 对应原版 start_kernel 的 mem_init(...)
     // SAFETY: 启动早期，中断仍关闭（head.S 未 sti），只调用一次；
     // kernel_end 来自链接脚本，e820::usable 反映真实物理内存。

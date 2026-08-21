@@ -107,11 +107,12 @@ pub unsafe fn copy_from_user(kern_dst: *mut u8, user_src: u64, len: usize, pml4:
             return -(EFAULT as i64);
         };
 
-        // 恒等映射下物理地址 == 内核虚拟地址
-        // SAFETY: translate 成功说明页已映射且 USER 位置位；物理地址在恒等映射内。
+        // 物理地址经高半区直接映射访问：低 1GB 恒等映射会被用户 ELF 覆盖，
+        // 直接按物理地址解引用会读到用户页而非真实物理页。
+        // SAFETY: translate 成功说明页已映射且 USER 位置位；物理地址在高半区映射内。
         unsafe {
             core::ptr::copy_nonoverlapping(
-                phys_addr as *const u8,
+                (paging::PHYS_MAP_BASE + phys_addr) as *const u8,
                 kern_dst.add(copied),
                 chunk,
             );
@@ -149,11 +150,11 @@ pub unsafe fn copy_to_user(user_dst: u64, kern_src: *const u8, len: usize, pml4:
             return -(EFAULT as i64);
         };
 
-        // SAFETY: translate 成功说明页已映射且可写；恒等映射下物理地址 == 内核虚拟地址
+        // SAFETY: translate 成功说明页已映射且可写；物理地址经高半区映射访问。
         unsafe {
             core::ptr::copy_nonoverlapping(
                 kern_src.add(copied),
-                phys_addr as *mut u8,
+                (paging::PHYS_MAP_BASE + phys_addr) as *mut u8,
                 chunk,
             );
         }
@@ -186,8 +187,8 @@ pub unsafe fn strncpy_from_user(
             return -(EFAULT as i64);
         };
 
-        // SAFETY: translate 成功，页在恒等映射内。
-        let byte = unsafe { core::ptr::read_volatile(phys_addr as *const u8) };
+        // SAFETY: translate 成功，页经高半区映射访问。
+        let byte = unsafe { core::ptr::read_volatile((paging::PHYS_MAP_BASE + phys_addr) as *const u8) };
         // SAFETY: kern_dst 由调用者保证有效。
         unsafe { core::ptr::write(kern_dst.add(i), byte) };
         if byte == 0 {

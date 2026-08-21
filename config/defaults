@@ -1,0 +1,36 @@
+# shitix kernel configuration — default values
+#
+# This is the canonical default configuration.  `make defconfig` copies it to
+# `.config`; `make config` (terminal GUI) edits `.config` interactively.  The Makefile loads this file first, then `.config`,
+# so values in `.config` win.  Values must be plain `KEY=VALUE` with no spaces
+# in the value (shell- and make-compatible).
+
+# Build profile: debug | release
+#   debug   = fast incremental builds, assertions, opt-level 1
+#   release = LTO-optimized; REQUIRED for `extra-drivers` to fit the linker limit
+CONFIG_PROFILE=debug
+
+# Extra drivers (IDE/ATA disk controller): y | n
+#   Required to boot an LFS rootfs (glibc).  Maps to the `extra-drivers`
+#   Cargo feature.  Use `--release` profile when enabled.
+CONFIG_EXTRA_DRIVERS=n
+
+# QEMU RAM size for `make test` / `make run` / `make debug`
+CONFIG_MEM=256M
+
+# Headless boot-test timeout in seconds
+CONFIG_TIMEOUT=20
+
+# Optional root filesystem image (2nd IDE drive) for tests; empty = none
+#   e.g. target/boot/lfs.img  or  target/boot/lfs-full.img
+CONFIG_ROOTIMG=
+
+# Kernel version string used by `make install` (installed file names + System.map)
+CONFIG_VERSION=0.1.0
+
+# Install destination prefix for `make install`; empty = auto-detect:
+#   $LFS  ->  /mnt/lfs  ->  "" (current /, i.e. running inside the chroot)
+CONFIG_INSTALL_ROOT=
+
+# Boot directory (relative to the install prefix) where the kernel is installed
+CONFIG_INSTALL_BOOTDIR=/boot

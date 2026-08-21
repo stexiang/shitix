@@ -1196,9 +1196,33 @@
       "id": "bug-067",
       "title": "退出路径 __run_exit_handlers call *rax 跳到 0x163fa0",
       "root_cause": "execve 不清 rdx（SysV ABI 的 rtld_fini 寄存器）。内核发起的 execve /init 走 syscall3(EXECVE,path,0,envp)，rdx 留成 envp 的内核栈地址；静态二进制 _start 把 rdx 当 rtld_fini 传给 __libc_start_main，后者 __cxa_atexit(内核栈地址) 注册成首个退出处理函数，exit 时 PTR_DEMANGLE 后 call *rax 跳进内核栈地址 → #PF(0x163fa0=init 的 pt_regs.r8 槽地址)。此前误判成 fork-after-posix_spawn 的 COW/堆写入——其实是注册时就写坏，与 system()/fork 无关（动态二进制不受影响，ld.so 不读 rdx）",
-      "fix": "execve 改完 rip/rsp/cs/rflags/ss/rax 后清掉 rdx 及 rdi/rsi/rcx/r8/r9/r10/r11（调用者保存参数寄存器，防止泄漏内核地址）。验证：reg_fixed 静态 init 3×system+fork+waitpid 后 REGRESSION DONE、exit 0；gcc/g++ 编译链照常",
+      "fix": "execve 改完 rip/rsp/cs/rflags/ss/rax 后清 rdx（rtld_fini 寄存器）。其余调用者保存参数寄存器按 ABI 属 undefined、动态链接器 ld.so 不读，不再逐一清。验证：reg_fixed 静态 init 3×system+fork+waitpid 后 REGRESSION DONE、exit 0；gcc/g++ 编译链照常",
       "status": "fixed",
       "last_seen": "2026-08-20T20:30:00"
+    },
+    {
+      "id": "bug-068",
+      "title": "readlink 对 ext4 快链接读垃圾、对非链接返回 ENOENT 导致 g++/cc1plus 死循环",
+      "root_cause": "readlink 系统调用手工读 ip.data[0]+bread(0x0101)，对 ext4 快链接（目标内联在 i_block 里）把目标文本前 4 字节当块号读垃圾；且对非符号链接（如目录 /usr）返回 -ENOENT 而非 POSIX 规定的 -EINVAL，glibc realpath/GCC 文件搜索靠 EINVAL 区分「不是链接」和「不存在」，返回 ENOENT 让它对同一路径反复 readlink",
+      "fix": "readlink 改走 fs 层 read_symlink_target（ext4 快/慢链接都正确读目标）；末尾不是符号链接时返回 -EINVAL",
+      "status": "fixed",
+      "last_seen": "2026-08-20T21:00:00"
+    },
+    {
+      "id": "bug-069",
+      "title": "低 1GB 恒等映射被用户 ELF 覆盖，内核读空闲链表/页表读错（g++/cc1plus 卡死）",
+      "root_cause": "内核把低 1GB 恒等映射（物理==虚拟）既当内核访问物理内存的直通映射、又当用户地址空间（ELF 装在 0x400000 起）。用户 ELF 的 BSS/数据映射覆盖掉恒等映射里对应物理地址的条目后，get_free_page_raw 读空闲链表节点时读到用户页（RESERVED、PRESENT=0）→ 对同一 cr2 死循环缺页",
+      "fix": "新增高半区直接映射（物理 0..1GB → PHYS_MAP_BASE=0xffff_8000_0000_0000，固定高 PDPT 0x7000 指向 boot PD 0x6000，在 mm::init 前建立、clone_kernel_pdpt 里复制到每个用户 PML4）。entry/set_entry、空闲链表读写、get_free_page 清零、copy_to/from_user、strncpy_from_user、文件后备 mmap、COW 拷贝全部改走高半区映射访问物理地址",
+      "status": "fixed",
+      "last_seen": "2026-08-20T21:30:00"
+    },
+    {
+      "id": "bug-070",
+      "title": "进程退出/execve 只回收 PML4 页，用户物理页与 PDPT/PD/PT 子树泄漏",
+      "root_cause": "release() 只 free_page(pml4) 回收 PML4 页自身，execve 也只 free 旧 PML4 页，用户物理页（ELF 文本/数据/BSS、mmap 竞技场、共享库）和中间页表页全部泄漏。gcc 一次编译泄漏 ~47MB、g++ ~109MB，gccroot 测试连跑 gcc+g++ 把 256MB 空闲页耗尽，ld 加载 libzstd 时 mmap OOM（failed to map segment）",
+      "fix": "新增 paging::free_user_pages(pml4)：遍历 PML4 低半区，末级 PTE 带 PRESENT|USER 的用户页按 page_ref_dec 到 0 才 free_page（COW 共享页只减不还），RESERVED 惰性页跳过，恒等映射 2MB 大页靠 HUGE 位跳过，4KB 条目靠 USER 位区分，最后回收 PT/PD/PDPT 页。release() 和 execve（换掉 old_pml4 前）都调用。验证：gcc/g++ 都编译+链接+运行（HELLO_C/HELLO_CPP），free 页数随进程退出恢复",
+      "status": "fixed",
+      "last_seen": "2026-08-20T21:30:00"
     }
   ]
 }

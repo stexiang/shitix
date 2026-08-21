@@ -593,7 +593,20 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // AT_RANDOM: 16 字节，glibc 期望 16 字节对齐，先对齐游标。
         cur = cur.sub((cur as usize) & 0xF);
         let rp = cur.sub(16);
-        core::ptr::write_bytes(rp, 0, 16);
+        // 之前 write_bytes(rp,0,16) 全 0：glibc 用 AT_RANDOM 前 8 字节当栈金丝雀、
+        // 后 8 字节当 pointer_guard(%fs:0x30)，全 0 会让 PTR_DEMANGLE/金丝雀形同虚设。
+        // 用与 getrandom 相同的 rdtsc + xorshift 生成非零随机字节。
+        let mut lo: u32 = 0; let mut hi: u32 = 0;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+        static mut AT_RAND_CTR: u64 = 0x9E3779B97F4A7C15;
+        let mut s = ((hi as u64) << 32 | lo as u64).wrapping_add(*core::ptr::addr_of!(AT_RAND_CTR));
+        *core::ptr::addr_of_mut!(AT_RAND_CTR) = (*core::ptr::addr_of!(AT_RAND_CTR)).wrapping_add(0x9E3779B97F4A7C15);
+        for i in 0..16 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *rp.add(i) = (s >> 32) as u8;
+        }
         random_va = (stack_top_va - (top as usize - rp as usize)) as u64;
         cur = rp;
         // 把一条用户字符串拷到栈字符串区，返回它的虚拟地址。
@@ -764,10 +777,11 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // execve 不会切任务，所以 switch_to_task 不会替我们换 CR3——
         // 必须在这里立即加载，否则 iretq 后 CPU 还在用旧的（可能是 boot）CR3。
         core::arch::asm!("mov cr3, {}", in(reg) new_pml4 as u64, options(preserves_flags));
-        // CR3 已切换到新 PML4，现在安全释放旧 PML4。
+        // CR3 已切换到新 PML4，现在安全释放旧 PML4 及其用户页。
         // VFORK 子进程的 old_pml4 是与被挂起父进程共享的页表，不能 free
         // （父进程 resume 后还要用它），留给父进程。
         if old_pml4 != 0 && old_pml4 != new_pml4 && (*me).vfork_parent == 0 {
+            unsafe { crate::mm::paging::free_user_pages(old_pml4) };
             crate::mm::free_page(old_pml4);
         }
         // VFORK：子进程已完成 exec，唤醒被挂起的父进程。
@@ -801,16 +815,9 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     // rdx 当 atexit 函数指针传给 __libc_start_main。内核发起的 execve（LFS boot
     // 用 syscall3(EXECVE,path,0,envp)）会把 rdx 留成 envp 的内核栈地址，静态
     // glibc 注册成退出处理函数，exit 时 call *%rax 跳进内核栈地址 → #PF。
-    // Linux 在 start_thread 里显式清 dx，这里对齐：清掉所有可能泄漏内核地址的
-    // 调用者保存参数寄存器（rdi/rsi/rdx/rcx/r8/r9/r10/r11）。
+    // Linux 在 start_thread 里显式清 dx，这里只清 rdx（最小修复）；其余参数
+    // 寄存器按 ABI 属于 undefined，动态链接器 ld.so 不读它们。
     regs.rdx = 0;
-    regs.rdi = 0;
-    regs.rsi = 0;
-    regs.rcx = 0;
-    regs.r8 = 0;
-    regs.r9 = 0;
-    regs.r10 = 0;
-    regs.r11 = 0;
 
     // 清理
     unsafe {
@@ -1471,7 +1478,7 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
                 let avail = if file_off < fsize { fsize - file_off } else { 0 };
                 let read_len = core::cmp::min(map_bytes, avail) as usize;
                 if read_len > 0 {
-                    let buf = unsafe { core::slice::from_raw_parts_mut(pg as *mut u8, read_len) };
+                    let buf = unsafe { core::slice::from_raw_parts_mut((crate::mm::paging::PHYS_MAP_BASE + pg) as *mut u8, read_len) };
                     unsafe {
                         crate::fs::read_write::lseek(fd as usize, file_off as i64, crate::fs::SEEK_SET);
                         let mut filled = 0usize;
@@ -1698,32 +1705,31 @@ pub fn readlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return 0;
     }
 
-    // 真实路径：用 lnamei 找到符号链接自身的 inode（不跟随末尾链接）
+    // 真实路径：用 lnamei 找到路径末尾的 inode（不跟随末尾链接），再走
+    // fs 层的 read_symlink_target。旧实现手工读 ip.data[0]+bread(0x0101)，
+    // 对 ext4 快链接（目标内联在 i_block 里）会把目标文本前 4 字节当块号读垃圾，
+    // 导致 g++/cc1plus 解析相对符号链接时死循环 readlink。
     let inr = match unsafe { crate::fs::namei::lnamei(path) } {
         Ok(i) => i, Err(e) => return e as i64,
     };
-    let ip = unsafe { crate::fs::inode::inode(inr) };
-    // minix 没有符号链接支持，返回数据块内容作为链接目标
-    let link_len = ip.i_size as usize;
-    if link_len == 0 || link_len > bufsize {
+    // 末尾不是符号链接时返回 -EINVAL（POSIX 语义）。glibc realpath / GCC 文件
+    // 搜索靠 EINVAL 区分「不是链接」和「不存在」；返回 ENOENT 会让它们对普通
+    // 目录（如 /usr）死循环 readlink（g++/cc1plus 卡住的根因）。
+    let is_lnk = unsafe { crate::fs::mode::is_lnk(crate::fs::inode::inode(inr).i_mode) };
+    if !is_lnk {
         unsafe { crate::fs::inode::iput(inr); }
-        return if link_len == 0 { -(ENOENT as i64) } else { -(EINVAL as i64) };
+        return -(EINVAL as i64);
     }
-    // 直接用 inode 的 zone[0] 读数据
-    let zone0 = ip.data[0] as usize;
-    if zone0 != 0 {
-        let blk = unsafe { crate::fs::buffer::bread(0x0101u16, zone0 as u32, 1024) };
-        if let Some(bn) = blk {
-            let data_slice = unsafe { crate::fs::buffer::bh(bn).data() };
-            let n = core::cmp::min(core::cmp::min(link_len, bufsize), data_slice.len());
-            unsafe { core::ptr::copy_nonoverlapping(data_slice.as_ptr(), buf, n); }
-            unsafe { crate::fs::buffer::brelse(bn); }
-            unsafe { crate::fs::inode::iput(inr); }
-            return n as i64;
-        }
-    }
+    let target = unsafe { crate::fs::namei::read_symlink_target(inr) };
     unsafe { crate::fs::inode::iput(inr); }
-    -(ENOENT as i64)
+    match target {
+        Some((tgt, n)) => {
+            let n = core::cmp::min(n, bufsize);
+            unsafe { core::ptr::copy_nonoverlapping(tgt.as_ptr(), buf, n); }
+            n as i64
+        }
+        None => -(ENOENT as i64),
+    }
 }
 
 /// readlinkat — dirfd 相对 readlink。

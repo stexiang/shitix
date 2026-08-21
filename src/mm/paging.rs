@@ -40,6 +40,15 @@ pub mod flags {
 /// 抹掉标志位、取出物理地址的掩码（52 位物理地址空间）。
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
+/// 高半区直接映射基址：物理 0..1GB 映射到 `PHYS_MAP_BASE .. PHYS_MAP_BASE+1GB`。
+///
+/// 低 1GB 的恒等映射（setup.S 建）被用户 ELF（装在 0x400000 起）覆盖后，
+/// 内核若仍按「物理==虚拟」访问物理内存（空闲链表、页表、缓冲缓存、用户页），
+/// 读到的就是用户 ELF 的页而非真实物理页 → get_free_page_raw 读空闲链表
+/// 节点时对 clobber 掉的物理地址死循环缺页（g++/cc1plus 卡死根因）。
+/// 高半区直接映射用户态映射不到，内核据此访问物理内存，与用户地址空间彻底分离。
+pub const PHYS_MAP_BASE: usize = 0xffff_8000_0000_0000;
+
 #[inline]
 pub fn pml4_index(v: usize) -> usize {
     (v >> 39) & 0x1ff
@@ -90,12 +99,13 @@ pub fn current_pml4() -> usize {
 /// 读一个表项。
 ///
 /// # Safety
-/// `table` 必须是页对齐的、位于恒等映射范围内的页表物理地址，`idx < 512`。
+/// `table` 必须是页对齐的页表物理地址，`idx < 512`。经 [`PHYS_MAP_BASE`]
+/// 高半区直接映射访问，避免低 1GB 恒等映射被用户 ELF 覆盖后读错。
 pub unsafe fn entry(table: usize, idx: usize) -> u64 {
     debug_assert!(idx < PTRS_PER_PAGE);
-    // SAFETY: 由调用者契约保证 table 是有效页表页且被恒等映射；
-    // idx < 512 使偏移落在这一页内。用 volatile 防止编译器缓存页表内容。
-    unsafe { core::ptr::read_volatile((table as *const u64).add(idx)) }
+    // SAFETY: 由调用者契约保证 table 是有效页表页；PHYS_MAP_BASE 覆盖物理
+    // 0..1GB，table 落在其中即被映射。volatile 防止编译器缓存页表内容。
+    unsafe { core::ptr::read_volatile(((PHYS_MAP_BASE + table) as *const u64).add(idx)) }
 }
 
 /// 写一个表项。
@@ -105,7 +115,7 @@ pub unsafe fn entry(table: usize, idx: usize) -> u64 {
 unsafe fn set_entry(table: usize, idx: usize, val: u64) {
     debug_assert!(idx < PTRS_PER_PAGE);
     // SAFETY: 同 entry 的契约；写入后由调用者刷 TLB 保证一致性。
-    unsafe { core::ptr::write_volatile((table as *mut u64).add(idx), val) }
+    unsafe { core::ptr::write_volatile(((PHYS_MAP_BASE + table) as *mut u64).add(idx), val) }
 }
 
 /// 沿着某一级往下走一步：若该项不存在则分配一张新页表页。
@@ -417,16 +427,106 @@ pub fn clone_kernel_pdpt(dst_pml4: usize) -> bool {
         if pd != 0 { crate::mm::free_page(pd); }
         return false;
     }
-    // SAFETY：dst_pml4 / pdpt / pd 在恒等映射内可写。
+    // SAFETY：dst_pml4 / pdpt / pd 经高半区直接映射可写（物理 0..1GB 都覆盖）。
     unsafe {
-        // Copy kernel PD entries (512 × 8 bytes = 4096 bytes) from 0x6000
-        core::ptr::copy_nonoverlapping(0x6000usize as *const u8, pd as *mut u8, 4096);
+        // Copy kernel PD entries (512 × 8 bytes = 4096 bytes) from boot PD 0x6000
+        // 经高半区直接映射，避免恒等映射被用户 ELF 覆盖后读错。
+        core::ptr::copy_nonoverlapping(
+            (PHYS_MAP_BASE + 0x6000) as *const u8,
+            (PHYS_MAP_BASE + pd) as *mut u8,
+            4096,
+        );
         // PML4[0] → new PDPT
         set_entry(dst_pml4, 0, pdpt as u64 | flags::PRESENT | flags::RW);
         // PDPT[0] → NEW PD (not shared 0x6000)
         set_entry(pdpt, 0, pd as u64 | flags::PRESENT | flags::RW);
+        // 复制高半区直接映射（boot PML4[256] → 高 PDPT → boot PD 0x6000），
+        // 让每个用户 PML4 都能在用户 ELF 覆盖低 1GB 后仍访问物理内存。
+        let high = entry(0x4000, 256);
+        set_entry(dst_pml4, 256, high);
     }
     true
+}
+
+/// 建立高半区直接映射：物理 0..1GB → [`PHYS_MAP_BASE`]..+1GB。
+///
+/// 用一个新 PDPT，其 [0] 指向 boot PD(0x6000)（setup.S 建的恒等映射 PD，
+/// 512 个 2MB 大页）。这样 `PHYS_MAP_BASE + phys` 恒等于 phys，用户态映射
+/// （低 0x400000 起）永远覆盖不到这一半，内核据此访问物理内存。
+///
+/// 必须在用户 ELF 装载前调用（此时恒等映射完好，可安全直写高 PDPT 与 boot PML4）。
+pub fn init_high_map() {
+    // 高 PDPT 用固定物理地址 0x7000（紧跟 boot 页表 0x4000-0x6FFF 之后）。
+    // 不能走 get_free_page：它依赖空闲链表，而空闲链表要在本函数之后、由
+    // page_alloc::init 建链时用高半区映射（push_free）写。0x7000 低于
+    // MIN_USABLE_PHYS(1MB)，永远不进空闲链表，恒等映射内直写安全。
+    const HIGH_PDPT: usize = 0x7000;
+    // SAFETY：启动早期，恒等映射（低 1GB）完好，直写物理地址安全。
+    unsafe {
+        core::ptr::write_bytes(HIGH_PDPT as *mut u8, 0, PAGE_SIZE);
+        // 高 PDPT[0] -> boot PD(0x6000) | PRESENT | RW
+        core::ptr::write_volatile(HIGH_PDPT as *mut u64, 0x6000u64 | flags::PRESENT | flags::RW);
+        // boot PML4(0x4000) 的 PML4[256] -> 高 PDPT | PRESENT | RW
+        core::ptr::write_volatile(
+            ((0x4000usize + 256 * 8) as *mut u64),
+            (HIGH_PDPT as u64) | flags::PRESENT | flags::RW,
+        );
+    }
+    invalidate();
+}
+
+/// 释放一个用户进程地址空间的全部用户页与其页表页（PDPT/PD/PT）。
+///
+/// 遍历 PML4 低半区（0..256，用户空间），只处理带 USER 位的页表分支：
+/// - 末级 PTE 带 PRESENT|USER：这是真正的用户页，`page_ref_dec` 到 0 才
+///   `free_page`（COW 共享页引用计数 >1 时只减不还）。
+/// - RESERVED 叶（惰性分配、PRESENT=0）：无物理页，跳过。
+/// - 恒等映射（无 USER 位）与高半区直接映射（PML4[256]，不在 0..256）不碰。
+///
+/// 调用时机：进程退出（release）与 execve 换地址空间（换掉 old_pml4 前）。
+/// 之前这里只 `free_page(pml4)` 回收 PML4 页自身，PDPT/PD/PT 与用户物理页
+/// 全部泄漏——gcc/g++ 连跑几个 exec 就把 256MB 空闲页耗尽，ld 加载库时 OOM。
+///
+/// # Safety
+/// `pml4` 必须是一个已不再被当前 CR3 使用的用户 PML4 物理地址。
+pub unsafe fn free_user_pages(pml4: usize) {
+    use crate::mm::page_ref;
+    // 只遍历 PML4 低半区（0..256 = 用户空间），高半区直接映射在 [256] 不碰。
+    // 中间级（PML4/PDPT/PD）不按 USER 位过滤：ELF 装在低 0x400000，走的是
+    // clone_kernel_pdpt 建的恒等映射副本（PML4[0]/PDPT[0] 无 USER 位），按 USER
+    // 过滤会把整个 ELF 分支跳过。真正区分「用户页 vs 恒等映射」在末级 PTE：
+    // 恒等映射 2MB 大页靠 HUGE 跳过，4KB 条目靠 USER 位区分。
+    for pml4_i in 0..256usize {
+        let pml4e = unsafe { entry(pml4, pml4_i) };
+        if pml4e & flags::PRESENT == 0 { continue; }
+        if pml4e & flags::HUGE != 0 { continue; }
+        let pdpt = (pml4e & ADDR_MASK) as usize;
+        for pdpt_i in 0..512usize {
+            let pdpte = unsafe { entry(pdpt, pdpt_i) };
+            if pdpte & flags::PRESENT == 0 { continue; }
+            if pdpte & flags::HUGE != 0 { continue; }
+            let pd = (pdpte & ADDR_MASK) as usize;
+            for pd_i in 0..512usize {
+                let pde = unsafe { entry(pd, pd_i) };
+                if pde & flags::PRESENT == 0 { continue; }
+                if pde & flags::HUGE != 0 { continue; }
+                let pt = (pde & ADDR_MASK) as usize;
+                for pt_i in 0..512usize {
+                    let pte = unsafe { entry(pt, pt_i) };
+                    if pte & flags::RESERVED != 0 { continue; }
+                    if pte & flags::PRESENT == 0 || pte & flags::USER == 0 { continue; }
+                    let phys = (pte & ADDR_MASK) as usize;
+                    let pfn = page_ref::phys_to_pfn(phys);
+                    if page_ref::page_ref_dec(pfn) == 0 {
+                        crate::mm::page_alloc::free_page(phys);
+                    }
+                }
+                crate::mm::page_alloc::free_page(pt);
+            }
+            crate::mm::page_alloc::free_page(pd);
+        }
+        crate::mm::page_alloc::free_page(pdpt);
+    }
 }
 
 /// 复制页表项到新的页表。
