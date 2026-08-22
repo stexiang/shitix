@@ -1,6 +1,6 @@
 //! BSD Socket 接口桥接层。将 syscall 连接到协议实现。
 
-use crate::klib::errno::{EINVAL, ENOSYS, EOPNOTSUPP, EPROTONOSUPPORT, ESOCKTNOSUPPORT, EAFNOSUPPORT, EBADF, ENOMEM, EFAULT};
+use crate::klib::errno::{EINVAL, ENOSYS, EOPNOTSUPP, EPROTONOSUPPORT, ESOCKTNOSUPPORT, EAFNOSUPPORT, EBADF, ENOMEM, EFAULT, EDESTADDRREQ, EMSGSIZE};
 use crate::net::{AF_INET, AF_UNIX, SOCK_STREAM, SOCK_DGRAM};
 use crate::mm::get_free_page;
 use core::mem::MaybeUninit;
@@ -15,6 +15,9 @@ struct SockEntry {
     peer: usize,     // usize::MAX = none
     buf_page: usize,  // get_free_page allocated buffer (0 = not alloc)
     buf_len: usize, buf_read: usize,
+    // AF_INET：bind 的本地端口 / connect 的对端（主机序）。
+    // DGRAM 的 buf 是「u16 长度前缀 + 载荷」的数据报队列。
+    local_port: u16, remote_ip: u32, remote_port: u16,
 }
 
 const MAX_SOCKETS: usize = 4;
@@ -33,6 +36,7 @@ fn ensure_inited() {
                 SOCKS[i].write(SockEntry {
                     family: 0, sock_type: 0, protocol: 0, used: false,
                     peer: SOCK_NIL, buf_page: 0, buf_len: 0, buf_read: 0,
+                    local_port: 0, remote_ip: 0, remote_port: 0,
                 });
             }
             SOCKS_INITED = true;
@@ -81,6 +85,7 @@ fn alloc_sock() -> Option<usize> {
             if !s.used {
                 s.used = true; s.family = 0; s.sock_type = 0; s.protocol = 0;
                 s.peer = SOCK_NIL; s.buf_page = 0; s.buf_len = 0; s.buf_read = 0;
+                s.local_port = 0; s.remote_ip = 0; s.remote_port = 0;
                 return Some(i);
             }
         }
@@ -98,6 +103,36 @@ fn find_free_fd() -> Option<usize> {
     None
 }
 
+/// UDP 收包投递（netif→socket 接线）。按目的端口找已 bind 的
+/// AF_INET DGRAM socket，把载荷以「u16 长度前缀 + 载荷」入队。
+/// 找不到匹配端口（且没有通配 socket）则丢弃。
+pub fn udp_input(_src_ip: u32, _src_port: u16, dst_port: u16, payload: &[u8]) {
+    ensure_inited();
+    unsafe {
+        let mut target = SOCK_NIL;
+        for i in 0..MAX_SOCKETS {
+            let s = sock_mut(i);
+            if s.used && s.family == AF_INET && s.sock_type == SOCK_DGRAM {
+                if s.local_port == dst_port { target = i; break; }
+                if s.local_port == 0 && target == SOCK_NIL { target = i; }
+            }
+        }
+        if target == SOCK_NIL { return; }
+        let s = sock_mut(target);
+        if !alloc_buf(target) { return; }
+        let s = sock_mut(target);
+        // 数据报不跨界放不下就丢弃（4KB 环形区对演示足够）
+        let need = 2 + payload.len();
+        if s.buf_read + s.buf_len + need > SOCK_BUF_SZ { return; }
+        let base = s.buf_page + s.buf_read + s.buf_len;
+        let dlen = payload.len() as u16;
+        core::ptr::write_volatile(base as *mut u8, dlen as u8);
+        core::ptr::write_volatile((base + 1) as *mut u8, (dlen >> 8) as u8);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), (base + 2) as *mut u8, payload.len());
+        s.buf_len += need;
+    }
+}
+
 // ---- syscall implementations ----
 
 pub fn sys_socket(family: u16, sock_type: u16, protocol: u8) -> i64 {
@@ -113,7 +148,16 @@ pub fn sys_socket(family: u16, sock_type: u16, protocol: u8) -> i64 {
 
 pub fn sys_bind(fd: usize, addr: *const u8, addrlen: usize) -> i64 {
     if addr.is_null() || addrlen < 2 { return -(EFAULT as i64); }
-    if fd_to_sock(fd).is_none() { return -(EBADF as i64); }
+    let sock_idx = match fd_to_sock(fd) { Some(i) => i, None => return -(EBADF as i64) };
+    ensure_inited();
+    unsafe {
+        let s = sock_mut(sock_idx);
+        if s.family == AF_INET {
+            if addrlen < core::mem::size_of::<SockAddrIn>() { return -(EINVAL as i64); }
+            let sa = &*(addr as *const SockAddrIn);
+            s.local_port = u16::from_be(sa.sin_port);
+        }
+    }
     0
 }
 
@@ -146,15 +190,54 @@ pub fn sys_accept(fd: usize, addr: *mut u8, addrlen: *mut u32) -> i64 {
 
 pub fn sys_connect(fd: usize, addr: *const u8, addrlen: usize) -> i64 {
     if addr.is_null() || addrlen < 2 { return -(EFAULT as i64); }
-    if fd_to_sock(fd).is_none() { return -(EBADF as i64); }
+    let sock_idx = match fd_to_sock(fd) { Some(i) => i, None => return -(EBADF as i64) };
+    ensure_inited();
+    unsafe {
+        let s = sock_mut(sock_idx);
+        if s.family == AF_INET {
+            if addrlen < core::mem::size_of::<SockAddrIn>() { return -(EINVAL as i64); }
+            let sa = &*(addr as *const SockAddrIn);
+            s.remote_port = u16::from_be(sa.sin_port);
+            s.remote_ip = u32::from_be_bytes(sa.sin_addr);
+        }
+    }
     0
 }
 
 pub fn sys_sendto(fd: usize, buf: *const u8, len: usize, _flags: i32,
-                  _dest_addr: *const u8, _addrlen: usize) -> i64 {
+                  dest_addr: *const u8, addrlen: usize) -> i64 {
     if buf.is_null() { return -(EFAULT as i64); }
     let sock_idx = match fd_to_sock(fd) { Some(i) => i, None => return -(EBADF as i64) };
     ensure_inited();
+    // AF_INET DGRAM：组 UDP 头后经 netif→e1000 发出。
+    unsafe {
+        let s = sock_mut(sock_idx);
+        if s.family == AF_INET && s.sock_type == SOCK_DGRAM {
+            let (dst_ip, dst_port) = if !dest_addr.is_null()
+                && addrlen >= core::mem::size_of::<SockAddrIn>()
+            {
+                let sa = &*(dest_addr as *const SockAddrIn);
+                (u32::from_be_bytes(sa.sin_addr), u16::from_be(sa.sin_port))
+            } else if s.remote_port != 0 {
+                (s.remote_ip, s.remote_port)
+            } else {
+                return -(EDESTADDRREQ as i64);
+            };
+            if len + 8 > 1472 { return -(EMSGSIZE as i64); }
+            // 未 bind 时分配临时端口
+            if s.local_port == 0 { s.local_port = 49152 + sock_idx as u16; }
+            let sport = s.local_port;
+            let mut udp = [0u8; 1480];
+            udp[0] = (sport >> 8) as u8; udp[1] = sport as u8;
+            udp[2] = (dst_port >> 8) as u8; udp[3] = dst_port as u8;
+            let ulen = (8 + len) as u16;
+            udp[4] = (ulen >> 8) as u8; udp[5] = ulen as u8;
+            // udp[6..8] 校验和留 0（IPv4 下合法）
+            core::ptr::copy_nonoverlapping(buf, udp.as_mut_ptr().add(8), len);
+            let sent = crate::net::inet::netif::send_ip_packet(dst_ip, 17, &udp[..8 + len]);
+            return if sent > 0 { len as i64 } else { -(crate::klib::errno::ENETUNREACH as i64) };
+        }
+    }
     unsafe {
         let peer = sock_mut(sock_idx).peer;
         if peer == SOCK_NIL { return len as i64; /* discard */ }
@@ -182,6 +265,28 @@ pub fn sys_recvfrom(fd: usize, buf: *mut u8, len: usize, _flags: i32,
     if buf.is_null() { return -(EFAULT as i64); }
     let sock_idx = match fd_to_sock(fd) { Some(i) => i, None => return -(EBADF as i64) };
     ensure_inited();
+    // AF_INET DGRAM：先从网卡收包入队，再按「u16 长度前缀 + 载荷」
+    // 弹出一个完整数据报（UDP 语义：一次 recvfrom 一条报文）。
+    unsafe {
+        let s = sock_mut(sock_idx);
+        if s.family == AF_INET && s.sock_type == SOCK_DGRAM {
+            crate::net::inet::netif::poll();
+            let s = sock_mut(sock_idx);
+            if s.buf_page == 0 || s.buf_len < 2 { return 0; }
+            let base = s.buf_page;
+            let dlen = u16::from_le_bytes([
+                core::ptr::read_volatile((base + s.buf_read) as *const u8),
+                core::ptr::read_volatile((base + s.buf_read + 1) as *const u8),
+            ]) as usize;
+            let n = core::cmp::min(len, dlen);
+            // 数据报一定整段落在页内（入队时已保证不跨界）
+            core::ptr::copy_nonoverlapping((base + s.buf_read + 2) as *const u8, buf, n);
+            s.buf_read += 2 + dlen;
+            s.buf_len -= 2 + dlen;
+            if s.buf_len == 0 { s.buf_read = 0; }
+            return n as i64;
+        }
+    }
     unsafe {
         let s = sock_mut(sock_idx);
         if s.buf_page == 0 || s.buf_len == 0 { return 0; }

@@ -110,6 +110,22 @@ impl E1000 {
         crate::pci::pci_write16(bus, dev, func, 4,
             crate::pci::pci_read16(bus, dev, func, 4) | 0x07);
 
+        // MMIO 在 3-4GB 高位，引导页表只恒等映射低 1GB；先按页映进
+        // 内核 PML4（PCD|PWT 禁缓存，同 LAPIC 的处理）。
+        // SAFETY: current_pml4 是内核引导 PML4；3-4GB 的 PDPT 槽位空闲。
+        let kpg = crate::mm::paging::current_pml4();
+        if !unsafe {
+            crate::mm::paging::map_range(
+                kpg, mmio & !0xFFF, mmio & !0xFFF, 0x20000,
+                crate::mm::paging::flags::KERNEL
+                    | crate::mm::paging::flags::PCD
+                    | crate::mm::paging::flags::PWT,
+            )
+        } {
+            crate::sprintln!("e1000: failed to map MMIO {:#x}, skip", mmio);
+            return None;
+        }
+
         unsafe {
             let slot = &raw mut E1000_DEV;
             (*slot) = Some(E1000 {

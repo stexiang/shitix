@@ -140,9 +140,9 @@ pub mod full {
                 block_bitmap: 0, inode_bitmap: 0, inode_table: 0, free_blocks_count: 0,
                 free_inodes_count: 0, used_dirs_count: 0, flags: 0, itable_unused: 0, checksum: 0,
             },
-            inode_size: 128, block_size: 1024, fs_block_size: 1024,
+            inode_size: 0, block_size: 0, fs_block_size: 0,
             inodes_per_group: 0, blocks_per_group: 0, group_count: 0,
-            gd_1024_block: 0, gd_size: 32, valid: false,
+            gd_1024_block: 0, gd_size: 0, valid: false,
         }
     }
 

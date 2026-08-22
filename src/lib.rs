@@ -70,6 +70,9 @@ unsafe extern "C" {
 pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     serial::init();
     console::clear();
+    // 分发表运行时填充（必须早于任何 int 0x80，含自检里的 syscallN）。
+    // SAFETY: 启动早期单线程，无并发访问。
+    unsafe { syscall::init_table() };
 
     cprintln!(Color::LightCyan, Color::Black, "shitix: Linux 1.0.9 rewritten in Rust (x86_64)");
     serial::print("shitix: long mode entry reached\n");
@@ -1201,6 +1204,13 @@ fn fs_init_thread(_arg: u64) {
     // swap 自检在 LFS/自检两种模式下都跑（用的是 ramdisk，两种模式下
     // 此刻都没被文件系统占用；selftest 结束即 swapoff）。
     crate::mm::swap::selftest();
+    // e1000 ↔ 协议栈接线：探测到网卡就初始化 netif（记录 MAC/IP），
+    // 之后 AF_INET DGRAM 的 sendto/recvfrom 走 UDP over e1000。
+    // 无 extra-drivers 时 probe() 恒为 None，零成本。
+    if drivers::net::e1000::E1000::probe().is_some() {
+        net::inet::netif::init();
+        drivers::net::e1000::E1000::selftest();
+    }
     if LFS_BOOT {
         sprintln!("LFS: === LFS boot mode ===");
 

@@ -164,7 +164,7 @@ pub fn pci_device_exists(bus: u8, dev: u8, func: u8) -> bool {
 
 /// 获取 PCI BAR
 fn get_bar(bus: u8, dev: u8, func: u8, bar_index: usize) -> Option<PciBar> {
-    let offset = PCI_VENDOR_ID + 4 + (bar_index as u8 * 4);
+    let offset = 0x10u8 + (bar_index as u8 * 4); // BAR0 在配置空间 0x10
     // Read full 32-bit BAR value (was incorrectly reading only 16 bits)
     let addr = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
     let base = pci_config_read32(addr);

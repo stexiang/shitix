@@ -170,6 +170,15 @@ pub fn handle_frame(pkt: &[u8]) {
                 let ihl = (pkt[14] & 0x0F) as usize * 4;
                 let ip_payload = &pkt[14+ihl..];
                 if proto == 6 { crate::net::inet::tcp::tcp_input(src_ip, ip_payload); }
+                else if proto == 17 && ip_payload.len() >= 8 {
+                    // UDP：解头部后投递到 socket 层的数据报队列
+                    let sport = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
+                    let dport = u16::from_be_bytes([ip_payload[2], ip_payload[3]]);
+                    let ulen = u16::from_be_bytes([ip_payload[4], ip_payload[5]]) as usize;
+                    if ulen >= 8 && ip_payload.len() >= ulen {
+                        crate::net::socket::udp_input(src_ip, sport, dport, &ip_payload[8..ulen]);
+                    }
+                }
             }
         }
         _ => {}
