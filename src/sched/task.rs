@@ -198,6 +198,24 @@ pub struct Task {
     /// 每下探一层自增，超过 5 层返回 `-ELOOP`。任务级而非全局，避免
     /// 不同任务的解析互相干扰。
     pub link_count: u32,
+
+    // ---- 凭据。对应原版 task_struct 的 uid/euid/suid/fsuid/gid/egid/sgid/fsgid ----
+    /// 真实用户 ID。原版 `uid_t uid`
+    pub uid: u32,
+    /// 有效用户 ID。原版 `uid_t euid`
+    pub euid: u32,
+    /// 保存的 set-user-ID。原版 `uid_t suid`
+    pub suid: u32,
+    /// 文件系统用户 ID（权限检查用）。原版 `uid_t fsuid`
+    pub fsuid: u32,
+    /// 真实组 ID。原版 `gid_t gid`
+    pub gid: u32,
+    /// 有效组 ID。原版 `gid_t egid`
+    pub egid: u32,
+    /// 保存的 set-group-ID。原版 `gid_t sgid`
+    pub sgid: u32,
+    /// 文件系统组 ID。原版 `gid_t fsgid`
+    pub fsgid: u32,
 }
 
 impl Task {
@@ -238,6 +256,15 @@ impl Task {
             close_on_exec: 0,
             umask: 0o022,
             link_count: 0,
+            // 初始进程是 root（uid/gid 全 0）。
+            uid: 0,
+            euid: 0,
+            suid: 0,
+            fsuid: 0,
+            gid: 0,
+            egid: 0,
+            sgid: 0,
+            fsgid: 0,
         }
     }
 

@@ -158,12 +158,19 @@ pub unsafe fn create(dir: usize, name: &[u8], m: u16) -> Result<usize, i32> {
             crate::fs::ext4::ops::full::free_inode_any(sb_nr, ino);
             return Err(EIO);
         }
+        // 原版 `inode->i_uid = current->euid`；目录 setgid 则继承目录 gid。
+        let dir_mode = inode::inode(dir).i_mode;
+        let dir_gid = inode::inode(dir).i_gid;
+        let (euid, egid) = {
+            let c = crate::sched::current();
+            (c.euid, c.egid)
+        };
         let i = inode::inode(ip);
         // create 收到的 m 是权限位（如 0666），不含类型位；补上 S_IFREG。
         i.i_mode = (m & !mode::S_IFMT) | mode::S_IFREG;
         i.i_nlink = 1;
-        i.i_uid = 0;  // TODO: 从当前进程获取
-        i.i_gid = 0;
+        i.i_uid = euid as u16;
+        i.i_gid = if dir_mode & mode::S_ISGID != 0 { dir_gid } else { egid as u16 };
         i.i_size = 0;
         i.i_op = FsType::Ext2;
         i.i_sb = sb_nr;
@@ -205,9 +212,18 @@ pub unsafe fn mknod(dir: usize, name: &[u8], m: u16, _rdev: u16) -> Result<usize
             crate::fs::ext4::ops::full::free_inode_any(sb_nr, ino);
             return Err(EIO);
         }
+        // 原版 `inode->i_uid = current->euid`；目录 setgid 则继承目录 gid。
+        let dir_mode = inode::inode(dir).i_mode;
+        let dir_gid = inode::inode(dir).i_gid;
+        let (euid, egid) = {
+            let c = crate::sched::current();
+            (c.euid, c.egid)
+        };
         let i = inode::inode(ip);
         i.i_mode = m;
         i.i_nlink = 1;
+        i.i_uid = euid as u16;
+        i.i_gid = if dir_mode & mode::S_ISGID != 0 { dir_gid } else { egid as u16 };
         i.i_size = 0;
         i.i_op = FsType::Ext2;
         i.i_sb = sb_nr;

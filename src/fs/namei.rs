@@ -17,13 +17,11 @@
 //!    链接（目标内联在 `i_block`）与慢链接（目标在数据块）都支持；
 //!    minix 符号链接未移植，遇到 minix 链接返回 `-EIO`。`lnamei`（`lstat`
 //!    用）不跟随末尾链接。
-//! 3. **权限检查简化**。原版 `permission()` 比对 `current->euid`/`egid`
+//! 3. **权限检查**。原版 `permission()` 比对 `current->euid`/`egid`
 //!    与 inode 的 uid/gid 选 owner/group/other 三组权限位，root
-//!    （`suser()`）全通过。我们的 `Task` 还没有 uid 字段
-//!    （见 `sched/task.rs` 的取舍说明），所以 [`permission`] 目前
-//!    等价于「以 root 身份检查」：只挡 `MS_RDONLY` 挂载上的写，
-//!    以及「对非目录做目录操作」这类结构性错误。uid 到位后
-//!    把注释里那段补上即可。
+//!    （`suser()`）全通过。[`permission`] 先做只读文件系统写保护，
+//!    再委托 [`inode::permission`] 做 uid/gid 三档位比对（读 `current()`
+//!    的 euid/egid；无附加组，`in_group_p` 退化为 `egid == i_gid`）。
 
 use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::super_block;
@@ -37,6 +35,9 @@ use crate::klib::errno::{
 pub const NAME_MAX: usize = 32;
 
 /// 权限检查。对应原版 `permission()`。见模块文档第 3 点。
+///
+/// 先做只读文件系统的写保护，再委托 [`inode::permission`] 做
+/// owner/group/other 三档权限位比对（读 `current()` 的 euid/egid）。
 ///
 /// # Safety
 /// `n < NR_INODE` 且是有效 inode。
@@ -52,13 +53,12 @@ pub unsafe fn permission(n: usize, mask: u16) -> bool {
                 return false;
             }
         }
-        // 原版这里是：
+        // 原版：
         //   mode = inode->i_mode;
         //   if (current->euid == inode->i_uid) mode >>= 6;
         //   else if (in_group_p(inode->i_gid)) mode >>= 3;
         //   if (((mode & mask & 0007) == mask) || suser()) return 1;
-        // 我们没有 euid（见模块文档第 3 点），等价于 suser() 恒真。
-        true
+        inode::permission(n, mask)
     }
 }
 

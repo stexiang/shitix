@@ -8,15 +8,15 @@
 //! fork 时整表复制，每项对 File 的 `f_count` +1；close 减引用计数。
 //! 纯内核线程（task[0]、worker 等）不使用 fd 表。
 //!
-//! 不移植：`sys_chown`/`sys_chmod` 的 uid 检查（没有 uid 体系）、
-//! `sys_utime`、`sys_access`（都依赖 `permission()` 的完整版本）、
-//! `sys_chroot`（依赖 `current->root`）。这几个的骨架留在 [`sys_chmod`]
-//! 一类里，但 uid 相关的判断都标了注释。
+//! 不移植：`sys_chown`/`sys_chmod` 的完整 uid/gid 权限矩阵（只有
+//! root 放行 + 属主本人的简化版）、`sys_utime`（无 RTC，忽略）、
+//! `sys_chroot`（依赖 `current->root`）。uid/gid 体系就位后，
+//! `sys_chown`/`sys_access` 已按原版实现（见 [`sys_chown`]/[`sys_access`]）。
 
 use crate::fs::file_table::{self, filp};
 use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::{NR_OPEN, mode, namei, oflags, super_block};
-use crate::klib::errno::{EBADF, EINVAL, EMFILE, ENFILE, ENOTDIR, EROFS};
+use crate::klib::errno::{EACCES, EBADF, EINVAL, EMFILE, ENFILE, ENOTDIR, EPERM, EROFS};
 use crate::pr_info;
 
 /// 每任务 FD 表（旁路数组，不在 Task 里省 BSS）。
@@ -310,10 +310,72 @@ pub unsafe fn sys_chdir(path: &[u8]) -> i64 {
     }
 }
 
-/// 改权限位。对应原版 `sys_chmod()`。
+/// 按 fd 切换当前工作目录。对应原版 `fs/open.c:sys_fchdir()`。
 ///
 /// # Safety
 /// 只能在进程上下文调用。
+pub unsafe fn sys_fchdir(fd: usize) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let f = fd_to_filp(fd);
+        if f == NIL {
+            return -(EBADF as i64);
+        }
+        let n = filp(f).f_inode;
+        if n == NIL {
+            return -(EBADF as i64);
+        }
+        let i_mode = core::ptr::addr_of!((*inode::inode_ptr(n)).i_mode).read_volatile();
+        if !mode::is_dir(i_mode) {
+            return -(ENOTDIR as i64);
+        }
+        if !namei::permission(n, super::MAY_EXEC) {
+            return -(EINVAL as i64);
+        }
+        // pwd 是新增的一个引用：i_count +1（fd 的引用保持不变）。
+        // SAFETY: n 被打开文件持有，有效。
+        unsafe { (*inode::inode_ptr(n)).i_count += 1; }
+        let old = super_block::pwd_inode();
+        super_block::set_pwd(n);
+        if old != NIL && old != super_block::root_inode() {
+            inode::iput(old);
+        }
+        0
+    }
+}
+
+/// 按 fd 截断文件。对应原版 `fs/open.c:sys_ftruncate()`。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn sys_ftruncate(fd: usize, length: u32) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let f = fd_to_filp(fd);
+        if f == NIL {
+            return -(EBADF as i64);
+        }
+        let n = filp(f).f_inode;
+        if n == NIL {
+            return -(EBADF as i64);
+        }
+        let i_ptr = inode::inode_ptr(n);
+        let i_mode = core::ptr::addr_of!((*i_ptr).i_mode).read_volatile();
+        if mode::is_dir(i_mode) {
+            return -(EINVAL as i64);
+        }
+        // 原版要查文件以写模式打开；这里简化成 permission(MAY_WRITE)。
+        if !namei::permission(n, super::MAY_WRITE) {
+            return -(EINVAL as i64);
+        }
+        let now = crate::sched::current_time();
+        core::ptr::addr_of_mut!((*i_ptr).i_size).write_volatile(length);
+        core::ptr::addr_of_mut!((*i_ptr).i_mtime).write_volatile(now);
+        core::ptr::addr_of_mut!((*i_ptr).i_ctime).write_volatile(now);
+        core::ptr::addr_of_mut!((*i_ptr).i_dirt).write_volatile(true);
+        0
+    }
+}
 pub unsafe fn sys_chmod(path: &[u8], m: u16) -> i64 {
     // SAFETY: 契约转交。
     unsafe {
@@ -345,7 +407,151 @@ pub unsafe fn sys_chmod(path: &[u8], m: u16) -> i64 {
     }
 }
 
-/// 截断一个文件到指定长度。对应原版 `sys_truncate()`。
+/// 对已持有的 inode 执行 chown 的核心逻辑。**不** `iput`，由调用方负责。
+///
+/// # Safety
+/// `n` 是已 `iget`（或由 fd 引用持有）的有效 inode。
+unsafe fn chown_inode(n: usize, uid: u32, gid: u32) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        // 全程裸指针，避免 &mut 别名 UB
+        let i_ptr = inode::inode_ptr(n);
+        let i_sb = core::ptr::addr_of!((*i_ptr).i_sb).read_volatile();
+        if i_sb != NIL {
+            let sb_flags =
+                core::ptr::addr_of!((*super_block::sb_ptr(i_sb)).s_flags).read_volatile();
+            if sb_flags & crate::fs::MS_RDONLY != 0 {
+                return -(EROFS as i64);
+            }
+        }
+        let (old_uid, old_gid) = (
+            core::ptr::addr_of!((*i_ptr).i_uid).read_volatile() as u32,
+            core::ptr::addr_of!((*i_ptr).i_gid).read_volatile() as u32,
+        );
+        // 原版：`(current->euid == inode->i_uid && ...) || suser()`。
+        // 简化：root 放行；属主本人只能改 gid（改属主仍需 root）。
+        let euid = crate::sched::current().euid;
+        if euid != 0 && euid != old_uid {
+            return -(EPERM as i64);
+        }
+        let new_uid = if uid == u32::MAX { old_uid } else { uid & 0xFFFF };
+        let new_gid = if gid == u32::MAX { old_gid } else { gid & 0xFFFF };
+        let mut new_mode = core::ptr::addr_of!((*i_ptr).i_mode).read_volatile();
+        if new_uid != old_uid {
+            new_mode &= !mode::S_ISUID;
+        }
+        if new_gid != old_gid {
+            new_mode &= !mode::S_ISGID;
+        }
+        let now = crate::sched::current_time();
+        core::ptr::addr_of_mut!((*i_ptr).i_uid).write_volatile(new_uid as u16);
+        core::ptr::addr_of_mut!((*i_ptr).i_gid).write_volatile(new_gid as u16);
+        core::ptr::addr_of_mut!((*i_ptr).i_mode).write_volatile(new_mode);
+        core::ptr::addr_of_mut!((*i_ptr).i_ctime).write_volatile(now);
+        core::ptr::addr_of_mut!((*i_ptr).i_dirt).write_volatile(true);
+        0
+    }
+}
+
+/// 改变属主。对应原版 `sys_chown()`（原版用 `lnamei`）与 `sys_fchown()`。
+///
+/// `uid`/`gid` 为 `u32::MAX`（即 `-1`）表示「不变更该项」。
+/// `follow` 为 false 时用 `lnamei`（不跟随末尾符号链接）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn sys_chown(path: &[u8], uid: u32, gid: u32, follow: bool) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let n = if follow {
+            match namei::namei(path) {
+                Ok(n) => n,
+                Err(e) => return -(e as i64),
+            }
+        } else {
+            match namei::lnamei(path) {
+                Ok(n) => n,
+                Err(e) => return -(e as i64),
+            }
+        };
+        // SAFETY: n 已 iget。
+        let r = unsafe { chown_inode(n, uid, gid) };
+        inode::iput(n);
+        r
+    }
+}
+
+/// 按 fd 改变属主。对应原版 `sys_fchown()`。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn sys_fchown(fd: usize, uid: u32, gid: u32) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let f = fd_to_filp(fd);
+        if f == NIL {
+            return -(EBADF as i64);
+        }
+        let n = filp(f).f_inode;
+        if n == NIL {
+            return -(EBADF as i64);
+        }
+        // 该 inode 由 fd 的打开文件引用持有，直接改，不 iget/iput。
+        // SAFETY: n 被打开文件持有，有效。
+        unsafe { chown_inode(n, uid, gid) }
+    }
+}
+
+/// 访问性检查。对应原版 `sys_access()`。
+///
+/// 用**真实** uid/gid（`access(2)` 语义），除非 `use_effective` 为 true
+/// （`faccessat(AT_EACCESS)` 语义，用有效 uid/gid）。
+/// `mode` 只允许 `R_OK|W_OK|X_OK`（`F_OK`=0 恒通过）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn sys_access(path: &[u8], mode: u16, use_effective: bool) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        if mode & !0o7 != 0 {
+            return -(EINVAL as i64);
+        }
+        let n = match namei::namei(path) {
+            Ok(n) => n,
+            Err(e) => return -(e as i64),
+        };
+        let i_ptr = inode::inode_ptr(n);
+        let (i_mode, i_uid, i_gid) = (
+            core::ptr::addr_of!((*i_ptr).i_mode).read_volatile(),
+            core::ptr::addr_of!((*i_ptr).i_uid).read_volatile() as u32,
+            core::ptr::addr_of!((*i_ptr).i_gid).read_volatile() as u32,
+        );
+        // SAFETY: 进程上下文，单核。
+        let (uid, gid) = {
+            let c = crate::sched::current();
+            if use_effective { (c.euid, c.egid) } else { (c.uid, c.gid) }
+        };
+        // 原版：`res = i_mode & S_IRWXUGO;` 然后按 owner/group/other 移位，
+        // `(res & mode) == mode` 即放行；root 有单独的兜底分支。
+        let mut m = i_mode;
+        if uid == i_uid {
+            m >>= 6;
+        } else if gid == i_gid {
+            m >>= 3;
+        }
+        inode::iput(n);
+        if m & mode & 0o007 == mode {
+            return 0;
+        }
+        // 原版 root 兜底：目录放行；非 X_OK 放行；文件有任意 x 位放行 X_OK。
+        if uid == 0
+            && (mode::is_dir(i_mode) || mode & 0o001 == 0 || i_mode & 0o111 != 0)
+        {
+            return 0;
+        }
+        -(EACCES as i64)
+    }
+}
 ///
 /// # Safety
 /// 只能在进程上下文调用。

@@ -646,41 +646,35 @@ pub unsafe fn invalidate_inodes(dev: u16) -> bool {
 /// 权限检查。对应原版 `fs/namei.c` 的 `permission()`
 /// （原版会先试 `i_op->permission`，minix 没有实现所以走通用逻辑）。
 ///
-/// 原版通用逻辑：root（`suser()`）除「对没有任何 x 位的文件要求执行」
-/// 之外无条件通过；否则按 uid/gid 选 owner/group/other 三档权限位比对。
+/// 原版通用逻辑：`if (((mode & mask & 0007) == mask) || suser()) return 1;`
+/// —— root（`suser()`，euid==0）无条件通过；否则按 uid/gid 选
+/// owner/group/other 三档权限位比对。
 ///
-/// 我们目前没有用户态、`current->uid` 恒为 0（root），所以这个函数
-/// 现在总是走 root 分支。保留完整逻辑是因为 `sys_open`/`namei` 里的
-/// 调用点必须存在，等 `execve` 与 uid 就位后它立刻就是对的。
+/// 从 `current()` 读有效 uid/gid（euid/egid）。无附加组（`in_group_p`
+/// 退化为 `egid == i_gid`），等组机制到位再补。
 pub fn permission(n: usize, mask: u16) -> bool {
     // SAFETY: 调用点保证 n 有效；只读几个字段。
     let (i_mode, i_uid, i_gid) = unsafe {
         let i = inode(n);
         (i.i_mode, i.i_uid, i.i_gid)
     };
-    // 原版 current->euid / egid；Task 里还没有这两个字段（见 STATUS.md），
-    // 内核态一律当 root。
-    let (euid, egid) = (0u16, 0u16);
+    // SAFETY: 进程上下文、单核；只读当前任务的凭据（euid/egid）。
+    let (euid, egid) = unsafe {
+        let c = crate::sched::current();
+        (c.euid, c.egid)
+    };
 
     let mut m = i_mode;
-    if euid == i_uid {
+    if euid == i_uid as u32 {
         m >>= 6;
-    } else if egid == i_gid {
+    } else if egid == i_gid as u32 {
         m >>= 3;
     }
     if m & mask & 0o007 == mask {
         return true;
     }
-    // root：读写无条件通过；执行要求至少有一个 x 位（同原版 suser() 分支）
-    if euid == 0 {
-        if mask & mode::S_IXUSR == 0 {
-            return true;
-        }
-        if i_mode & 0o111 != 0 {
-            return true;
-        }
-    }
-    false
+    // root：suser() 恒真，无条件通过（原版 1.0.9 语义）。
+    euid == 0
 }
 
 /// 建立 inode 表。对应原版 `inode_init()`。

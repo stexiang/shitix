@@ -111,6 +111,103 @@ impl Stat64 {
     }
 }
 
+/// `struct statx_timestamp`（x86_64 ABI，16 字节）。
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __reserved: i32,
+}
+
+/// `struct statx`（x86_64 ABI，256 字节）。对应 `include/uapi/linux/stat.h`。
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub __spare0: u16,
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    pub __spare3: [u64; 12],
+}
+
+/// `STATX_BASIC_STATS`（type/mode/nlink/uid/gid/atime/mtime/ctime/ino/size/blocks）。
+pub const STATX_BASIC_STATS: u32 = 0x7ff;
+
+impl Statx {
+    pub const fn zeroed() -> Self {
+        Statx {
+            stx_mask: 0,
+            stx_blksize: 0,
+            stx_attributes: 0,
+            stx_nlink: 0,
+            stx_uid: 0,
+            stx_gid: 0,
+            stx_mode: 0,
+            __spare0: 0,
+            stx_ino: 0,
+            stx_size: 0,
+            stx_blocks: 0,
+            stx_attributes_mask: 0,
+            stx_atime: StatxTimestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 },
+            stx_btime: StatxTimestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 },
+            stx_ctime: StatxTimestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 },
+            stx_mtime: StatxTimestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 },
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+            __spare3: [0; 12],
+        }
+    }
+
+    /// 从 x86_64 `struct stat`（Stat64）填充 Statx。只填 BASIC_STATS。
+    pub fn from_stat64(s: &Stat64) -> Self {
+        let mut x = Self::zeroed();
+        x.stx_mask = STATX_BASIC_STATS;
+        x.stx_blksize = s.st_blksize as u32;
+        x.stx_nlink = s.st_nlink as u32;
+        x.stx_uid = s.st_uid;
+        x.stx_gid = s.st_gid;
+        x.stx_mode = s.st_mode as u16;
+        x.stx_ino = s.st_ino;
+        x.stx_size = s.st_size as u64;
+        x.stx_blocks = s.st_blocks as u64;
+        x.stx_attributes_mask = 0;
+        x.stx_atime = StatxTimestamp { tv_sec: s.st_atime, tv_nsec: s.st_atime_nsec as u32, __reserved: 0 };
+        x.stx_btime = StatxTimestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 };
+        x.stx_ctime = StatxTimestamp { tv_sec: s.st_ctime, tv_nsec: s.st_ctime_nsec as u32, __reserved: 0 };
+        x.stx_mtime = StatxTimestamp { tv_sec: s.st_mtime, tv_nsec: s.st_mtime_nsec as u32, __reserved: 0 };
+        x.stx_rdev_major = (s.st_rdev >> 8) as u32;
+        x.stx_rdev_minor = (s.st_rdev & 0xff) as u32;
+        x.stx_dev_major = (s.st_dev >> 8) as u32;
+        x.stx_dev_minor = (s.st_dev & 0xff) as u32;
+        x
+    }
+}
+
 impl Stat {
     pub const fn zeroed() -> Self {
         Stat {

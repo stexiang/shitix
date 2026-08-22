@@ -585,6 +585,149 @@ fn syscall_selftest() {
 
     // SAFETY: 同上。
     unsafe { syscall::syscall0(nr::UNAME) };
+
+    // ---- uid/gid 凭据体系自检（Phase C）----
+    // task[0]（swapper）初始是 root。getter 应全 0；root 下 setter 应全成功；
+    // umask 往返；getresuid/getresgid 写回三值；非 root 的 euid 转换能复位。
+    let uid_ok = unsafe {
+        let get0 = || {
+            (
+                syscall::syscall0(nr::GETUID),
+                syscall::syscall0(nr::GETEUID),
+                syscall::syscall0(nr::GETGID),
+                syscall::syscall0(nr::GETEGID),
+            )
+        };
+        let (uid, euid, gid, egid) = get0();
+        let ids_ok = uid == 0 && euid == 0 && gid == 0 && egid == 0;
+
+        // umask(077) 返回旧值 0o022，再设回旧值。
+        let old_mask = syscall::syscall3(nr::UMASK, 0o077, 0, 0);
+        let back_mask = syscall::syscall3(nr::UMASK, old_mask as u64, 0, 0);
+        let mask_ok = old_mask == 0o022 && back_mask == 0o077;
+
+        // root 下各 setter 都应成功（值 0）。
+        let s_ok = syscall::syscall3(nr::SETUID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETGID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETREUID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETREGID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETRESUID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETRESGID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETFSUID, 0, 0, 0) == 0
+            && syscall::syscall3(nr::SETFSGID, 0, 0, 0) == 0;
+
+        // getresuid/getresgid 写回三个指针（栈上缓冲区）。
+        let mut res = [0u32; 6];
+        let base = res.as_mut_ptr() as u64;
+        let gr_ok = {
+            let r = syscall::syscall3(nr::GETRESUID, base, base + 4, base + 8);
+            r == 0 && res[0] == 0 && res[1] == 0 && res[2] == 0
+        };
+        let gg_ok = {
+            let r = syscall::syscall3(nr::GETRESGID, base + 12, base + 16, base + 20);
+            r == 0 && res[3] == 0 && res[4] == 0 && res[5] == 0
+        };
+
+        // 非 root 转换：root 把 euid 提到 1000（real uid 保持 0），
+        // 然后靠 real uid==0 用 setuid(0) 复位回 root。
+        syscall::syscall3(nr::SETREUID, 0, 1000, 0);
+        let euid_1000 = syscall::syscall0(nr::GETEUID) == 1000;
+        let uid_still0 = syscall::syscall0(nr::GETUID) == 0;
+        syscall::syscall3(nr::SETUID, 0, 0, 0);
+        let euid_back0 = syscall::syscall0(nr::GETEUID) == 0;
+
+        ids_ok && mask_ok && s_ok && gr_ok && gg_ok
+            && euid_1000 && uid_still0 && euid_back0
+    };
+    kprintln!("syscall: uid/gid -> {}", if uid_ok { "ok" } else { "FAIL" });
+
+    // ---- 匿名事件 fd（Phase B）：eventfd 往返 ----
+    // eventfd2(0,0) 建一个计数 0 的 eventfd；write 42 → read 得 42 且清零，
+    // 再 read 得 -EAGAIN；close 返回 0。
+    let ev_ok = unsafe {
+        let fd = syscall::syscall3(nr::EVENTFD2, 0, 0, 0);
+        if fd < 3 {
+            false
+        } else {
+            let mut val = 0u64;
+            let mut out = 0u64;
+            val = 42;
+            let w = syscall::syscall3(nr::WRITE, fd as u64, &val as *const _ as u64, 8);
+            let r = syscall::syscall3(nr::READ, fd as u64, &mut out as *mut _ as u64, 8);
+            let r2 = syscall::syscall3(nr::READ, fd as u64, &mut out as *mut _ as u64, 8);
+            let c = syscall::syscall3(nr::CLOSE, fd as u64, 0, 0);
+            w == 8 && r == 8 && out == 42
+                && r2 == -(klib::errno::EAGAIN as i64) && c == 0
+        }
+    };
+    kprintln!("syscall: eventfd -> {}", if ev_ok { "ok" } else { "FAIL" });
+
+    // ---- timerfd / signalfd 基本往返（Phase B）----
+    // timerfd：create → settime（立即）→ gettime → close 全成功。
+    // signalfd：create → read 无待处理信号得 -EAGAIN → close。
+    let ts_ok = unsafe {
+        let tfd = syscall::syscall3(nr::TIMERFD_CREATE, 1 /* CLOCK_MONOTONIC */, 0, 0);
+        let sfd = syscall::syscall3(nr::SIGNALFD, -1i64 as u64, 0, 0);
+        if tfd < 3 || sfd < 3 {
+            false
+        } else {
+            // itimerspec：一次性 1 纳秒（向上取整到 1 tick）。
+            let mut spec = crate::fs::event::ItimerSpec {
+                it_interval_sec: 0,
+                it_interval_nsec: 0,
+                it_value_sec: 0,
+                it_value_nsec: 1,
+            };
+            let st = syscall::syscall3(nr::TIMERFD_SETTIME, tfd as u64, 0,
+                                       &mut spec as *mut _ as u64);
+            // signalfd：无待处理信号，read 应 -EAGAIN（缓冲需 >= 128B）。
+            let mut out = [0u64; 16];
+            let sr = syscall::syscall3(nr::READ, sfd as u64, out.as_mut_ptr() as u64, 128);
+            let tc = syscall::syscall3(nr::CLOSE, tfd as u64, 0, 0);
+            let sc = syscall::syscall3(nr::CLOSE, sfd as u64, 0, 0);
+            st == 0 && sr == -(klib::errno::EAGAIN as i64) && tc == 0 && sc == 0
+        }
+    };
+    kprintln!("syscall: timerfd/signalfd -> {}", if ts_ok { "ok" } else { "FAIL" });
+
+    // ---- splice / tee 往返（零拷贝管道）----
+    // task[0] 无用户页表（pml4==0），copy_from_user 是 no-op，所以 vmsplice
+    // （依赖 pipe_write→copy_from_user）无法在内核上下文测；这里用
+    // pipe_write_kernel 直接灌数据，只测 splice/tee 的内核缓冲搬运路径。
+    let sp_ok = unsafe {
+        let mut fds1 = [0i32; 2];
+        let mut fds2 = [0i32; 2];
+        let p1 = syscall::syscall3(nr::PIPE, fds1.as_mut_ptr() as u64, 0, 0);
+        let p2 = syscall::syscall3(nr::PIPE, fds2.as_mut_ptr() as u64, 0, 0);
+        if p1 != 0 || p2 != 0 || fds1[0] < 0 || fds2[0] < 0 {
+            false
+        } else {
+            let msg = b"hello";
+            // 直接内核接口写进 pipe1。
+            let pin1 = crate::fs::pipe::fd_to_pipe(fds1[1] as usize).unwrap();
+            let w0 = crate::fs::pipe::pipe_write_kernel(pin1, msg.as_ptr(), 5);
+            // splice(pipe1读端, NULL, pipe2写端, NULL, 5, 0)：pipe→pipe。
+            let sp = syscall::syscall6(nr::SPLICE, fds1[0] as u64, 0,
+                                       fds2[1] as u64, 0, 5, 0);
+            // tee：从 pipe2 读端 peek 复制到 pipe1 写端（不消费 pipe2）。
+            let t = syscall::syscall3(nr::TEE, fds2[0] as u64, fds1[1] as u64, 5);
+            // 现在 pipe1 和 pipe2 的读端都应有 "hello"。
+            let pout1 = crate::fs::pipe::fd_to_pipe(fds1[0] as usize).unwrap();
+            let mut out2 = [0u8; 8];
+            let rd2 = crate::fs::pipe::pipe_read_kernel(pout1, out2.as_mut_ptr(), 8);
+            let pout2 = crate::fs::pipe::fd_to_pipe(fds2[0] as usize).unwrap();
+            let mut out = [0u8; 8];
+            let rd = crate::fs::pipe::pipe_read_kernel(pout2, out.as_mut_ptr(), 8);
+            // 关掉四个端。
+            for fd in [fds1[0], fds1[1], fds2[0], fds2[1]] {
+                syscall::syscall3(nr::CLOSE, fd as u64, 0, 0);
+            }
+            w0 == 5 && sp == 5 && rd == 5 && &out[..5] == b"hello"
+                && t == 5 && rd2 == 5 && &out2[..5] == b"hello"
+        }
+    };
+    kprintln!("syscall: splice/tee -> {}", if sp_ok { "ok" } else { "FAIL" });
+
     syscall::dump();
     serial::print("syscall: selftest done\n");
 }
@@ -1398,6 +1541,26 @@ fn syscall_fs_selftest() {
     };
     check(e2 == 0, "stat(path) return", e2);
     check(st2.st_size == data.len() as u32, "stat st_size", st2.st_size as i64);
+
+    // 6b. chown + access：属主改为 1000/2000，stat 应反映；access 应通过。
+    let ch = unsafe {
+        syscall::syscall3(nr::CHOWN, path.as_ptr() as u64, 1000, 2000)
+    };
+    check(ch == 0, "chown", ch);
+    let mut st3 = fs::stat::Stat::zeroed();
+    // SAFETY: 同上；st3 在内核栈上。
+    let e4 = unsafe {
+        syscall::syscall3(nr::STAT, path.as_ptr() as u64, &mut st3 as *mut _ as u64, 0)
+    };
+    check(e4 == 0, "stat after chown", e4);
+    check(st3.st_uid == 1000, "chown set st_uid", st3.st_uid as i64);
+    check(st3.st_gid == 2000, "chown set st_gid", st3.st_gid as i64);
+    // access 用真实 uid（root==0）：F_OK 与 R_OK 都应通过。
+    // SAFETY: 同上。
+    let acc_f = unsafe { syscall::syscall3(nr::ACCESS, path.as_ptr() as u64, 0, 0) };
+    check(acc_f == 0, "access F_OK", acc_f);
+    let acc_r = unsafe { syscall::syscall3(nr::ACCESS, path.as_ptr() as u64, 4, 0) };
+    check(acc_r == 0, "access R_OK", acc_r);
 
     // 7. mkdir/rmdir 往返
     let dir = b"/scdir\0";

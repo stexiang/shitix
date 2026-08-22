@@ -321,8 +321,10 @@ pub unsafe fn sys_wait4(pid: i64, stat_addr: u64, options: u64) -> i64 {
         };
 
         if let Some((slot, child_pid, code)) = found {
-            // slot == NR_TASKS 是 WUNTRACED 的「只报告不收尸」哨兵。
-            let status = if slot == sched::NR_TASKS { code } else { encode_status(code) };
+            // `exit_code` 现在存的就是最终状态字（sys_exit 已把退出码编成
+            // `(code & 0xff) << 8`，信号终止存原始信号号 1..=31），wait4
+            // 直接透传，不再需要区分「1..=31 是退出码还是信号」。
+            let status = code;
             if stat_addr != 0 {
                 // SAFETY: 契约保证 stat_addr 可写 4 字节；页表恒等映射。
                 unsafe { core::ptr::write_volatile(stat_addr as *mut i32, status) };
@@ -365,21 +367,6 @@ pub unsafe fn sys_wait4(pid: i64, stat_addr: u64, options: u64) -> i64 {
                 return -(EINTR as i64);
             }
         }
-    }
-}
-
-/// 把 `exit_code` 编成 waitpid 的状态字。
-///
-/// 原版 `do_exit` 存的就是最终状态字（`sys_exit` 传 `code<<8`，
-/// 信号终止传信号号）。我们的 [`do_exit`] 收到的是「退出码或信号号」，
-/// 所以在这里区分：1..=31 当信号，其余当退出码。
-fn encode_status(code: i32) -> i32 {
-    if (1..=31).contains(&code) {
-        // 低 7 位放终止信号，第 8 位（core dumped）我们不置
-        code
-    } else {
-        // 高 8 位放退出码，低 8 位 0 表示正常退出
-        (code & 0xFF) << 8
     }
 }
 

@@ -221,24 +221,34 @@ pub mod full {
 
     /// 写回 ext2/ext4 超级块与组描述符的空闲计数。对应原版 `ext2_write_super`。
     ///
-    /// 本内核只维护组 0 的描述符（单块组文件系统），所以超级块空闲计数直接
-    /// 取组 0 的计数。块位图/inode 位图的变更由 alloc/free 路径用 mark_buffer_dirty
-    /// 落盘，这里只回写 free_blocks_count / free_inodes_count。
+    /// 超级块的 s_free_blocks_count / s_free_inodes_count 是**所有块组之和**，
+    /// 之前直接取组 0 的计数（`info.ext4_gd`），多块组文件系统（GNU 镜像 4 组）
+    /// 上会把总数写成组 0 单独的值 → e2fsck 报 "Free blocks count wrong"。
+    /// 块位图/inode 位图的变更由 alloc/free 路径用 mark_buffer_dirty 落盘，
+    /// 这里只回写 free_blocks_count / free_inodes_count。
     pub unsafe fn write_super(n: usize) {
         unsafe {
             let info = ext4_info(n);
             if !info.valid { return; }
             let dev = sb(n).s_dev;
-            let free_blocks = info.ext4_gd.free_blocks_count;
-            let free_inodes = info.ext4_gd.free_inodes_count;
+
+            // 跨组汇总：组 0 用缓存，组 1..N 从 GDT 读。
+            let mut free_blocks = info.ext4_gd.free_blocks_count as u64;
+            let mut free_inodes = info.ext4_gd.free_inodes_count as u64;
+            for group in 1..info.group_count as u32 {
+                if let Some(gd) = read_group_desc_scaled(n, group) {
+                    free_blocks += gd.free_blocks_count as u64;
+                    free_inodes += gd.free_inodes_count as u64;
+                }
+            }
 
             // 超级块在 1024 字节块 1（字节偏移 1024）；s_free_blocks_count 在
             // 偏移 12、s_free_inodes_count 在偏移 16（u32 小端）。
             if let Some(sbn) = buffer::bread(dev, 1, 1024) {
                 let sd = bh(sbn).data_mut();
                 if sd.len() >= 20 {
-                    sd[12..16].copy_from_slice(&free_blocks.to_le_bytes());
-                    sd[16..20].copy_from_slice(&free_inodes.to_le_bytes());
+                    sd[12..16].copy_from_slice(&(free_blocks as u32).to_le_bytes());
+                    sd[16..20].copy_from_slice(&(free_inodes as u32).to_le_bytes());
                 }
                 buffer::mark_buffer_dirty(sbn);
                 buffer::brelse(sbn);
@@ -248,11 +258,13 @@ pub mod full {
             // bg_free_inodes_count 偏移 14（u16）、bg_used_dirs_count 偏移 16（u16）。
             let gd_block = info.gd_1024_block;
             let used_dirs = info.ext4_gd.used_dirs_count;
+            let group0_blocks = info.ext4_gd.free_blocks_count;
+            let group0_inodes = info.ext4_gd.free_inodes_count;
             if let Some(gbn) = buffer::bread(dev, gd_block, 1024) {
                 let gd_data = bh(gbn).data_mut();
                 if gd_data.len() >= 18 {
-                    gd_data[12..14].copy_from_slice(&(free_blocks as u16).to_le_bytes());
-                    gd_data[14..16].copy_from_slice(&(free_inodes as u16).to_le_bytes());
+                    gd_data[12..14].copy_from_slice(&(group0_blocks as u16).to_le_bytes());
+                    gd_data[14..16].copy_from_slice(&(group0_inodes as u16).to_le_bytes());
                     gd_data[16..18].copy_from_slice(&(used_dirs as u16).to_le_bytes());
                 }
                 buffer::mark_buffer_dirty(gbn);
@@ -995,13 +1007,21 @@ pub mod full {
             while read < len {
                 let block = (off / bs as u64) as u32;
                 let block_off = (off % bs as u64) as usize;
+                let avail = (bs - block_off).min(len - read);
                 let phys = bmap(ip, block, false);
-                if phys == 0 { break; }
+                if phys == 0 {
+                    // 空洞（稀疏文件）：读出 0，而不是把 hole 当 EOF。
+                    for b in &mut buf[read..read + avail] {
+                        *b = 0;
+                    }
+                    read += avail;
+                    off += avail as u64;
+                    continue;
+                }
                 let b = match buffer::bread(dev, phys, bs) {
                     Some(b) => b, None => break,
                 };
                 let data = buffer::bh(b).data();
-                let avail = (bs - block_off).min(len - read);
                 ptr::copy_nonoverlapping(data[block_off..].as_ptr(), buf.as_mut_ptr().add(read), avail);
                 read += avail; off += avail as u64;
                 buffer::brelse(b);

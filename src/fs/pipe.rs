@@ -306,3 +306,87 @@ pub fn pipe_write(idx: usize, buf: *const u8, count: usize) -> i64 {
         }
     }
 }
+
+// =============================================================================
+// splice / tee / vmsplice 用的内核缓冲管道操作（不经 copy_to/from_user）
+// =============================================================================
+
+/// 从管道环缓冲读入**内核**缓冲区（`dst` 是内核地址，不经 copy_to_user）。
+/// 非阻塞：空则返回 0。
+pub fn pipe_read_kernel(idx: usize, dst: *mut u8, count: usize) -> i64 {
+    if dst.is_null() || count == 0 { return 0; }
+    // SAFETY: dst 是调用方分配的内核页；idx 有效。
+    unsafe {
+        let page = PIPE_PAGES[idx];
+        if page == 0 { return 0; }
+        let m = meta(page);
+        if (*m).len == 0 { return 0; }
+        let ring = (page + buf_offset()) as *const u8;
+        let n = core::cmp::min(count, (*m).len);
+        let first = core::cmp::min(n, ring_size() - (*m).read_pos);
+        core::ptr::copy_nonoverlapping(ring.add((*m).read_pos), dst, first);
+        (*m).read_pos = ((*m).read_pos + first) % ring_size();
+        (*m).len -= first;
+        let mut total = first;
+        if first < n {
+            let second = n - first;
+            core::ptr::copy_nonoverlapping(ring, dst.add(first), second);
+            (*m).read_pos = second;
+            (*m).len -= second;
+            total += second;
+        }
+        (*m).write_wait.wake_up();
+        total as i64
+    }
+}
+
+/// 把**内核**缓冲区写入管道环缓冲（`src` 是内核地址，不经 copy_from_user）。
+/// 非阻塞：满则返回 0。
+pub fn pipe_write_kernel(idx: usize, src: *const u8, count: usize) -> i64 {
+    if src.is_null() || count == 0 { return 0; }
+    // SAFETY: src 是调用方分配的内核页；idx 有效。
+    unsafe {
+        let page = PIPE_PAGES[idx];
+        if page == 0 { return 0; }
+        let m = meta(page);
+        if (*m).readers == 0 { return -(EPIPE as i64); }
+        let free = ring_size() - (*m).len;
+        if free == 0 { return 0; }
+        let ring = (page + buf_offset()) as *mut u8;
+        let n = core::cmp::min(count, free);
+        let first = core::cmp::min(n, ring_size() - (*m).write_pos);
+        core::ptr::copy_nonoverlapping(src, ring.add((*m).write_pos), first);
+        (*m).write_pos = ((*m).write_pos + first) % ring_size();
+        (*m).len += first;
+        let mut total = first;
+        if first < n {
+            let second = n - first;
+            core::ptr::copy_nonoverlapping(src.add(first), ring, second);
+            (*m).write_pos = second;
+            (*m).len += second;
+            total += second;
+        }
+        (*m).read_wait.wake_up();
+        total as i64
+    }
+}
+
+/// 从管道环缓冲**只读不消费**地读入内核缓冲区（tee 用）。非阻塞：空返回 0。
+pub fn pipe_peek_kernel(idx: usize, dst: *mut u8, count: usize) -> i64 {
+    if dst.is_null() || count == 0 { return 0; }
+    // SAFETY: dst 是内核页；idx 有效。
+    unsafe {
+        let page = PIPE_PAGES[idx];
+        if page == 0 { return 0; }
+        let m = meta(page);
+        if (*m).len == 0 { return 0; }
+        let ring = (page + buf_offset()) as *const u8;
+        let n = core::cmp::min(count, (*m).len);
+        let first = core::cmp::min(n, ring_size() - (*m).read_pos);
+        core::ptr::copy_nonoverlapping(ring.add((*m).read_pos), dst, first);
+        if first < n {
+            core::ptr::copy_nonoverlapping(ring, dst.add(first), n - first);
+        }
+        n as i64
+    }
+}

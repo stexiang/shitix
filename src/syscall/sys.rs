@@ -5,7 +5,7 @@
 //! 其余在分发表里指向 [`ni_syscall`]。每个函数的文档注明原版位置。
 
 use super::{SysArgs, nr};
-use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV};
+use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP};
 use crate::klib::printk::Level;
 use crate::sched;
 use crate::traps::PtRegs;
@@ -24,6 +24,13 @@ pub struct Timezone {
     pub tz_dsttime: i32,
 }
 
+/// `struct itimerval`（x86_64：两个 `timeval`）。
+#[repr(C)]
+pub struct ItimerVal {
+    pub it_interval: TimeVal,
+    pub it_value: TimeVal,
+}
+
 /// 系统信息结构
 #[repr(C)]
 pub struct SysInfo {
@@ -36,6 +43,22 @@ pub struct SysInfo {
     pub totalswap: u64,
     pub freeswap: u64,
     pub procs: u64,
+}
+
+/// 系统主机名。`sethostname(2)` 写入，`uname(2)` 的 nodename 读它。
+/// 空（首字节 0）时 `uname` 回退到 [`crate::UTS_SYSNAME`]。
+static mut HOSTNAME: [u8; 65] = [0; 65];
+/// 系统域名。`setdomainname(2)` 写入，`uname(2)` 的 domainname 读它。
+static mut DOMAINNAME: [u8; 65] = [0; 65];
+
+/// 把一个 NUL 结尾的字节串拷进定长缓冲（越界截断，末尾补 NUL）。
+/// 返回实际写入的字节数。
+fn hostname_set(dst: &mut [u8], src: &[u8]) {
+    let n = src.len().min(dst.len() - 1);
+    dst[..n].copy_from_slice(&src[..n]);
+    for b in &mut dst[n..] {
+        *b = 0;
+    }
 }
 
 /// 资源使用情况
@@ -1068,6 +1091,10 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         let pipe_idx = crate::fs::pipe::fd_to_pipe(fd as usize).unwrap();
         return crate::fs::pipe::pipe_write(pipe_idx, args.a1 as *const u8, sz64 as usize);
     }
+    // 匿名事件 fd（仅 eventfd 可写）。
+    if crate::fs::event::fd_is_event(fd as usize) {
+        return crate::fs::event::write(fd as usize, args.a1, sz64);
+    }
     // SAFETY: user_buf 已校验范围。
     let buf = match unsafe { user_buf(args.a1, sz64) } {
         Ok(b) => b,
@@ -1107,7 +1134,11 @@ pub fn write(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 原版 `do_exit` 要释放页表、关文件、通知父进程、转 ZOMBIE 等父进程 wait。
 /// 那些依赖 `fs/` 和信号。这里只做内核线程能做的部分：记录退出码后让出 CPU。
 pub fn exit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    crate::exit::do_exit(args.a0 as i32)
+    // 对齐 Linux：sys_exit 把退出码编成最终状态字（高 8 位退出码、低 7 位
+    // 信号为 0），do_exit 收到的是「已编码的退出状态」；信号终止则直接传
+    // 原始信号号（1..=31，落在低 7 位）。这样 wait4 无需再猜 1..=31 是
+    // 退出码还是信号——之前 `/bin/false`(exit 1) 会被误报成 SIGHUP。
+    crate::exit::do_exit((args.a0 as i32 & 0xff) << 8)
 }
 
 /// 系统信息。对应原版 `sys.c:sys_uname()` / `sys_newuname()`。
@@ -1144,7 +1175,17 @@ pub fn uname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         fill(p, crate::UTS_SYSNAME, utsname_len);
         p = p.add(utsname_len);
         zeroed += utsname_len;
-        fill(p, crate::UTS_SYSNAME, utsname_len); // nodename（暂同 sysname）
+        // nodename：sethostname 设置过就用它，否则回退 sysname。
+        let nodename = {
+            let h = &*core::ptr::addr_of!(HOSTNAME);
+            let n = h.iter().position(|&b| b == 0).unwrap_or(65);
+            if n > 0 {
+                core::str::from_utf8(&h[..n]).unwrap_or(crate::UTS_SYSNAME)
+            } else {
+                crate::UTS_SYSNAME
+            }
+        };
+        fill(p, nodename, utsname_len);
         p = p.add(utsname_len);
         zeroed += utsname_len;
         fill(p, crate::UTS_RELEASE, utsname_len);
@@ -1156,8 +1197,17 @@ pub fn uname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         fill(p, crate::UTS_MACHINE, utsname_len);
         p = p.add(utsname_len);
         zeroed += utsname_len;
-        // domainname（GNU 扩展，第 6 字段）留空
-        fill(p, "", utsname_len);
+        // domainname（GNU 扩展，第 6 字段）：setdomainname 设置过就用它。
+        let domainname = {
+            let d = &*core::ptr::addr_of!(DOMAINNAME);
+            let n = d.iter().position(|&b| b == 0).unwrap_or(65);
+            if n > 0 {
+                core::str::from_utf8(&d[..n]).unwrap_or("")
+            } else {
+                ""
+            }
+        };
+        fill(p, domainname, utsname_len);
         zeroed += utsname_len;
         debug_assert_eq!(zeroed, 390);
     }
@@ -1290,6 +1340,11 @@ pub fn read(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         let pipe_idx = crate::fs::pipe::fd_to_pipe(fd as usize).unwrap();
         return crate::fs::pipe::pipe_read(pipe_idx, args.a1 as *mut u8, sz64 as usize);
     }
+    // 匿名事件 fd（eventfd/timerfd/signalfd/...）fast path。
+    if crate::fs::event::fd_is_event(fd as usize) {
+        // SAFETY: 调用方保证 buf 可写；event.rs 内按 len 校验。
+        return crate::fs::event::read(fd as usize, args.a1, sz64);
+    }
     // SAFETY: user_buf_mut 已校验范围。
     let buf = match unsafe { user_buf_mut(args.a1, sz64) } {
         Ok(b) => b,
@@ -1332,6 +1387,11 @@ pub fn close(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // Socket cleanup
     if crate::net::socket::fd_is_socket(fd) {
         crate::net::socket::close_socket(fd);
+        closed = true;
+    }
+    // 匿名事件 fd cleanup
+    if crate::fs::event::fd_is_event(fd) {
+        crate::fs::event::close(fd);
         closed = true;
     }
     if closed {
@@ -1880,17 +1940,14 @@ pub fn ioctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// 访问权限检查。对应原版 `fs/open.c:sys_access()`。
 pub fn access(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let pathname = args.a0 as *const u8;
-    let _mode = args.a1 as i32;
+    let mode = args.a1 as u16;
     if pathname.is_null() { return -(EFAULT as i64); }
     let path = match unsafe { user_path(args.a0) } {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // Check if file exists by trying to resolve it
-    match unsafe { crate::fs::namei::namei(path) } {
-        Ok(ino) => { unsafe { crate::fs::inode::iput(ino); } 0 }
-        Err(e) => e as i64,
-    }
+    // SAFETY: 进程上下文；access 用真实 uid/gid（use_effective=false）。
+    unsafe { crate::fs::open::sys_access(path, mode, false) }
 }
 
 /// pipe。对应原版 `fs/pipe.c:sys_pipe()`。
@@ -1961,18 +2018,21 @@ pub fn chmod(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     unsafe { crate::fs::open::sys_chmod(path, args.a1 as u16) }
 }
 
-/// 改变所有者。对应原版 `fs/open.c:sys_chown()`。
+/// 改变所有者（跟随符号链接）。对应原版 `fs/open.c:sys_chown()`。
 pub fn chown(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let pathname = args.a0 as *const u8;
     let owner = args.a1 as u32;
     let group = args.a2 as u32;
-    
+
     if pathname.is_null() {
         return -(EFAULT as i64);
     }
-    
-    // TODO: 集成 fs
-    -(ENOSYS as i64)
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 进程上下文；路径已从用户态拷入。
+    unsafe { crate::fs::open::sys_chown(path, owner, group, true) }
 }
 
 /// 终止进程信号。对应原版 `kernel/signal.c:sys_kill()`。
@@ -2026,18 +2086,68 @@ pub fn gettimeofday(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     0
 }
 
+/// 是否超级用户。对应原版 `suser()`：有效 uid == 0。
+///
+/// # Safety
+/// 进程上下文（读 `current()`）。
+#[inline]
+unsafe fn suser() -> bool {
+    // SAFETY: 契约转交。
+    unsafe { crate::sched::current().euid == 0 }
+}
+
 /// 获取用户 ID。对应原版 `kernel/sys.c:sys_getuid()`。
-pub fn getuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn getuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 进程上下文，单核。
+    unsafe { crate::sched::current().uid as i64 }
+}
 /// 获取有效用户 ID。对应原版 `kernel/sys.c:sys_geteuid()`。
-pub fn geteuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn geteuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 进程上下文，单核。
+    unsafe { crate::sched::current().euid as i64 }
+}
 /// 获取组 ID。对应原版 `kernel/sys.c:sys_getgid()`。
-pub fn getgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn getgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 进程上下文，单核。
+    unsafe { crate::sched::current().gid as i64 }
+}
 /// 获取有效组 ID。对应原版 `kernel/sys.c:sys_getegid()`。
-pub fn getegid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 设置用户 ID。
-pub fn setuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置组 ID。
-pub fn setgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
+pub fn getegid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 进程上下文，单核。
+    unsafe { crate::sched::current().egid as i64 }
+}
+/// 设置用户 ID。对应原版 `kernel/sys.c:sys_setuid()`。
+pub fn setuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let uid = args.a0 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        if c.euid == 0 {
+            c.uid = uid; c.euid = uid; c.suid = uid; c.fsuid = uid;
+        } else if uid == c.uid || uid == c.suid {
+            c.euid = uid; c.fsuid = uid;
+        } else {
+            return -(EPERM as i64);
+        }
+    }
+    0
+}
+/// 设置组 ID。对应原版 `kernel/sys.c:sys_setgid()`。
+pub fn setgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let gid = args.a0 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        if c.euid == 0 {
+            c.gid = gid; c.egid = gid; c.sgid = gid; c.fsgid = gid;
+        } else if gid == c.gid || gid == c.sgid {
+            c.egid = gid; c.fsgid = gid;
+        } else {
+            return -(EPERM as i64);
+        }
+    }
+    0
+}
 /// 设置进程组。对应原版 `kernel/sys.c:sys_setpgid()`。
 ///
 /// `pid == 0` 表示当前进程；`pgid == 0` 表示「以目标进程 pid 建立新组」。
@@ -2122,8 +2232,17 @@ pub fn setsid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
 }
 
-/// 同步文件系统。
-pub fn sync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 同步文件系统。对应原版 `sys_sync()`。
+///
+/// 之前是返回 0 的存根：`sync` 命令「成功」但什么都不刷。结果 chmod/ln 等
+/// 只改 inode 元数据（i_mode/i_nlink）的操作，其脏 inode 缓冲从不落盘，
+/// 硬关机后权限/链接数回退，e2fsck 报 "ref count wrong"。dev=0 表示所有设备
+/// （`sync_buffers`/`sync_supers`/`sync_inodes` 都对 0 做「全部」分支）。
+pub fn sync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 系统调用上下文（进程上下文，可睡）。
+    unsafe { crate::fs::buffer::sync_dev(0) };
+    0
+}
 /// 文件同步。
 pub fn fsync(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let fd = args.a0 as i64;
@@ -2144,7 +2263,14 @@ pub fn truncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     unsafe { crate::fs::open::sys_truncate(path, args.a1 as u32) }
 }
 /// 设置文件长度（ftruncate）。
-pub fn ftruncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+pub fn ftruncate(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    // SAFETY: fs 层校验 fd。
+    unsafe { crate::fs::open::sys_ftruncate(fd as usize, args.a1 as u32) }
+}
 /// 获取目录项。
 pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let fd = args.a0 as i64;
@@ -2181,9 +2307,26 @@ pub fn getdents64(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     getdents(args, regs)
 }
 /// 文件描述符控制。
-pub fn fchdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 获取 umask。
-pub fn umask(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0o022 }
+pub fn fchdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    // SAFETY: fs 层校验 fd。
+    unsafe { crate::fs::open::sys_fchdir(fd as usize) }
+}
+/// 设置/获取 umask。对应原版 `kernel/sys.c:sys_umask()`：
+/// 设置新值（只取 `S_IRWXUGO` 位）并返回旧值。
+pub fn umask(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let mask = args.a0 as u16;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        let old = c.umask;
+        c.umask = mask & 0o777;
+        old as i64
+    }
+}
 /// 获取系统信息。
 pub fn sysinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let buf = args.a0 as *mut SysInfo;
@@ -2324,7 +2467,24 @@ pub fn mount(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 /// 卸载文件系统。
 pub fn umount(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn prlimit64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置/获取资源限制（`prlimit64`）。只支持当前进程；无资源限制子系统，
+/// 读取返回「无限」（-1），写入忽略。
+pub fn prlimit64(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // prlimit64(pid, resource, new_limit, old_limit)
+    let _pid = args.a0 as i32;
+    let _resource = args.a1 as u32;
+    let _new_limit = args.a2;
+    let old_limit = args.a3;
+    if old_limit != 0 {
+        let rlim = old_limit as *mut RLimit;
+        // SAFETY: 缺 verify_area，同 getrlimit 的限制。
+        unsafe {
+            (*rlim).rlim_cur = -1i64 as u64;
+            (*rlim).rlim_max = -1i64 as u64;
+        }
+    }
+    0
+}
 /// 重新引导。
 pub fn reboot(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 资源使用情况。
@@ -2594,8 +2754,45 @@ pub fn wait4(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // 页表恒等映射所以用户指针可直接写（还没有独立用户地址空间）。
     unsafe { crate::exit::sys_wait4(pid, args.a1, args.a2) }
 }
-pub fn setitimer(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn getitimer(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置间隔定时器。没有定时器投递子系统（ITIMER_REAL→SIGALRM 未接），
+/// 接受设置但不起效；`old` 写回「未激活」。
+pub fn setitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let which = args.a0 as i32;
+    let _new = args.a1 as *const ItimerVal;
+    let old = args.a2 as *mut ItimerVal;
+    if which < 0 || which > 2 {
+        return -(EINVAL as i64);
+    }
+    if !old.is_null() {
+        // SAFETY: 缺 verify_area，同 sys_write 的限制。
+        unsafe {
+            (*old).it_interval.tv_sec = 0;
+            (*old).it_interval.tv_usec = 0;
+            (*old).it_value.tv_sec = 0;
+            (*old).it_value.tv_usec = 0;
+        }
+    }
+    0
+}
+/// 取间隔定时器。无定时器子系统 → 恒返回「未激活」。
+pub fn getitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let which = args.a0 as i32;
+    let v = args.a1 as *mut ItimerVal;
+    if v.is_null() {
+        return -(EFAULT as i64);
+    }
+    if which < 0 || which > 2 {
+        return -(EINVAL as i64);
+    }
+    // SAFETY: 缺 verify_area，同 sys_write 的限制。
+    unsafe {
+        (*v).it_interval.tv_sec = 0;
+        (*v).it_interval.tv_usec = 0;
+        (*v).it_value.tv_sec = 0;
+        (*v).it_value.tv_usec = 0;
+    }
+    0
+}
 
 // Memory syscalls
 pub fn mlock(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
@@ -2680,8 +2877,11 @@ pub fn clock_gettime(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let clk_id = args.a0 as i32;
     let tp = args.a1 as *mut Timespec;
     if tp.is_null() { return -(EFAULT as i64); }
-    // Use jiffies (100Hz) for CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1)
-    if clk_id == 0 || clk_id == 1 {
+    // 用 jiffies(100Hz) 充当时间源。接受 realtime/monotonic 及其 coarse/raw/
+    // boot 变体（glibc 的 clock_gettime 可能落到 coarse 时钟上），其余（如
+    // 进程/线程 CPU 时间）没有实现，返回 EINVAL。
+    let supported = matches!(clk_id, 0 | 1 | 4 | 5 | 6 | 7 | 9 | 10 | 11);
+    if supported {
         let jif = crate::sched::jiffies();
         let secs = jif / crate::sched::task::HZ as u64;
         let nsecs = ((jif % crate::sched::task::HZ as u64) * 10_000_000) as i64;
@@ -2693,15 +2893,60 @@ pub fn clock_gettime(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 pub fn clock_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn clock_getres(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn clock_nanosleep(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { nanosleep(_args, _regs) }
+pub fn clock_nanosleep(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // clock_nanosleep(clockid, flags, req, rem)：req 在 a2、rem 在 a3，
+    // 而 nanosleep 期望 req 在 a0、rem 在 a1。之前直接把 a0（clockid，常为
+    // CLOCK_REALTIME=0）当 req 指针传下去 → req==NULL → EINVAL，glibc 的
+    // nanosleep()（内部走 clock_nanosleep）全部失败，`sleep 1` 报
+    // "cannot read realtime clock: Invalid argument"。
+    // TIMER_ABSTIME(flags=1) 的绝对时间语义暂不实现，按相对时间睡。
+    let na = SysArgs { a0: args.a2, a1: args.a3, a2: 0, a3: 0, a4: 0, a5: 0 };
+    nanosleep(&na, _regs)
+}
 
 // Priority syscalls
 pub fn getpriority(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn setpriority(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
 // Hostname syscalls
-pub fn sethostname(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn setdomainname(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn sethostname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let name = args.a0 as *const u8;
+    let len = args.a1 as usize;
+    if name.is_null() {
+        return -(EFAULT as i64);
+    }
+    if len > 64 {
+        return -(EINVAL as i64);
+    }
+    if !unsafe { user_ok(args.a0, len as u64, crate::mm::area::AccessMode::Read) } {
+        return -(EFAULT as i64);
+    }
+    // SAFETY: user_ok 通过；HOSTNAME 是静态缓冲。
+    unsafe {
+        let src = core::slice::from_raw_parts(name, len);
+        hostname_set(&mut *core::ptr::addr_of_mut!(HOSTNAME), src);
+    }
+    0
+}
+pub fn setdomainname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let name = args.a0 as *const u8;
+    let len = args.a1 as usize;
+    if name.is_null() {
+        return -(EFAULT as i64);
+    }
+    if len > 64 {
+        return -(EINVAL as i64);
+    }
+    if !unsafe { user_ok(args.a0, len as u64, crate::mm::area::AccessMode::Read) } {
+        return -(EFAULT as i64);
+    }
+    // SAFETY: user_ok 通过；DOMAINNAME 是静态缓冲。
+    unsafe {
+        let src = core::slice::from_raw_parts(name, len);
+        hostname_set(&mut *core::ptr::addr_of_mut!(DOMAINNAME), src);
+    }
+    0
+}
 
 // CPU syscall
 pub fn getcpu(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
@@ -2718,8 +2963,50 @@ pub fn pipe2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let pipe_args = SysArgs { a0: args.a0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0 };
     pipe(&pipe_args, _regs)
 }
-pub fn fchmodat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn fchownat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 取 `*at` 系列系统调用的路径，并校验 dirfd。
+///
+/// `AT_FDCWD(-100)` 或绝对路径退化为普通路径解析；相对路径 + 具体 dirfd
+/// 目前仍按 CWD 解析（VFS 尚未支持真正的 dirfd 相对解析），但先确认该 fd
+/// 有效，避免静默作用到错误文件上。
+///
+/// # Safety
+/// 只能在系统调用上下文调用（`user_path` 依赖 `current()` 与 `check_range`）。
+unsafe fn at_path(dirfd: i64, path_ptr: u64) -> Result<&'static [u8], i64> {
+    use crate::klib::errno::EBADF;
+    // SAFETY: 契约转交 user_path。
+    let path = unsafe { user_path(path_ptr) }?;
+    if dirfd != -100 && path.first() != Some(&b'/') {
+        if crate::fs::open::fd_to_filp(dirfd as usize) == crate::fs::inode::NIL {
+            return Err(-(EBADF as i64));
+        }
+    }
+    Ok(path)
+}
+
+/// `fchmodat(dirfd, path, mode, flags)`。flags 目前不区分 AT_SYMLINK_NOFOLLOW。
+pub fn fchmodat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let path = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`chmod`]。
+    unsafe { crate::fs::open::sys_chmod(path, args.a2 as u16) }
+}
+
+/// `fchownat(dirfd, path, owner, group, flags)`。`AT_SYMLINK_NOFOLLOW` 时不跟随链接。
+pub fn fchownat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let path = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let owner = args.a2 as u32;
+    let group = args.a3 as u32;
+    let flags = args.a4 as u64;
+    // AT_SYMLINK_NOFOLLOW = 0x100
+    let follow = flags & 0x100 == 0;
+    // SAFETY: 进程上下文；路径已从用户态拷入。
+    unsafe { crate::fs::open::sys_chown(path, owner, group, follow) }
+}
 pub fn openat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     use crate::klib::errno::EBADF;
     // openat(dirfd, path, flags, mode)。AT_FDCWD 与绝对路径退化为普通 open。
@@ -2739,14 +3026,100 @@ pub fn openat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let r = unsafe { crate::fs::open::sys_open(path, args.a2 as u32, args.a3 as u16) };
     r
 }
-pub fn mkdirat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn mknodat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn unlinkat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn renameat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn renameat2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn linkat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn symlinkat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn fchown(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+
+/// `mkdirat(dirfd, path, mode)`。glibc 的 `mkdir` 在 x86_64 上走这里。
+pub fn mkdirat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let path = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`mkdir`]。
+    unsafe { crate::fs::namei::do_mkdir(path, args.a2 as u16) }
+}
+
+/// `mknodat(dirfd, path, mode, dev)`。
+pub fn mknodat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let path = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`mknod`]。
+    unsafe { crate::fs::namei::do_mknod(path, args.a2 as u16, args.a3 as u16) }
+}
+
+/// `unlinkat(dirfd, path, flags)`。`AT_REMOVEDIR`(0x200) 时删目录。
+pub fn unlinkat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let path = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let flags = args.a2 as u32;
+    const AT_REMOVEDIR: u32 = 0x200;
+    // SAFETY: 同 [`unlink`]/[`rmdir`]。
+    unsafe {
+        if flags & AT_REMOVEDIR != 0 {
+            crate::fs::namei::do_rmdir(path)
+        } else {
+            crate::fs::namei::do_unlink(path)
+        }
+    }
+}
+
+/// `renameat(olddirfd, oldpath, newdirfd, newpath)`。glibc 的 `rename` 走这里。
+pub fn renameat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let old = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new = match unsafe { at_path(args.a2 as i64, args.a3) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`rename`]。
+    unsafe {
+        let r = crate::fs::namei::do_link(old, new);
+        if r < 0 { return r; }
+        crate::fs::namei::do_unlink(old)
+    }
+}
+
+/// `renameat2(..., flags)`。仅支持 flags==0；其余返回 -EINVAL，
+/// glibc/coreutils 会回退到 [`renameat`] 或 [`rename`]。
+pub fn renameat2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    if args.a4 != 0 {
+        return -(EINVAL as i64);
+    }
+    renameat(args, _regs)
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`。glibc 的 `link` 走这里。
+pub fn linkat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let old = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new = match unsafe { at_path(args.a2 as i64, args.a3) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`link`]。
+    unsafe { crate::fs::namei::do_link(old, new) }
+}
+
+/// `symlinkat(target, newdirfd, linkpath)`。glibc 的 `symlink` 走这里。
+pub fn symlinkat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // 目标文本在 a0、链接路径在 a2；把链接路径搬到 a1 后交给 [`symlink`]。
+    let sa = SysArgs { a0: args.a0, a1: args.a2, a2: 0, a3: 0, a4: 0, a5: 0 };
+    symlink(&sa, _regs)
+}
+/// 改文件属主（按 fd）。对应原版 `fs/open.c:sys_fchown()`。
+pub fn fchown(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as usize;
+    let owner = args.a1 as u32;
+    let group = args.a2 as u32;
+    // SAFETY: 进程上下文。
+    unsafe { crate::fs::open::sys_fchown(fd, owner, group) }
+}
 
 pub fn getrusage(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let usage = args.a1 as *mut RUsage;
@@ -2861,32 +3234,295 @@ pub fn add_key(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn request_key(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn keyctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 
+/// 给一个匿名事件对象分配一个空闲 fd 并绑定。返回 fd，失败 -EMFILE。
+fn alloc_event_fd(obj_idx: usize) -> i64 {
+    for fd in 3usize..64 {
+        if !crate::fs::pipe::fd_is_pipe(fd)
+            && !crate::net::socket::fd_is_socket(fd)
+            && !crate::fs::event::fd_is_event(fd)
+            && unsafe { crate::fs::open::fd_to_filp(fd) == crate::fs::inode::NIL }
+        {
+            crate::fs::event::register_fd(fd, obj_idx);
+            return fd as i64;
+        }
+    }
+    -(crate::klib::errno::EMFILE as i64)
+}
+
 /// inotify.
-pub fn inotify_init(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn inotify_init1(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn inotify_add_watch(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn inotify_rm_watch(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn inotify_init(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let idx = crate::fs::event::inotify_init(0);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
+pub fn inotify_init1(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let idx = crate::fs::event::inotify_init(args.a0 as u32);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
+pub fn inotify_add_watch(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::event::inotify_add_watch(args.a0 as usize, args.a1, args.a2 as u32)
+}
+pub fn inotify_rm_watch(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::event::inotify_rm_watch(args.a0 as usize, args.a1 as u32)
+}
 
 /// epoll.
-pub fn epoll_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn epoll_create1(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn epoll_ctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn epoll_wait(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn epoll_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let idx = crate::fs::event::epoll_create(0);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
+pub fn epoll_create1(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let idx = crate::fs::event::epoll_create(args.a0 as u32);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
+pub fn epoll_ctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::event::epoll_ctl(args.a0 as usize, args.a1 as u32, args.a2 as usize, args.a3)
+}
+pub fn epoll_wait(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::event::epoll_wait(args.a0 as usize, args.a1, args.a2 as u32, args.a3 as i32)
+}
 
 /// timerfd.
-pub fn timerfd_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn timerfd_settime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn timerfd_gettime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn timerfd_create(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let idx = crate::fs::event::timerfd_create(args.a0 as u32, args.a1 as u32);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
+pub fn timerfd_settime(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::event::timerfd_settime(args.a0 as usize, args.a1 as u32, args.a2, args.a3)
+}
+pub fn timerfd_gettime(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::event::timerfd_gettime(args.a0 as usize, args.a1)
+}
 
 /// eventfd.
-pub fn eventfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn eventfd2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn eventfd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // eventfd(initval)：无 flags。
+    let idx = crate::fs::event::eventfd_create(args.a0 as u32, 0);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
+pub fn eventfd2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // eventfd2(initval, flags)。
+    let idx = crate::fs::event::eventfd_create(args.a0 as u32, args.a1 as u32);
+    if idx < 0 { return idx; }
+    alloc_event_fd(idx as usize)
+}
 
 /// file operations.
-pub fn splice(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn tee(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn vmsplice(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn sync_file_range(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 零拷贝管道搬运。`splice(fd_in, off_in*, fd_out, off_out*, len, flags)`。
+/// 至少一端必须是管道；经内核页缓冲在管道与文件/设备之间搬运（非阻塞）。
+pub fn splice(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::mm::{get_free_page, free_page, PAGE_SIZE};
+    let fd_in = args.a0 as usize;
+    let off_in = args.a1;
+    let fd_out = args.a2 as usize;
+    let off_out = args.a3;
+    let len = args.a4 as u64;
+    let _flags = args.a5 as u32;
+
+    if len == 0 {
+        return 0;
+    }
+    // 本树 splice 不支持 socket 端点。
+    if crate::net::socket::fd_is_socket(fd_in) || crate::net::socket::fd_is_socket(fd_out) {
+        return -(EINVAL as i64);
+    }
+    let in_pipe = crate::fs::pipe::fd_is_pipe(fd_in);
+    let out_pipe = crate::fs::pipe::fd_is_pipe(fd_out);
+    if !in_pipe && !out_pipe {
+        return -(EINVAL as i64);
+    }
+    let pin = if in_pipe { crate::fs::pipe::fd_to_pipe(fd_in) } else { None };
+    let pout = if out_pipe { crate::fs::pipe::fd_to_pipe(fd_out) } else { None };
+
+    // 起始偏移：管道侧忽略 off；文件侧 NULL 用 f_pos，否则读 *off。
+    let mut in_pos: i64 = if in_pipe {
+        0
+    } else if off_in != 0 {
+        if !check_range(off_in, 8) { return -(EFAULT as i64); }
+        // SAFETY: 已校验可读。
+        unsafe { core::ptr::read_unaligned(off_in as *const i64) }
+    } else {
+        let f = crate::fs::open::fd_to_filp(fd_in);
+        if f == crate::fs::inode::NIL { return -(EBADF as i64); }
+        // SAFETY: f 有效。
+        unsafe { crate::fs::file_table::filp(f).f_pos as i64 }
+    };
+    let mut out_pos: i64 = if out_pipe {
+        0
+    } else if off_out != 0 {
+        if !check_range(off_out, 8) { return -(EFAULT as i64); }
+        // SAFETY: 已校验可读。
+        unsafe { core::ptr::read_unaligned(off_out as *const i64) }
+    } else {
+        let f = crate::fs::open::fd_to_filp(fd_out);
+        if f == crate::fs::inode::NIL { return -(EBADF as i64); }
+        // SAFETY: f 有效。
+        unsafe { crate::fs::file_table::filp(f).f_pos as i64 }
+    };
+    if in_pos < 0 || out_pos < 0 {
+        return -(EINVAL as i64);
+    }
+
+    let buf = get_free_page();
+    if buf == 0 {
+        return -(crate::klib::errno::ENOMEM as i64);
+    }
+
+    let mut total: i64 = 0;
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = core::cmp::min(remaining as usize, PAGE_SIZE);
+        // 读源。
+        let n: i64 = if in_pipe {
+            crate::fs::pipe::pipe_read_kernel(pin.unwrap(), buf as *mut u8, chunk)
+        } else {
+            // SAFETY: buf 是本页大小内核内存。
+            unsafe {
+                let dest = core::slice::from_raw_parts_mut(buf as *mut u8, chunk);
+                let saved = crate::fs::read_write::lseek(fd_in, 0, crate::fs::SEEK_CUR);
+                crate::fs::read_write::lseek(fd_in, in_pos, crate::fs::SEEK_SET);
+                let r = crate::fs::read_write::read(fd_in, dest);
+                crate::fs::read_write::lseek(fd_in, saved, crate::fs::SEEK_SET);
+                r
+            }
+        };
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        // 写目标。
+        let w: i64 = if out_pipe {
+            crate::fs::pipe::pipe_write_kernel(pout.unwrap(), buf as *const u8, n)
+        } else {
+            // SAFETY: buf 是本页大小内核内存。
+            unsafe {
+                let src = core::slice::from_raw_parts(buf as *const u8, n);
+                let saved = crate::fs::read_write::lseek(fd_out, 0, crate::fs::SEEK_CUR);
+                crate::fs::read_write::lseek(fd_out, out_pos, crate::fs::SEEK_SET);
+                let r = crate::fs::read_write::write(fd_out, src);
+                crate::fs::read_write::lseek(fd_out, saved, crate::fs::SEEK_SET);
+                r
+            }
+        };
+        if w <= 0 {
+            break;
+        }
+        let w = w as usize;
+        total += w as i64;
+        if !in_pipe { in_pos += w as i64; }
+        if !out_pipe { out_pos += w as i64; }
+        if (w as u64) < remaining {
+            break;
+        }
+        remaining -= w as u64;
+    }
+    free_page(buf);
+
+    // 回写偏移 / 推进 f_pos（管道侧无需处理）。
+    if !in_pipe {
+        if off_in != 0 {
+            // SAFETY: 已校验可写。
+            unsafe { core::ptr::write_unaligned(off_in as *mut i64, in_pos); }
+        } else {
+            unsafe { crate::fs::read_write::lseek(fd_in, in_pos, crate::fs::SEEK_SET); }
+        }
+    }
+    if !out_pipe {
+        if off_out != 0 {
+            // SAFETY: 已校验可写。
+            unsafe { core::ptr::write_unaligned(off_out as *mut i64, out_pos); }
+        } else {
+            unsafe { crate::fs::read_write::lseek(fd_out, out_pos, crate::fs::SEEK_SET); }
+        }
+    }
+    total
+}
+
+/// 复制管道数据（两端都必须是管道，源**不消费**）。`tee(fd_in, fd_out, len, flags)`。
+pub fn tee(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::mm::{get_free_page, free_page, PAGE_SIZE};
+    let fd_in = args.a0 as usize;
+    let fd_out = args.a1 as usize;
+    let len = args.a2 as u64;
+    let _flags = args.a3 as u32;
+
+    if len == 0 {
+        return 0;
+    }
+    if !crate::fs::pipe::fd_is_pipe(fd_in) || !crate::fs::pipe::fd_is_pipe(fd_out) {
+        return -(EINVAL as i64);
+    }
+    let pin = crate::fs::pipe::fd_to_pipe(fd_in).unwrap();
+    let pout = crate::fs::pipe::fd_to_pipe(fd_out).unwrap();
+
+    let buf = get_free_page();
+    if buf == 0 {
+        return -(crate::klib::errno::ENOMEM as i64);
+    }
+    // 单次 peek + write：源不消费，所以一次 tee 复制「从头数 len 字节」。
+    let chunk = core::cmp::min(len as usize, PAGE_SIZE);
+    let n = crate::fs::pipe::pipe_peek_kernel(pin, buf as *mut u8, chunk);
+    let mut total: i64 = 0;
+    if n > 0 {
+        let w = crate::fs::pipe::pipe_write_kernel(pout, buf as *const u8, n as usize);
+        total = if w > 0 { w } else { 0 };
+    }
+    free_page(buf);
+    total
+}
+
+/// 把用户内存 iovec 搬进管道。`vmsplice(fd, iov, nr_segs, flags)`。fd 必须是管道。
+pub fn vmsplice(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as usize;
+    let iov = args.a1 as *const IoVec;
+    let nr_segs = args.a2 as usize;
+    let _flags = args.a3 as u32;
+
+    if !crate::fs::pipe::fd_is_pipe(fd) {
+        return -(EINVAL as i64);
+    }
+    let pidx = crate::fs::pipe::fd_to_pipe(fd).unwrap();
+    if iov.is_null() || nr_segs == 0 {
+        return 0;
+    }
+    if nr_segs > 1024 {
+        return -(EINVAL as i64);
+    }
+
+    let mut total: i64 = 0;
+    for i in 0..nr_segs {
+        // SAFETY: 缺 verify_area，同 readv/writev 的限制。
+        let v = unsafe { &*iov.add(i) };
+        if v.len == 0 {
+            continue;
+        }
+        // 用户内存 → 管道：复用 pipe_write（内部 copy_from_user）。
+        let r = crate::fs::pipe::pipe_write(pidx, v.base as *const u8, v.len as usize);
+        if r < 0 {
+            return if total > 0 { total } else { r };
+        }
+        total += r;
+        if (r as u64) < v.len {
+            break; // 管道满
+        }
+    }
+    total
+}
+pub fn sync_file_range(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // sync_file_range(fd, offset, nbytes, flags)。无页缓存/区间写回，
+    // 退化为整文件 fsync。
+    let fd = args.a0 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    // SAFETY: fs 层校验 fd。
+    unsafe { crate::fs::read_write::fsync(fd as usize) }
+}
 pub fn vhangup(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn dup3(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // dup3(oldfd, newfd, flags)。glibc 的 dup2 在 x86_64 上直接走 dup3(fd,fd2,0)，
@@ -2908,31 +3544,226 @@ pub fn dup3(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     unsafe { crate::fs::open::sys_dup2(old as usize, new as usize) }
 }
 pub fn faccessat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    // dirfd=AT_FDCWD(-100) + absolute path: check file accessibility
-    let _dirfd = args.a0 as i32;
-    let path_ptr = args.a1;
-    let _mode = args.a2;
-    // let _flags = args.a3;
-    if path_ptr == 0 { return -(EFAULT as i64); }
-    let path = match unsafe { user_path(path_ptr) } {
-        Ok(p) => p, Err(e) => return e,
+    // faccessat(dirfd, path, mode, flags)
+    let path = match unsafe { at_path(args.a0 as i64, args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
     };
-    match unsafe { crate::fs::namei::namei(path) } {
-        Ok(n) => { unsafe { crate::fs::inode::iput(n); } 0 }
-        Err(e) => -(e as i64),
-    }
+    let mode = args.a2 as u16;
+    let flags = args.a3 as u64;
+    // AT_EACCESS = 0x200：用有效 uid/gid 而非真实 uid/gid。
+    let use_effective = flags & 0x200 != 0;
+    // SAFETY: 进程上下文。
+    unsafe { crate::fs::open::sys_access(path, mode, use_effective) }
 }
 pub fn statfs(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn fstatfs(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn truncate64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn ftruncate64(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn fallocate(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn fallocate(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // fallocate(fd, mode, offset, len)
+    let fd = args.a0 as i64;
+    let mode = args.a1 as u32;
+    let offset = args.a2 as i64;
+    let len = args.a3 as i64;
+    if fd < 0 {
+        return -(EBADF as i64);
+    }
+    // 支持：mode 0（默认分配）+ FALLOC_FL_KEEP_SIZE(1)。
+    if mode & !1 != 0 {
+        return -(EINVAL as i64);
+    }
+    if offset < 0 || len < 0 {
+        return -(EINVAL as i64);
+    }
+    let end = offset + len;
+    if mode & 1 != 0 {
+        // KEEP_SIZE：不改变文件大小（无预分配，直接成功）
+        return 0;
+    }
+    // 默认：文件大小扩展到 end（若当前更大则不变）。
+    let f = crate::fs::open::fd_to_filp(fd as usize);
+    if f == crate::fs::inode::NIL {
+        return -(EBADF as i64);
+    }
+    // SAFETY: f 有效。
+    let n = unsafe { (*crate::fs::file_table::filp(f)).f_inode };
+    if n == crate::fs::inode::NIL {
+        return -(EBADF as i64);
+    }
+    // SAFETY: n 被打开文件持有。
+    let cur = unsafe { (*crate::fs::inode::inode_ptr(n)).i_size as i64 };
+    if end > cur {
+        // SAFETY: fs 层校验 fd；i_size 为 u32，超界截断。
+        unsafe { crate::fs::open::sys_ftruncate(fd as usize, end as u32) }
+    } else {
+        0
+    }
+}
 pub fn fanotify_init(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn fanotify_mark(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn copy_file_range(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn preadv2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn pwritev2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn statx(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn copy_file_range(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::mm::{get_free_page, free_page, PAGE_SIZE};
+    // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+    let in_fd = args.a0 as usize;
+    let off_in = args.a1;
+    let out_fd = args.a2 as usize;
+    let off_out = args.a3;
+    let len = args.a4 as u64;
+    let _flags = args.a5 as u32;
+
+    if in_fd == out_fd {
+        return -(EINVAL as i64);
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    // 起始偏移：off==NULL 用当前 f_pos，否则读 *off。
+    let mut in_pos: i64 = if off_in != 0 {
+        if !check_range(off_in, 8) { return -(EFAULT as i64); }
+        // SAFETY: 已校验可读。
+        unsafe { core::ptr::read_unaligned(off_in as *const i64) }
+    } else {
+        let f = crate::fs::open::fd_to_filp(in_fd);
+        if f == crate::fs::inode::NIL { return -(EBADF as i64); }
+        // SAFETY: f 有效。
+        unsafe { crate::fs::file_table::filp(f).f_pos as i64 }
+    };
+    let mut out_pos: i64 = if off_out != 0 {
+        if !check_range(off_out, 8) { return -(EFAULT as i64); }
+        // SAFETY: 已校验可读。
+        unsafe { core::ptr::read_unaligned(off_out as *const i64) }
+    } else {
+        let f = crate::fs::open::fd_to_filp(out_fd);
+        if f == crate::fs::inode::NIL { return -(EBADF as i64); }
+        // SAFETY: f 有效。
+        unsafe { crate::fs::file_table::filp(f).f_pos as i64 }
+    };
+    if in_pos < 0 || out_pos < 0 {
+        return -(EINVAL as i64);
+    }
+
+    let buf = get_free_page();
+    if buf == 0 {
+        return -(crate::klib::errno::ENOMEM as i64);
+    }
+
+    // 统一用显式定位读/写：每次 lseek 到 in_pos/out_pos，完事恢复原 f_pos。
+    // off==NULL 的「推进 f_pos」语义在循环结束后统一补 lseek。
+    let mut copied: u64 = 0;
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = core::cmp::min(remaining as usize, PAGE_SIZE);
+        // SAFETY: buf 是本页大小的已分配内存。
+        let dest = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, chunk) };
+        let n = unsafe {
+            let saved = crate::fs::read_write::lseek(in_fd, 0, crate::fs::SEEK_CUR);
+            crate::fs::read_write::lseek(in_fd, in_pos, crate::fs::SEEK_SET);
+            let r = crate::fs::read_write::read(in_fd, dest);
+            crate::fs::read_write::lseek(in_fd, saved, crate::fs::SEEK_SET);
+            r
+        };
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        let w = unsafe {
+            let saved = crate::fs::read_write::lseek(out_fd, 0, crate::fs::SEEK_CUR);
+            crate::fs::read_write::lseek(out_fd, out_pos, crate::fs::SEEK_SET);
+            let r = crate::fs::read_write::write(out_fd, &dest[..n]);
+            crate::fs::read_write::lseek(out_fd, saved, crate::fs::SEEK_SET);
+            r
+        };
+        if w <= 0 {
+            break;
+        }
+        let w = w as usize;
+        copied += w as u64;
+        in_pos += w as i64;
+        out_pos += w as i64;
+        if (w as u64) < remaining {
+            break;
+        }
+        remaining -= w as u64;
+    }
+    free_page(buf);
+
+    // 回写偏移 / 推进 f_pos。
+    if off_in != 0 {
+        // SAFETY: 已校验可写。
+        unsafe { core::ptr::write_unaligned(off_in as *mut i64, in_pos); }
+    } else {
+        unsafe { crate::fs::read_write::lseek(in_fd, in_pos, crate::fs::SEEK_SET); }
+    }
+    if off_out != 0 {
+        // SAFETY: 已校验可写。
+        unsafe { core::ptr::write_unaligned(off_out as *mut i64, out_pos); }
+    } else {
+        unsafe { crate::fs::read_write::lseek(out_fd, out_pos, crate::fs::SEEK_SET); }
+    }
+    copied as i64
+}
+pub fn preadv2(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    // preadv2(fd, iov, iovcnt, offset, flags)。忽略 flags，退化为 preadv。
+    preadv(args, regs)
+}
+pub fn pwritev2(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    // pwritev2(fd, iov, iovcnt, offset, flags)。忽略 flags，退化为 pwritev。
+    pwritev(args, regs)
+}
+pub fn statx(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // statx(dirfd, pathname, flags, mask, statxbuf)
+    let dirfd = args.a0 as i32;
+    let path_ptr = args.a1;
+    let _flags = args.a2 as u32;
+    let _mask = args.a3 as u32;
+    let buf = args.a4;
+
+    if buf == 0 {
+        return -(EFAULT as i64);
+    }
+
+    // 空路径 / AT_EMPTY_PATH：fstat(dirfd)。
+    let path_empty = path_ptr != 0
+        && check_range(path_ptr, 1)
+        && unsafe { core::ptr::read_volatile(path_ptr as *const u8) } == 0;
+
+    let inr = if path_ptr != 0 && !path_empty && dirfd == -100 {
+        // AT_FDCWD + 非空路径：按路径 stat
+        match unsafe { user_path(path_ptr) } {
+            Ok(p) => match unsafe { crate::fs::namei::namei(p) } {
+                Ok(n) => n,
+                Err(e) => return e as i64,
+            },
+            Err(e) => return e,
+        }
+    } else if path_ptr == 0 || path_empty {
+        let filp_idx = crate::fs::open::fd_to_filp(dirfd as usize);
+        if filp_idx == crate::fs::inode::NIL {
+            return -(EBADF as i64);
+        }
+        // SAFETY: filp_idx 有效
+        unsafe { (*crate::fs::file_table::filp(filp_idx)).f_inode }
+    } else {
+        return -(EINVAL as i64);
+    };
+
+    let need = core::mem::size_of::<crate::fs::stat::Statx>() as u64;
+    if !check_range(buf, need) {
+        // SAFETY: inr 是已 iget 的下标。
+        unsafe { crate::fs::inode::iput(inr); }
+        return -(EFAULT as i64);
+    }
+    let mut s = crate::fs::stat::Stat64::zeroed();
+    // SAFETY: inr 是有效 inode 下标。
+    unsafe { crate::fs::stat::cp_new_stat(inr, &mut s); }
+    unsafe { crate::fs::inode::iput(inr); }
+    let x = crate::fs::stat::Statx::from_stat64(&s);
+    // SAFETY: check_range 通过。
+    unsafe { core::ptr::write_unaligned(buf as *mut crate::fs::stat::Statx, x) };
+    0
+}
 pub fn lookup_dcookie(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn syncfs(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
@@ -2959,19 +3790,21 @@ pub fn pkey_mprotect(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i
 pub fn pkey_alloc(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn pkey_free(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 
-/// extended attributes.
-pub fn setxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn lsetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn fsetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn getxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn lgetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn fgetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn listxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn llistxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn flistxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn removexattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn lremovexattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn fremovexattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// extended attributes：无 xattr 支持。返回 `-EOPNOTSUPP`（而非 `-ENOSYS`），
+/// 这样 libselinux/libacl 会把「无 SELinux 标签/无 ACL」当作「不支持」而非
+/// 硬错误——否则 `ls` 每条目录项都刷「Function not implemented」。
+pub fn setxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn lsetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn fsetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn getxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn lgetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn fgetxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn listxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn llistxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn flistxattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn removexattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn lremovexattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
+pub fn fremovexattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EOPNOTSUPP as i64) }
 
 /// io_uring (simplified stub).
 pub fn io_uring_setup(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -2988,7 +3821,8 @@ pub fn seccomp(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn memfd_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn userfaultfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn membarrier(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn clock_adjtime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 调整时钟。没有 RTC/NTP 环路，接受但忽略。
+pub fn clock_adjtime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn setns(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn rseq(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
@@ -3135,8 +3969,21 @@ pub fn fdatasync(args: &SysArgs, regs: &mut PtRegs) -> i64 { fsync(args, regs) }
 pub fn flock(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 改文件权限（按 fd）。minix 层还没接 chmod，先当成功。
 pub fn fchmod(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 改文件属主（不跟随符号链接）。同 [`chown`] 的限制。
-pub fn lchown(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 改文件属主（不跟随符号链接）。同 [`chown`]，`follow=false`。
+pub fn lchown(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pathname = args.a0 as *const u8;
+    let owner = args.a1 as u32;
+    let group = args.a2 as u32;
+    if pathname.is_null() {
+        return -(EFAULT as i64);
+    }
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 进程上下文。
+    unsafe { crate::fs::open::sys_chown(path, owner, group, false) }
+}
 /// 改文件时间戳。没有 RTC，忽略。
 pub fn utime(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 改文件时间戳（μs 精度）。同 [`utime`]。
@@ -3149,28 +3996,167 @@ pub fn futimesat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 取附加组列表。没有组机制，返回 0 个组（原版 `sys.c:sys_getgroups()`
 /// 在 NGROUPS 为空时同样返回 0）。
 pub fn getgroups(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 设置附加组列表。需要 root，本树无 uid 概念 → `-EPERM`。
-pub fn setgroups(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置真实/有效 uid。同 [`setuid`] 的限制。
-pub fn setreuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置真实/有效 gid。同上。
-pub fn setregid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置真实/有效/保存 uid。同上。
-pub fn setresuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置真实/有效/保存 gid。同上。
-pub fn setresgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置文件系统 uid。返回旧值（恒为 0），与原版「返回旧 fsuid」一致。
-pub fn setfsuid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置附加组列表。需要 root；无附加组存储，root 也仅接受空列表。
+pub fn setgroups(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let size = args.a0 as usize;
+    // SAFETY: 进程上下文。
+    unsafe {
+        if suser() {
+            if size == 0 { 0 } else { -(EINVAL as i64) }
+        } else {
+            -(EPERM as i64)
+        }
+    }
+}
+/// 设置真实/有效 uid。对应原版 `kernel/sys.c:sys_setreuid()`。
+pub fn setreuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let ruid = args.a0 as u32;
+    let euid = args.a1 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        let old_ruid = c.uid;
+        if ruid != u32::MAX {
+            if c.euid == ruid || old_ruid == ruid || c.euid == 0 {
+                c.uid = ruid;
+            } else {
+                return -(EPERM as i64);
+            }
+        }
+        if euid != u32::MAX {
+            if old_ruid == euid || c.euid == euid || c.euid == 0 {
+                c.euid = euid;
+                c.suid = euid;
+            } else {
+                c.uid = old_ruid; // 回滚 ruid 变更（同原版）
+                return -(EPERM as i64);
+            }
+        }
+    }
+    0
+}
+/// 设置真实/有效 gid。对应原版 `kernel/sys.c:sys_setregid()`。
+pub fn setregid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let rgid = args.a0 as u32;
+    let egid = args.a1 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        let old_rgid = c.gid;
+        if rgid != u32::MAX {
+            if c.egid == rgid || old_rgid == rgid || c.euid == 0 {
+                c.gid = rgid;
+            } else {
+                return -(EPERM as i64);
+            }
+        }
+        if egid != u32::MAX {
+            if old_rgid == egid || c.egid == egid || c.euid == 0 {
+                c.egid = egid;
+                c.sgid = egid;
+            } else {
+                c.gid = old_rgid; // 回滚 rgid 变更（同原版）
+                return -(EPERM as i64);
+            }
+        }
+    }
+    0
+}
+/// 设置真实/有效/保存 uid。`-1` 表示保持不变。
+pub fn setresuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let ruid = args.a0 as u32;
+    let euid = args.a1 as u32;
+    let suid = args.a2 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        // 非 root：新值必须落在当前 uid/euid/suid 中之一。
+        if c.euid != 0 {
+            for v in [ruid, euid, suid] {
+                if v != u32::MAX && v != c.uid && v != c.euid && v != c.suid {
+                    return -(EPERM as i64);
+                }
+            }
+        }
+        if ruid != u32::MAX { c.uid = ruid; }
+        if euid != u32::MAX { c.euid = euid; }
+        if suid != u32::MAX { c.suid = suid; }
+        // Linux：setresuid 把 fsuid 归位到新 euid。
+        c.fsuid = c.euid;
+    }
+    0
+}
+/// 设置真实/有效/保存 gid。`-1` 表示保持不变。
+pub fn setresgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let rgid = args.a0 as u32;
+    let egid = args.a1 as u32;
+    let sgid = args.a2 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        if c.euid != 0 {
+            for v in [rgid, egid, sgid] {
+                if v != u32::MAX && v != c.gid && v != c.egid && v != c.sgid {
+                    return -(EPERM as i64);
+                }
+            }
+        }
+        if rgid != u32::MAX { c.gid = rgid; }
+        if egid != u32::MAX { c.egid = egid; }
+        if sgid != u32::MAX { c.sgid = sgid; }
+        c.fsgid = c.egid;
+    }
+    0
+}
+/// 设置文件系统 uid，返回旧 fsuid。Linux 语义：root 或新值 ∈ {uid,euid,suid}
+/// 时生效，否则保持 fsuid = euid。
+pub fn setfsuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let uid = args.a0 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        let old = c.fsuid;
+        if c.euid == 0 || uid == c.uid || uid == c.euid || uid == c.suid {
+            c.fsuid = uid;
+        }
+        old as i64
+    }
+}
 /// 设置文件系统 gid。同 [`setfsuid`]。
-pub fn setfsgid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 取真实/有效/保存 uid。三个都是 0，写回三个指针。
-pub fn getresuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { put_triple(args, 0) }
+pub fn setfsgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let gid = args.a0 as u32;
+    // SAFETY: 进程上下文，单核。
+    unsafe {
+        let c = crate::sched::current();
+        let old = c.fsgid;
+        if c.euid == 0 || gid == c.gid || gid == c.egid || gid == c.sgid {
+            c.fsgid = gid;
+        }
+        old as i64
+    }
+}
+/// 取真实/有效/保存 uid。
+pub fn getresuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 进程上下文，单核。
+    let (r, e, s) = unsafe {
+        let c = crate::sched::current();
+        (c.uid, c.euid, c.suid)
+    };
+    put_triple(args, r, e, s)
+}
 /// 取真实/有效/保存 gid。同 [`getresuid`]。
-pub fn getresgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { put_triple(args, 0) }
+pub fn getresgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 进程上下文，单核。
+    let (r, e, s) = unsafe {
+        let c = crate::sched::current();
+        (c.gid, c.egid, c.sgid)
+    };
+    put_triple(args, r, e, s)
+}
 
 /// `getresuid`/`getresgid` 的公共写回。
-fn put_triple(args: &SysArgs, v: u32) -> i64 {
-    for p in [args.a0, args.a1, args.a2] {
+fn put_triple(args: &SysArgs, r: u32, e: u32, s: u32) -> i64 {
+    for (p, v) in [args.a0, args.a1, args.a2].into_iter().zip([r, e, s]) {
         let p = p as *mut u32;
         if p.is_null() {
             return -(EFAULT as i64);
@@ -3595,8 +4581,8 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         child_pid
     }
 }
-/// 进程跟踪。需要 `arch_ptrace` 与调试寄存器支持。
-pub fn ptrace(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 进程跟踪。需要 `arch_ptrace` 与调试寄存器支持，未实现 → -EPERM。
+pub fn ptrace(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
 /// 读内核日志环。`klib::printk::read_log()` 已有，缺用户地址校验才好接。
 pub fn syslog(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 取进程能力集。没有 capability 机制。
@@ -3626,8 +4612,16 @@ pub fn sigaltstack(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 /// 加载共享库（老式 a.out）。`src/elf/` 走的是现代路径，不打算实现。
 pub fn uselib(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 设置执行域。只有一种 personality。
-pub fn personality(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置执行域。只有一种 personality（PER_LINUX=0）。
+/// `persona == 0xffff_ffff` 表示「查询当前 personality」。
+pub fn personality(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let persona = args.a0 as u64;
+    if persona == 0 || persona == 0xffff_ffff {
+        0 // 始终是 PER_LINUX
+    } else {
+        -(EINVAL as i64)
+    }
+}
 /// 文件系统统计（已废弃接口）。用 [`statfs`] 代替。
 pub fn ustat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 查询已注册的文件系统类型。`fs/devices.rs` 里还没有类型注册表。
@@ -3800,14 +4794,14 @@ pub fn rt_sigreturn(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
     }
     0
 }
-/// 调整系统时钟。没有 RTC 与 NTP 环路。
-pub fn adjtimex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 调整系统时钟。没有 RTC 与 NTP 环路，接受但忽略。
+pub fn adjtimex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 换根目录。需要 per-task 的 root inode。
 pub fn chroot(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 开启进程记账。
-pub fn acct(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 设置系统时间。没有 RTC。
-pub fn settimeofday(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 开启进程记账。没有记账后台，接受但忽略。
+pub fn acct(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设置系统时间。没有 RTC，接受但忽略。
+pub fn settimeofday(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 启用交换分区。没有换页子系统。
 pub fn swapon(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 关闭交换分区。同 [`swapon`]。
@@ -4043,16 +5037,83 @@ pub fn unshare(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn set_robust_list(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 读健壮 futex 链。同 [`futex`]。
 pub fn get_robust_list(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 带信号屏蔽的 epoll_wait。同 [`pselect6`]。
-pub fn epoll_pwait(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带信号屏蔽的 epoll_wait。同 [`epoll_wait`]，忽略 sigmask。
+pub fn epoll_pwait(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // epoll_pwait(epfd, events, maxevents, timeout, sigmask)
+    crate::fs::event::epoll_wait(args.a0 as usize, args.a1, args.a2 as u32, args.a3 as i32)
+}
 /// 把信号变成可读的 fd。
-pub fn signalfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn signalfd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // signalfd(fd, mask*, flags)
+    let fd_in = args.a0 as i32;
+    let mask = args.a1;
+    if fd_in >= 0 {
+        // 复用已有 signalfd：更新掩码。
+        if !crate::fs::event::fd_is_event(fd_in as usize) {
+            return -(EBADF as i64);
+        }
+        // SAFETY: 调用方保证 mask 可读。
+        let m = unsafe { core::ptr::read_unaligned(mask as *const u64) };
+        crate::fs::event::signalfd_set_mask(fd_in as usize, m);
+        return fd_in as i64;
+    }
+    let idx = crate::fs::event::signalfd_alloc(0);
+    if idx < 0 { return idx; }
+    let fd = alloc_event_fd(idx as usize);
+    if fd >= 0 && mask != 0 {
+        // SAFETY: 调用方保证 mask 可读。
+        let m = unsafe { core::ptr::read_unaligned(mask as *const u64) };
+        crate::fs::event::signalfd_set_mask(fd as usize, m);
+    }
+    fd
+}
 /// [`signalfd`] 的带 flags 版本。
-pub fn signalfd4(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// [`readv`] + 指定偏移。同 [`pread64`] 的限制。
-pub fn preadv(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// [`writev`] + 指定偏移。同 [`pwrite64`] 的限制。
-pub fn pwritev(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn signalfd4(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // signalfd4(fd, mask*, size, flags)
+    let fd_in = args.a0 as i32;
+    let mask = args.a1;
+    let flags = args.a3 as u32;
+    if fd_in >= 0 {
+        if !crate::fs::event::fd_is_event(fd_in as usize) {
+            return -(EBADF as i64);
+        }
+        // SAFETY: 调用方保证 mask 可读。
+        let m = unsafe { core::ptr::read_unaligned(mask as *const u64) };
+        crate::fs::event::signalfd_set_mask(fd_in as usize, m);
+        return fd_in as i64;
+    }
+    let idx = crate::fs::event::signalfd_alloc(flags);
+    if idx < 0 { return idx; }
+    let fd = alloc_event_fd(idx as usize);
+    if fd >= 0 && mask != 0 {
+        // SAFETY: 调用方保证 mask 可读。
+        let m = unsafe { core::ptr::read_unaligned(mask as *const u64) };
+        crate::fs::event::signalfd_set_mask(fd as usize, m);
+    }
+    fd
+}
+/// 定位分散读。`preadv(fd, iov, iovcnt, offset)`，同 [`pread64`] 的 f_pos 保存/恢复。
+pub fn preadv(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    let fd = args.a0;
+    let offset = args.a3;
+    let old_pos = unsafe { crate::fs::read_write::lseek(fd as usize, 0, crate::fs::SEEK_CUR) };
+    unsafe { crate::fs::read_write::lseek(fd as usize, offset as i64, crate::fs::SEEK_SET); }
+    let sub = SysArgs { a0: fd, a1: args.a1, a2: args.a2, a3: 0, a4: 0, a5: 0 };
+    let r = readv(&sub, regs);
+    unsafe { crate::fs::read_write::lseek(fd as usize, old_pos, crate::fs::SEEK_SET); }
+    r
+}
+/// 定位分散写。`pwritev(fd, iov, iovcnt, offset)`，同 [`preadv`]。
+pub fn pwritev(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    let fd = args.a0;
+    let offset = args.a3;
+    let old_pos = unsafe { crate::fs::read_write::lseek(fd as usize, 0, crate::fs::SEEK_CUR) };
+    unsafe { crate::fs::read_write::lseek(fd as usize, offset as i64, crate::fs::SEEK_SET); }
+    let sub = SysArgs { a0: fd, a1: args.a1, a2: args.a2, a3: 0, a4: 0, a5: 0 };
+    let r = writev(&sub, regs);
+    unsafe { crate::fs::read_write::lseek(fd as usize, old_pos, crate::fs::SEEK_SET); }
+    r
+}
 /// 按 tgid 带 siginfo 发信号。
 pub fn rt_tgsigqueueinfo(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 批量收包。`net/` 层还没有 msghdr 批处理。
@@ -4080,7 +5141,10 @@ pub fn clone3(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// [`faccessat`] 的带 flags 版本。
 pub fn faccessat2(args: &SysArgs, regs: &mut PtRegs) -> i64 { faccessat(args, regs) }
 /// [`epoll_pwait`] 的 ns 超时版本。
-pub fn epoll_pwait2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn epoll_pwait2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // epoll_pwait2(epfd, events, maxevents, timeout*, sigmask)。忽略 timeout/sigmask。
+    crate::fs::event::epoll_wait(args.a0 as usize, args.a1, args.a2 as u32, 0)
+}
 
 // --- 正式表 424..=448（335..423 是 x32 保留段，官方 x86_64 表里没有）------------
 
@@ -4101,7 +5165,36 @@ pub fn fspick(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 批量关闭 fd 区间。`fs/open.rs` 的 fd 表是每进程 16 项，加这个要先决定 EBADF 语义。
 pub fn close_range(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 带 `open_how` 结构的 openat。需要 RESOLVE_* 解析约束。
-pub fn openat2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn openat2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // openat2(dirfd, pathname, open_how*, size)
+    let dirfd = args.a0 as i32;
+    let path_ptr = args.a1;
+    let how_ptr = args.a2;
+    let size = args.a3 as usize;
+
+    // `struct open_how` = { u64 flags; u64 mode; u64 resolve; } = 24 字节。
+    if size != 24 {
+        return -(EINVAL as i64);
+    }
+    if how_ptr == 0 || !check_range(how_ptr, 24) {
+        return -(EFAULT as i64);
+    }
+    // SAFETY: check_range 已确认 24 字节可读。
+    let (flags, mode, resolve) = unsafe {
+        (
+            core::ptr::read_unaligned(how_ptr as *const u64),
+            core::ptr::read_unaligned((how_ptr + 8) as *const u64),
+            core::ptr::read_unaligned((how_ptr + 16) as *const u64),
+        )
+    };
+    // RESOLVE_* 位（RESOLVE_NO_SYMLINKS 等）未实现，只接受 0。
+    if resolve != 0 {
+        return -(EINVAL as i64);
+    }
+    // 退化为 openat(dirfd, path, flags, mode)。
+    let sub = SysArgs { a0: dirfd as u64, a1: path_ptr, a2: flags, a3: mode, a4: 0, a5: 0 };
+    openat(&sub, _regs)
+}
 /// 从别的进程偷一个 fd。同 [`pidfd_open`]。
 pub fn pidfd_getfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 对别的进程做 madvise。需要跨进程地址空间访问。

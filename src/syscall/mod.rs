@@ -1301,6 +1301,36 @@ pub unsafe fn syscall0(number: usize) -> i64 {
     unsafe { syscall3(number, 0, 0, 0) }
 }
 
+/// 六参数版本（rdi/rsi/rdx/r10/r8/r9），给 splice/sendfile 等自检用。
+///
+/// # Safety
+/// 同 [`syscall3`]。
+pub unsafe fn syscall6(
+    number: usize,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) -> i64 {
+    let ret: i64;
+    // SAFETY: 契约保证 IDT 就绪。参数按 x86_64 系统调用 ABI 放到对应寄存器。
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") number as u64 => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+        );
+    }
+    ret
+}
+
 /// 表里挂了实现（不是 [`sys::ni_syscall`]）的槽位数。
 ///
 /// 不能靠比较函数指针来数：release 下 LLVM 会把函数体相同的 `sys_*` 合并成

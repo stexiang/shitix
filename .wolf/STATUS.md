@@ -1,4 +1,4 @@
-<!-- Last updated: 2026-08-08 (TCP/IP netif bridge to e1000; per-task pwd/root with refcount; VESA framebuffer kernel side; all long-term module skeletons) -->
+<!-- Last updated: 2026-08-22 (uid/gid 权限体系 + 低成本 syscall 批 + 事件通知/异步 I/O 族三阶段完成) -->
 # STATUS — shitix
 
 > Single source of truth for resuming work. Read this FIRST when starting a session.
@@ -169,54 +169,32 @@ debug 与 release 都过，`-m 32M/128M/1G/3G` 都过。
 
 ## 🚀 Next phase
 
-**Stage 2–8 + TCP/e1000 + per-task pwd/root + VESA 全部完成。**
-下一阶段：**LFS 真实启动验证**。
+**本次会话（2026-08-22）完成三阶段 TODO 整改，全部经 release+extra-drivers 构建 + QEMU selftest + GNU 镜像实机验证：**
 
-### Objective
-在真实 ext4 磁盘镜像上启动 /bin/bash。
+### ✅ 阶段 C：文件系统 uid/gid 权限体系
+- `Task` 加 uid/euid/suid/fsuid/gid/egid/sgid/fsgid（u32，clone 自动继承）。
+- getuid/euid/gid/egid/getresuid/getresgid 读 current；setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid 按原版 sys.c 语义；umask 真读写。
+- chown/fchown/lchown/fchownat → open.rs 新增 sys_chown/sys_fchown/chown_inode（-1 哨兵=u32::MAX、变更清 S_ISUID/S_ISGID、落盘）。
+- permission() 读 current euid/egid（namei::permission 委托 inode::permission）；新 inode i_uid/i_gid = current->euid + S_ISGID 目录继承（ext4 create/mknod、minix new_inode）；access/faccessat 用真实 uid/gid。
+- 验证：GNU `id`→root、`chown 1000:2000`→stat 1000:2000:666 落盘、`umask 077` 往返、`test -r`。
 
-### Scope
-1. **LFS 启动测试** — 构建静态 busybox 镜像，`LFS_BOOT=true`，验证 /bin/sh
-2. **setup.S VBE 探测** — 实模式 VBE 函数调用，填入 LFB 地址到 BootParams
-3. **USB HID 键盘** — UHCI 主机控制器初始化 + HID 键盘报告解析
+### ✅ 阶段 A：低成本 syscall 批（ENOSYS 166→118，另 12 个 xattr→EOPNOTSUPP）
+- statx 真实现（Statx 256B ABI）；xattr 全族 ENOSYS→EOPNOTSUPP（消除 `ls` "Function not implemented"）。
+- fchdir/ftruncate、preadv/pwritev/preadv2/pwritev2、sethostname/setdomainname、prlimit64、get/setitimer（返回未激活）、personality/adjtimex/acct/settimeofday/clock_adjtime（接受忽略）、ptrace→EPERM、copy_file_range 真实现、sync_file_range→fsync、fallocate、openat2。
+- **顺带修真 bug**：① fsync 漏 FsType::Ext2→EINVAL；② ext4_file_read 空洞 break 返 0 而非填零；③ lseek 加 SEEK_DATA/SEEK_HOLE。
 
-### Objective
-把内核从「纯内核态运行」推到真正 iretq 到 ring-3、跑用户代码、再通过 int 0x80（以及 syscall 指令）回到内核。这是 LFS 集成的前提——当前内核从未执行过一条用户态指令。
+### ✅ 阶段 B：事件通知/异步 I/O 族（`src/fs/event.rs` 新增）
+- eventfd/eventfd2、timerfd_*、signalfd/signalfd4 真实现；epoll_*、inotify_* 近似（无真实就绪/事件跟踪，与 select/poll「fd 存在即就绪」简化一致）。
+- read/write/close 加 fd_is_event 分发。
 
-### Scope
-1. **Ring-3 切换基础设施** — 构造用户页表（用户空间 3GB 分割，不使用段基址而是靠页表隔离）、TSS 里填好 rsp0、iretq 到 USER_CS
-2. **`copy_page_tables` / `clone_page_tables`** — fork 不再共用内核页表（当前 tss.cr3 == 0），真正给子进程一份**写时复制**的页表
-3. **`verify_area` / `copy_from_user` / `copy_to_user`** — 替换当前只挡未映射地址的 `check_range`，对用户态指针做真正的 vm_area_struct 校验
-4. **页面错误恢复路径** — page fault 在用户态时不再走 `die_if_kernel`（Stage 2 的 `send_sig_stub` 已经为它留好了信号投递），COW 页的缺页处理也在这里
-5. **`syscall` 指令入口启用**（可选）— 目前 `entry.S:syscall_entry` 是 `cli; hlt` 桩，需要 per-task 的用户栈暂存位 + MSR 配置
-6. **初始化用户态 init 进程** — fork + iretq 一个最简单的用户态任务跑起来（哪怕只是 `hlt` 循环），验证整套 ring-3 ↔ ring-0 往返
+### ✅ 零拷贝管道 splice/tee/vmsplice（`src/fs/pipe.rs` + `src/syscall/sys.rs`）
+- pipe.rs 加 `pipe_read_kernel`/`pipe_write_kernel`/`pipe_peek_kernel`（内核缓冲 memcpy）；syscall/mod.rs 加 `syscall6`。
+- splice（至少一端管道，pipe↔file/device，非阻塞）、tee（两管道，peek 不消费源）、vmsplice（复用 pipe_write 灌用户 iovec）。
+- copy_file_range 已在阶段 A 改为真块间拷贝（经缓冲缓存的定位读写）。
 
-### Files to create / edit
-| Type | File | Content |
-|------|------|---------|
-| edit | `src/mm/paging.rs` | `copy_page_tables`/`clone_page_tables`（COW，fork 时给子进程一份独立的 PML4）|
-| edit | `src/syscall/sys.rs` | fork 里接 `copy_page_tables`、补 `sys_execve` 的用户态入口骨架 |
-| new | `src/mm/user.rs` | 用户页表构造（map user pages to 0..3GB with USER bit, separate from kernel 1:1 map）、`create_user_process`（见 stage 3 下的具体步骤） |
-| edit | `src/mm/page_alloc.rs` | 可能需要加 `get_free_page_for_user`（用户页放在物理地址 > 0x100000 之上） |
-| edit | `src/sched/task.rs` | 补 `vm_area_struct`（原版 `mm/mmap.c`，每个 task 的 mm），或新建 `src/mm/vma.rs` |
-| edit | `boot/entry.S` | 可能启用 `syscall_entry`（MSR STAR/LSTAR/SFMASK）、加 `iretq` 到用户态后第一次被中断/系统调用回来时确保栈正确 |
-| edit | `src/desc.rs` | 确认 USER_DS 的 DPL=3、TSS 的 IST 栈都就绪 |
-| New | `src/mm/area.rs` | `verify_area`/`access_ok`（原版 `mm/memory.c` 和 `asm/segment.h`），替换当前 `sys.rs::check_range` |
-| New | `src/uspace/` (or in `src/syscall`) | `copy_from_user`/`copy_to_user`/`strncpy_from_user` |
-
-### Open decisions (from Stage 2, mostly still open)
-- **`printk` 临界区**：`klib::printk::emit()` 缺中断保护，已知缺口。Stage 3 开始前应该先做。
-- **per-task filp/pwd/root**：FD 表目前还是全局的 `FD_TABLE`（`fs/open.rs`），`do_exit` 里的 `close_all()` 是对全局操作的。在 fork 真正分出独立地址空间之前，这项工作对 Stage 3 的正确性更关键了。
-- **`arch_prctl`（FS/GS base）**：glibc 启动时调这个装 TLS，execve 之前必须补。
-- **x86_64 `struct stat` ABI**：当前的 `Stat` 是 i386 布局，任何返回给用户态的 `fstat`/`stat` 都会被 glibc 误解。Stage 3 应该补 x86_64 版本。
-- **ELF64 加载器**：当前只认 ELF32。是否在 Stage 3 一起做、还是留给 Stage 4，看复杂度。
-- `syscall` 指令入口是否在 Stage 3 启用待定。
-
-### Acceptance criteria
-1. `iretq` 到用户态（USER_CS DPL=3）的一段代码，用户态触发 `int 0x80` 或 page fault → 内核收到并正确处理（信号投递或服务调用），再 iretq 回去
-2. `fork` + `copy_page_tables`：父进程写 COW 页触发缺页，拿到自己的私有副本；子进程看到的是 fork 时刻的快照
-3. `copy_from_user`/`copy_to_user` 对用户指针做边界检查，写入超出映射范围的地址返回 `-EFAULT`（替换当前 `check_range` 只认恒等映射的假实现）
-4. 用户态 segfault（访问 null 或未映射地址）→ `page_fault` → `send_sig(SIGSEGV)` → `do_signal` → `do_exit(SIGSEGV)`，任务被回收（Stage 2 的信号路径与 Stage 3 的缺页恢复挂上）
+### 剩余（未做）
+- epoll/inotify 真实就绪/事件跟踪（需 VFS poll 机制）；eventfd/timerfd/signalfd/splice 阻塞语义（现返回 EAGAIN/非阻塞）；io_uring 族、mq_*、SysV IPC、perf_event、keyctl、xattr 真实存储。
+- 驱动接线（e1000↔TCP/IP、串口 IRQ、IDE DMA、SMP、USB HID、VBE 探测）；swap/vmalloc/VMA 结构；O_CLOEXEC 追踪、shebang、vDSO、itimer 真投递。
 
 ---
 

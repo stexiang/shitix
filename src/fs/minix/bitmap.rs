@@ -260,11 +260,14 @@ pub unsafe fn new_inode(dir: usize) -> usize {
         ni.i_nlink = 1;
         ni.i_dev = dev;
         ni.i_ino = ino;
-        // 原版 `inode->i_uid = current->euid`；我们还没有 uid 体系
-        // （见 sched/task.rs 的字段取舍），统一用 0 = root。
-        ni.i_uid = 0;
+        // 原版 `inode->i_uid = current->euid`
+        let (euid, egid) = {
+            let c = crate::sched::current();
+            (c.euid, c.egid)
+        };
+        ni.i_uid = euid as u16;
         // 原版：目录有 setgid 位就继承目录的 gid，否则用 current->egid
-        ni.i_gid = if dir_mode & crate::fs::mode::S_ISGID != 0 { dir_gid } else { 0 };
+        ni.i_gid = if dir_mode & crate::fs::mode::S_ISGID != 0 { dir_gid } else { egid as u16 };
         ni.i_mtime = now;
         ni.i_atime = now;
         ni.i_ctime = now;

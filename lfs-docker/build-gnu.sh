@@ -44,7 +44,12 @@ grep -q '^root:' "$TMP/etc/passwd" 2>/dev/null || echo 'root:x:0:0:root:/root:/b
 echo "=== Step 4: create ext4 image + device nodes ==="
 rm -f "$IMG"
 dd if=/dev/zero of="$IMG" bs=1M count=512 status=none
-mkfs.ext4 -F -O ^64bit,^huge_file,^metadata_csum -L gnu-root "$IMG"
+# 关键：禁用 extent 与 dir_index。内核 ext4 **写路径**只实现经典直接/间接
+# 块指针与线性目录项；Ubuntu 默认 mkfs.ext4 开 extent（i_block 存 extent 树），
+# 写路径 write_inode 把扁平化的 i.data[] 当经典指针写回会破坏 extent 头 →
+# 新建文件/目录不落盘、inode 元数据全是垃圾。^extent + ^dir_index 让镜像与
+# 内核已实现（e2fsck 干净的）经典布局对齐。
+mkfs.ext4 -F -O ^64bit,^huge_file,^metadata_csum,^extent,^dir_index -L gnu-root "$IMG"
 MNT=$(mktemp -d)
 sudo mount -o loop "$IMG" "$MNT"
 sudo cp -a "$TMP"/. "$MNT"/

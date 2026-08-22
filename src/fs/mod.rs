@@ -17,6 +17,7 @@
 
 pub mod buffer;
 pub mod devices;
+pub mod event;        // eventfd / timerfd / signalfd / epoll / inotify
 pub mod ext2;        // ext2 filesystem support
 pub mod ext4;        // ext4 filesystem support
 pub mod file_table;

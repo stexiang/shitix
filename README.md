@@ -278,8 +278,17 @@ qemu-system-x86_64 \
 在 shell 里可跑 `echo` / `ls` / `sleep 3 &` / `jobs` 等；要彻底退出 QEMU 按
 `Ctrl-A` 再按 `x`（`exit` 只会让 init 重开一个 shell）。
 
-> 已知问题：GNU bash 的 `cmd1 | cmd2` 管道目前有偶发挂起（数据管丢失唤醒），
-> busybox ash 的管道稳定。作业控制、`ls`/`echo`/`jobs` 等均正常。
+文件系统**读写**已打通：`mkdir` / `echo hi > f` / `cat` / `ls` / `stat` /
+`rm` / `mv` / `ln` / `chmod` 等从真实 glibc 程序发起均能落盘且 `e2fsck -fn`
+五个 pass 全过（镜像用 `-O ^extent,^dir_index` 构建，见 `build-gnu.sh` 里的
+说明——内核 ext4 写路径目前只支持经典块布局）。
+
+> 已知问题：
+> 1. GNU bash 的 `cmd1 | cmd2` 管道偶发挂起（数据管丢失唤醒），busybox ash 管道稳定。
+> 2. `grep`（如 `grep -c root /etc/passwd`）偶发卡住——已核实**不是** mmap 问题：
+>    syscall 追踪显示 grep 根本没被 fork，bash 读入命令行后卡在 readline/tty 输入
+>    路径（`head`/`cat`/`wc` 用 read 均正常）。与管道 flaky 同属 readline/串口 tty
+>    输入偶发问题，未定位最后一环。
 
 ### 作业控制（job control）
 
@@ -303,7 +312,8 @@ qemu-system-x86_64 \
 | futex (per-address hash, 32 桶) | ✓ |
 | clock_gettime / nanosleep | ✓ |
 | kill/tkill/tgkill | ✓ |
-| access/rename/symlink | ✓ |
+| access/rename/symlink + *at 族（mkdirat/unlinkat/renameat/linkat/symlinkat/fchmodat/...） | ✓ |
+| sync / fsync | ✓ |
 | poll/select/pselect6 | ✓ |
 | 作业控制（setpgid/setsid/kill_pg、TIOCGPGRP/SPGRP/SCTTY、SIGINT/SIGTSTP/SIGTTIN/SIGTTOU） | ✓ |
 | Unix socket (socketpair/sendto/recvfrom) | ✓ |

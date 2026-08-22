@@ -72,9 +72,22 @@ pub mod file_type {
     pub const EXT4_FT_SOCK: u8 = 6;
     pub const EXT4_FT_SYMLINK: u8 = 7;
     
-    /// 从 mode 提取文件类型
+    /// 从 mode 提取文件类型（EXT4_FT_* 编码，非 POSIX 类型 nibble）。
+    ///
+    /// 之前直接 `mode >> 12`：POSIX 的 S_IFREG 是 0o100000，右移 12 位得到 8，
+    /// 而 EXT4_FT_REG_FILE 是 1 —— 硬链接/rename 落盘的 filetype 字节写成 8，
+    /// e2fsck 报 "incorrect filetype (was 8, should be 1)"。
     pub fn from_mode(mode: u16) -> u8 {
-        (mode >> 12) as u8
+        use crate::fs::mode;
+        match mode & mode::S_IFMT {
+            mode::S_IFREG => EXT4_FT_REG_FILE,
+            mode::S_IFDIR => EXT4_FT_DIR,
+            mode::S_IFCHR => EXT4_FT_CHRDEV,
+            mode::S_IFBLK => EXT4_FT_BLKDEV,
+            mode::S_IFIFO => EXT4_FT_FIFO,
+            mode::S_IFLNK => EXT4_FT_SYMLINK,
+            _ => EXT4_FT_UNKNOWN,
+        }
     }
     
     /// 文件类型名称

@@ -16,7 +16,7 @@ use crate::fs::file_table::filp;
 use crate::fs::inode::{self, FsType, NIL};
 use crate::fs::open::fd_to_filp;
 use crate::fs::{Dirent, SEEK_CUR, SEEK_END, SEEK_SET, mode, oflags};
-use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENOTDIR, EROFS, ESPIPE};
+use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENOTDIR, ENXIO, EROFS, ESPIPE};
 
 /// 读。对应原版 `sys_read()`。
 ///
@@ -182,6 +182,19 @@ pub unsafe fn lseek(fd: usize, offset: i64, whence: u32) -> i64 {
                 };
                 end + offset
             }
+            // SEEK_DATA(3)/SEEK_HOLE(4)：无空洞跟踪，整个文件都算数据，
+            // 洞在 EOF。这样 coreutils `cp` 的空洞探测不会误判稀疏文件
+            // （否则它把 truncate 出来的稀疏文件拷成 0 字节）。
+            3 => {
+                let size = inode::inode(n).i_size as i64;
+                if offset >= size { return -(ENXIO as i64); }
+                offset
+            }
+            4 => {
+                let size = inode::inode(n).i_size as i64;
+                if offset >= size { return -(ENXIO as i64); }
+                size
+            }
             _ => return -(EINVAL as i64),
         };
         if new < 0 {
@@ -250,9 +263,11 @@ pub unsafe fn fsync(fd: usize) -> i64 {
             return -(EBADF as i64);
         }
         // 原版是 file->f_op->fsync；minix 的是 file_fsync = fsync_dev(i_dev)
+        // ext4（本树用 FsType::Ext2 表示）同样按 i_dev 同步。
         let dev = match inode::inode(n).i_op {
             FsType::Blk => inode::inode(n).i_rdev,
             FsType::Minix => inode::inode(n).i_dev,
+            FsType::Ext2 => inode::inode(n).i_dev,
             _ => return -(EINVAL as i64),
         };
         // inode 本身也要先落盘
