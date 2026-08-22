@@ -230,7 +230,8 @@ pub fn pci_enumerate() -> [Option<PciDevice>; MAX_PCI_DEVICES] {
             }
             
             // 获取功能数量
-            let header_type = pci_read8(bus, dev, 0, PCI_VENDOR_ID + 0x0D);
+            // header type 在偏移 0x0E（bit 7 = 多功能设备标志）
+            let header_type = pci_read8(bus, dev, 0, 0x0E);
             let max_func = if (header_type & 0x80) != 0 { 8 } else { 1 };
             
             for func in 0..max_func {

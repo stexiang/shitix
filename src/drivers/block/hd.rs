@@ -51,6 +51,42 @@ const HD_IRQ: u32 = 14;
 
 /// 最大硬盘数
 const MAX_HD: usize = 2;
+
+// ---- Bus-master DMA ----
+/// PCI IDE 控制器 class/subclass
+const IDE_PCI_CLASS: u8 = 0x01;
+const IDE_PCI_SUBCLASS: u8 = 0x01;
+/// BMIDE 寄存器偏移（相对 bus-master I/O base）
+const BM_CMD: u16 = 0x00;
+const BM_STATUS: u16 = 0x02;
+const BM_PRD_ADDR: u16 = 0x04;
+/// BM command 位
+const BM_CMD_START: u8 = 0x01;
+const BM_CMD_WRITE: u8 = 0x08;  // 0=read from disk, 1=write to disk
+/// BM status 位
+const BM_STATUS_ACTIVE: u8 = 0x01;
+const BM_STATUS_ERROR: u8 = 0x02;
+const BM_STATUS_IRQ: u8 = 0x04;
+
+/// PRD（Physical Region Descriptor）表项：8 字节
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct Prd {
+    addr: u32,   // 物理地址
+    count: u16,  // 字节数（0 = 64KB）
+    eot: u16,    // bit15 = end of table
+}
+
+/// 最多 8 个 PRD 项（每 PRD 最多 64KB，8 项 = 512KB > 单次最大请求）
+const MAX_PRD: usize = 8;
+/// bus-master I/O 基地址（0 = 未探测/不可用）
+static mut BM_BASE: u16 = 0;
+/// PRD 表物理页（4KB，放 512 个 PRD 项绰绰有余）
+static mut PRD_PAGE: usize = 0;
+/// DMA 数据缓冲区物理页（分配一整页，DMA 要求物理连续）
+static mut DMA_PAGE: usize = 0;
+/// DMA 可用标志
+static mut DMA_OK: bool = false;
 /// 最大重试次数
 const MAX_ERRORS: usize = 16;
 
@@ -219,6 +255,141 @@ unsafe fn ide_write_sector(buf: *const u16) {
     }
 }
 
+// ---- Bus-master DMA 辅助 ----
+
+/// 探测 PCI IDE 控制器的 bus-master I/O 基地址。
+/// 对应原版 `ide_init_pci()`。
+#[inline(never)]
+fn bmide_probe() -> Option<u16> {
+    let devices = crate::pci::pci_enumerate();
+    let dev = devices.iter().filter_map(|d| d.as_ref())
+        .find(|d| d.class_code == IDE_PCI_CLASS && d.subclass == IDE_PCI_SUBCLASS)?;
+    // BAR4 是 bus-master IDE I/O base
+    let bar = dev.bars[4]?;
+    if !bar.is_io || bar.base == 0 { return None; }
+    // 使能 bus mastering（PCI command bit 2）
+    let bus = dev.bus; let d = dev.device; let f = dev.function;
+    let cmd = crate::pci::pci_read16(bus, d, f, 4);
+    crate::pci::pci_write16(bus, d, f, 4, cmd | 0x04);
+    Some(bar.base as u16)
+}
+
+/// 初始化 DMA：分配 PRD 页和数据页，探测 bus-master 端口。
+#[inline(never)]
+pub fn bmide_init() {
+    let bm = match bmide_probe() {
+        Some(b) => b,
+        None => return,  // 无 bus-master IDE，静默回退 PIO
+    };
+    let prd = unsafe { crate::mm::get_free_page() };
+    let dma = unsafe { crate::mm::get_free_page() };
+    if prd == 0 || dma == 0 {
+        return;
+    }
+    // SAFETY: 内核态独占，页已清零
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(BM_BASE), bm);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(PRD_PAGE), prd);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(DMA_PAGE), dma);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(DMA_OK), true);
+    }
+}
+
+/// 填充 PRD 表（单缓冲区，不跨页）
+fn bmide_setup_prd(buf_phys: u32, count: u16) {
+    let prd_base = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PRD_PAGE)) };
+    // SAFETY: prd_base 是有效内核页
+    unsafe {
+        let prd = prd_base as *mut Prd;
+        (*prd).addr = buf_phys;
+        (*prd).count = count;
+        (*prd).eot = 0x8000; // end of table
+    }
+}
+
+/// 启动 bus-master DMA 传输并等待完成。返回 true 表示成功。
+///
+/// # Safety
+/// DMA_OK 已确认，buf_phys 是 DMA_PAGE 的物理地址。
+unsafe fn bmide_transfer(is_write: bool, buf_phys: u32, count: u16) -> bool {
+    let bm = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BM_BASE)) };
+    let prd_page = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PRD_PAGE)) };
+
+    // 停掉上次传输
+    x86_64::instructions::port::PortWriteOnly::<u8>::new(bm + BM_CMD).write(0);
+
+    // 写 PRD 表地址
+    x86_64::instructions::port::PortWriteOnly::<u32>::new(bm + BM_PRD_ADDR)
+        .write(prd_page as u32);
+
+    // 清状态（IRQ + Error bits are write-1-to-clear）
+    x86_64::instructions::port::PortWriteOnly::<u8>::new(bm + BM_STATUS).write(
+        BM_STATUS_IRQ | BM_STATUS_ERROR
+    );
+
+    // 启动：direction + start
+    let dir = if is_write { BM_CMD_WRITE } else { 0 };
+    x86_64::instructions::port::PortWriteOnly::<u8>::new(bm + BM_CMD)
+        .write(BM_CMD_START | dir);
+
+    // 等待完成（IRQ 位置位 或 error）
+    let mut timeout = 100_000u32;
+    loop {
+        let st = x86_64::instructions::port::PortReadOnly::<u8>::new(bm + BM_STATUS).read();
+        if st & BM_STATUS_ACTIVE == 0 {
+            // 传输完成
+            return st & BM_STATUS_ERROR == 0;
+        }
+        timeout -= 1;
+        if timeout == 0 {
+            crate::pr_warn!("hd: DMA timeout");
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// DMA 读扇区到 DMA_PAGE，返回 true 表示成功。
+///
+/// # Safety
+/// DMA_OK 已确认，DMA_PAGE 是有效物理页。
+unsafe fn bmide_read_sector(dev: usize, lba: u64, buf: *mut u8) -> bool {
+    let dma = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(DMA_PAGE)) };
+    bmide_setup_prd(dma as u32, 512);
+
+    unsafe {
+        ide_select_device(dev, lba);
+        ide_settle();
+        if !ide_wait_ready() { return false; }
+        ide_setup_lba(lba, 1);
+        ide_write_cmd(0xC8); // READ DMA
+        if !bmide_transfer(false, dma as u32, 512) { return false; }
+        core::ptr::copy_nonoverlapping(dma as *const u8, buf, 512);
+    }
+    true
+}
+
+/// DMA 写扇区（从 DMA_PAGE 写到盘）。
+///
+/// # Safety
+/// DMA_OK 已确认，buf 指向至少 512 字节。
+unsafe fn bmide_write_sector(dev: usize, lba: u64, buf: *const u8) -> bool {
+    let dma = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(DMA_PAGE)) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf, dma as *mut u8, 512);
+    }
+    bmide_setup_prd(dma as u32, 512);
+
+    unsafe {
+        ide_select_device(dev, lba);
+        ide_settle();
+        if !ide_wait_ready() { return false; }
+        ide_setup_lba(lba, 1);
+        ide_write_cmd(0xCA); // WRITE DMA
+        bmide_transfer(true, dma as u32, 512)
+    }
+}
+
 // ---- 扇区读写 ----
 
 /// 读一个扇区（512 字节）从 IDE 硬盘。
@@ -234,6 +405,13 @@ unsafe fn hd_read_sector(dev: usize, lba: u64, buf: *mut u8) -> bool {
     // Retry up to 3 times — PIO can fail under timing variations
     for _ in 0..3u32 {
         unsafe {
+            // DMA 路径（bus-master IDE 已初始化时）
+            if core::ptr::read_volatile(core::ptr::addr_of!(DMA_OK)) {
+                if bmide_read_sector(dev, lba, buf) { return true; }
+                // DMA 失败回退 PIO（不 continue，直接走下面 PIO）
+            }
+
+            // PIO 路径
             // 必须先选盘再等就绪：状态寄存器反映的是「当前选中」的设备。
             // 若上一个被选中的盘不存在（如缺从盘时探测过从盘），状态会停在
             // BSY=1 或 DRDY=0，这里先选目标盘、读几次状态让选择生效。
@@ -262,6 +440,12 @@ unsafe fn hd_write_sector(dev: usize, lba: u64, buf: *const u8) -> bool {
 
     for _ in 0..3u32 {
         unsafe {
+            // DMA 路径
+            if core::ptr::read_volatile(core::ptr::addr_of!(DMA_OK)) {
+                if bmide_write_sector(dev, lba, buf) { return true; }
+            }
+
+            // PIO 路径
             // 先选盘再等就绪，理由同 hd_read_sector。
             ide_select_device(dev, lba);
             ide_settle();
@@ -406,6 +590,7 @@ pub unsafe fn init() {
         return;
     }
     crate::kprintln!("hd: probing IDE drives...");
+    bmide_init();
 
     // 探测 primary IDE 通道的主盘和从盘
     let mut found = 0usize;

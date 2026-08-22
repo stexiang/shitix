@@ -269,6 +269,14 @@ const fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
 }
 
 impl Task {
+    /// 全零初始化（用于静态 TASKS 数组，进入 .bss 不占镜像空间）。
+    /// 注意：state 会是 Running(0)，调用方必须在使用前设为 Unused。
+    pub const fn zeroed() -> Self {
+        // SAFETY: Task 是 #[repr(C)] 的纯数据聚合（无指针、无 Drop、
+        // 无有效性不变量），全零是位模式合法的。
+        unsafe { core::mem::zeroed() }
+    }
+
     /// 一个空槽位。
     pub const fn empty() -> Self {
         Task {

@@ -49,7 +49,7 @@ mod syscall_scratch {
 
 /// 任务表。对应原版 `struct task_struct * task[NR_TASKS] = {&init_task, }`。
 /// 原版是指针数组（槽位空 = NULL），我们是值数组（槽位空 = `TaskState::Unused`）。
-static mut TASKS: [Task; NR_TASKS] = [const { Task::empty() }; NR_TASKS];
+static mut TASKS: [Task; NR_TASKS] = [const { Task::zeroed() }; NR_TASKS];
 
 /// 当前任务下标。对应原版全局 `struct task_struct *current`。
 static mut CURRENT: usize = 0;
@@ -1028,10 +1028,14 @@ const LATCH: u16 = (1_193_180 / HZ) as u16;
 /// 必须在 `desc::init_gdt`/`init_idt`、`irq::init`、`mm::init` 之后，
 /// 中断关闭时调用一次。
 pub unsafe fn init() -> KResult<()> {
-    // task[0] = idle。对应原版静态构造的 `INIT_TASK`（comm 是 "swapper"）。
-    // 它用的是 head.S 的静态内核栈，所以 kernel_stack = 0（无魔数可查）。
+    // TASKS 用 Task::zeroed() 静态初始化（进 .bss），这里先把所有槽位
+    // 标记为 Unused，再设置 task[0] = idle。
     // SAFETY: 启动期单线程，独占任务表。
     unsafe {
+        for i in 0..NR_TASKS {
+            task(i).state = TaskState::Unused;
+        }
+
         let t = task(0);
         *t = Task::empty();
         t.set_name("swapper");
