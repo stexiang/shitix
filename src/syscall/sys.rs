@@ -2746,8 +2746,32 @@ pub fn mount(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         }
     }
 }
-/// 卸载文件系统。
-pub fn umount(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 卸载文件系统。对应原版 `fs/super.c:sys_umount()`。
+/// 挂载点 inode 的 `i_mount` 清回 NIL（被盖目录重新可见），并 iput
+/// 被挂文件系统的根 inode。根文件系统（i_mount==NIL 的 "/"）与
+/// 非挂载点返回 -EINVAL。
+pub fn umount(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let dir = match unsafe { crate::fs::namei::namei(path) } {
+        Ok(n) => n,
+        Err(_) => return -(ENOENT as i64),
+    };
+    // SAFETY: 进程上下文；inode 表访问单核串行。
+    unsafe {
+        let ip = crate::fs::inode::inode_ptr(dir);
+        let mounted = (*ip).i_mount;
+        if mounted == crate::fs::inode::NIL {
+            return -(EINVAL as i64);
+        }
+        (*ip).i_mount = crate::fs::inode::NIL;
+        crate::fs::inode::iput(mounted);
+    }
+    0
+}
 /// 设置/获取资源限制（`prlimit64`）。pid=0 操作当前进程，否则按 pid 查
 /// 任务表；权限规则同 [`setrlimit`]。
 pub fn prlimit64(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
@@ -3538,8 +3562,20 @@ pub fn setdomainname(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     0
 }
 
-// CPU syscall
-pub fn getcpu(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// getcpu(cpu*, node*, cache*)：报告调用线程所在 CPU。
+/// 调度器只在 BSP 上跑（AP 仅响应 run_on_all_cpus 派工），
+/// 所以进程视角恒为 cpu 0 / node 0。
+pub fn getcpu(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    if args.a0 != 0 {
+        // SAFETY: 用户指针；按 u32 写当前 cpu。
+        unsafe { core::ptr::write_unaligned(args.a0 as *mut u32, 0) };
+    }
+    if args.a1 != 0 {
+        // SAFETY: 同上，node 恒 0。
+        unsafe { core::ptr::write_unaligned(args.a1 as *mut u32, 0) };
+    }
+    0
+}
 
 // Resource limits
 pub fn prlimit(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }

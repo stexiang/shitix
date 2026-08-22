@@ -829,6 +829,43 @@ fn syscall_selftest() {
     };
     kprintln!("syscall: epoll -> {}", if ep_ok { "ok" } else { "FAIL" });
 
+    // ---- mount/umount + getcpu（Batch G）----
+    // mkdir /mt → mount tmpfs → 在里面建文件 → umount 后文件不可见。
+    // 默认 ramdisk 引导没有挂根文件系统，mkdir("/mt") 直接 ENOENT，
+    // 这种情况跳过（umount 语义在 LFS 环境下验证）。
+    let um_state = unsafe {
+        let p_mt = b"/mt\0";
+        let p_tf = b"tmpfs\0";
+        let p_none = b"none\0";
+        let p_probe = b"/mt/probe\0";
+        let mk = syscall::syscall3(nr::MKDIR, p_mt.as_ptr() as u64, 0o755, 0);
+        if mk == -(klib::errno::ENOENT as i64) {
+            0 // skip
+        } else {
+            let mo = syscall::syscall4(nr::MOUNT, p_none.as_ptr() as u64,
+                                       p_mt.as_ptr() as u64, p_tf.as_ptr() as u64, 0);
+            // mount 后在挂载点里建文件，应成功（进 tmpfs）
+            let fd = syscall::syscall3(nr::OPEN, p_probe.as_ptr() as u64,
+                                       0o101 /* O_WRONLY|O_CREAT */, 0o644);
+            if fd >= 0 { syscall::syscall3(nr::CLOSE, fd as u64, 0, 0); }
+            let um = syscall::syscall3(nr::UMOUNT2, p_mt.as_ptr() as u64, 0, 0);
+            // umount 后挂载点恢复原目录：probe 应不可见
+            let gone = syscall::syscall3(nr::OPEN, p_probe.as_ptr() as u64, 0 /* O_RDONLY */, 0);
+            if mk == 0 && mo == 0 && fd >= 0 && um == 0 && gone < 0 { 1 } else { -1 }
+        }
+    };
+    kprintln!("syscall: mount/umount -> {}",
+        match um_state { 0 => "skip (no rootfs)", 1 => "ok", _ => "FAIL" });
+
+    let gc_ok = unsafe {
+        let mut cpu = u32::MAX;
+        let mut node = u32::MAX;
+        let r = syscall::syscall3(nr::GETCPU, &mut cpu as *mut _ as u64,
+                                  &mut node as *mut _ as u64, 0);
+        r == 0 && cpu == 0 && node == 0
+    };
+    kprintln!("syscall: getcpu -> {}", if gc_ok { "ok" } else { "FAIL" });
+
     // ---- timerfd / signalfd 基本往返（Phase B）----
     // timerfd：create → settime（立即）→ gettime → close 全成功。
     // signalfd：create → read 无待处理信号得 -EAGAIN → close。
