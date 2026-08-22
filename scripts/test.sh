@@ -69,9 +69,13 @@ command -v "$QEMU" >/dev/null || fail "缺少 $QEMU"
 info "构建"
 bash scripts/build.sh "${BUILD_ARGS[@]}"
 
+# SMP: 默认 4 核（AP 蹦床/INIT-SIPI-SIPI/并行求和自检都依赖多核路径），
+# 可用 SMP=1 退回单核。
+SMP="${SMP:-4}"
 QEMU_BASE=(
     -drive "format=raw,file=$IMG,if=ide"
     -m "$MEM"
+    -smp "$SMP"
     -no-reboot
     -no-shutdown
 )
