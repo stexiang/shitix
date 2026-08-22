@@ -9,11 +9,13 @@
 ### 内存布局
 | 地址 | 内容 |
 |------|------|
+| 0x2000 | SMP AP 蹦床页（代码在头部，0x2F00 起为启动信箱）|
 | 0x90000 | 机器参数区 |
 | 0x90200 | setup（4扇区）|
 | 0x9E000 | E820 条目数组 |
 | 0x4000-0x6FFF | 页表（PML4/PDPT/PD）|
 | 0x10000 | system（head.S + 内核）|
+| 0xffff800040000000+ | AP 启动栈（每核 16KB 有效 + 16KB guard 洞）|
 
 ### 已解决的历史问题
 - ~~LLVM noalias 优化导致 super block 数据竞争~~（bug-023）
@@ -165,6 +167,35 @@ mmap file-backed ENOMEM 回滚已映射页（原来泄漏）。
   `/sbin/init` 执行（`init: must be run as PID 1`）。
 - 双盘（shitix.img + lfs3.img）：无回归，`/sbin/init` 执行。
 - 默认引导（单 1MB 镜像）：干净落到 selftest，`boot ok`。
+
+### SMP 真正实现（2026-08-22）
+
+AP 启动从骨架变为真实现：
+- `boot/ap_trampoline.S`：16 位实模式→保护模式→long mode 蹦床，链接基址
+  固定 0x2000（低 1MB 保留区里唯一空闲的 4KB；0x8000 不可用作跳板——它在
+  内核镜像 0x10000.._kernel_end 内部，会被自身覆盖）。页尾 0x2F00 起是信箱
+  （magic/CR3/栈顶/Rust 入口/逻辑 CPU 号），BSP 经 PHYS_MAP_BASE 直写。
+- `scripts/build.sh` 先汇编蹦床（`ld -Ttext 0x2000 --oformat=binary`），
+  Rust 侧 `include_bytes!` 嵌入，smp_init 再拷到 0x2000。
+- `smp::smp_init()`：map_range 把 LAPIC MMIO(0xFEE00000, PCD 禁缓存) 映进内核
+  PML4（引导 PDPT 第 3 项 3-4GB 空闲，不会撞 2MB 大页）→ 使能 BSP LAPIC →
+  fw_cfg(0x510/0x511) 读真实 vCPU 数 → 按 INIT-SIPI-SIPI 逐核启动。
+- AP 入口 `smp_ap_main`：`desc::ap_load_tables()`（lgdt+lidt 共享表，**不 ltr**——
+  TSS 被 BSP 独占且已 busy，再 ltr 会 #GP；CS 用 lretq 从蹦床 GDT 换回
+  KERNEL_CS）→ 本核 LAPIC 使能、屏蔽 LINT/Timer → 置 CPU_ONLINE → 进入
+  派工等待循环（`run_on_all_cpus`：JOB_SEQ 代序号 + 每核 JOB_DONE 回执，
+  BSP 自己也跑一份 cpu0）。
+- AP 栈：每核 4 物理页映到 0xffff_8000_4000_0000+（PHYS_MAP_BASE+1GB 之上，
+  只在内核 PML4），32KB 步进含 guard 洞。
+- 验证：-smp 1/2/4/8 全部 SHITIX_BOOT_OK；多核并行求和与单核参考值一致。
+
+踩过的坑：
+- **等待必须用 jiffies 不能数 pause**：TCG 宿主限速下忙等待比真实时间快几十倍，
+  AP 的 vCPU 线程拿不到时间片，SIPI 永远等不到回应。
+- **不要轮询 ICR delivery status (bit12)**：QEMU 下对不存在的目标永不清位。
+- **不能对不存在的 APIC ID 发 INIT**（level-assert 会把 TCG 的 ICR 写卡死）——
+  用 fw_cfg NB_CPUS 精确枚举。
+- 调度器仍是单核：AP 不参与调度，只做显式派工的并行计算。
 
 ### 已知未解决问题
 - ~~ls/cat #GP（glibc malloc 腐败 chunk）~~ —— 见「本次会话修复」第 12 条：
