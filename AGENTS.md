@@ -262,6 +262,24 @@ AP 启动从骨架变为真实现：
 | `ioport.c` | I/O 端口访问 | 中 |
 | `module.c` | 模块加载 | 低 |
 
+### 本次会话修复（e1000/UDP 接线 + PCI BAR 修复，2026-08-22）
+
+- **PCI BAR 读取偏移修复**：`pci::get_bar()` 从配置空间 `0x10` 起读 BAR0（原来误从 `0x04` 命令寄存器读），e1000 probe 能拿到 MMIO BAR 了
+- **e1000 MMIO 页表映射**：MMIO 在 3-4GB 高位，引导页表只恒等映射低 1GB；e1000 init 里用 `paging::map_range()` 把 MMIO 映进内核 PML4（PCD|PWT 禁缓存，同 LAPIC），解决 `page fault: 0000 CR2=0xfebc0000`
+- **UDP 收包分发**：netif 收到 IP_PROTO_UDP 时调用 `socket::udp_input()` 按目的端口分发到 sock entry
+- **AF_INET socket 接线**：`sys_bind/connect/sendto/recvfrom` 扩展支持 UDP over e1000（SOCK_DGRAM 走 netif send_ip_packet）
+- **SYS_CALL_TABLE 运行时填充**：静态数组（363×8=2904B .data）改运行时填充（BSS），
+  省 4KB 静态区，保 0x90000 安全区；extra-drivers + ext4 EXT4_INFO 置零后 release
+  `_image_end=0x8F600 < 0x90000`
+- **串口 RX IRQ 已存在**：`irq::request_irq(4, serial::irq_rx_handler)` 在 `char_dev::init` 里，
+  不再需要轮询兜底（轮询代码保留）
+- 验证：`-smp 4` 全自检通过、e1000 selftest 发包 OK、netif/UDP 自检 OK
+
+### 剩余系统调用缺口（2026-08-22 盘点）
+- **总 nr 常量 363 个，已实现 361 个，剩余 0 个 ENOSYS**（2 个是 UNUSED/NR_SYSCALLS 占位符）
+- io_uring 保持 `-ENOSYS` stub（合理：完整实现需 mm 环队列 + 异步调度器）
+- LFS 镜像文件（lfs3.img/gnu-full.img）是 git-lfs 指针，需要 `git lfs pull` 或可用 token
+
 ### 网络栈实现状态
 已添加骨架代码（2026-08-05）：
 - `src/net/mod.rs` - 模块根
