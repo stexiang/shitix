@@ -11,6 +11,11 @@ fi
 SRC=/build/sources
 NPROC=$(nproc)
 
+# Ubuntu GCC 默认开 -fstack-protector-strong，可能触发与 glibc 相同的
+# always_inline 失败。显式关掉，保证所有包都用同一套标志。
+export CFLAGS="-O2 -fno-stack-protector -fno-stack-clash-protection"
+export CXXFLAGS="-O2 -fno-stack-protector -fno-stack-clash-protection"
+
 echo "=== Building LFS System Packages (${NPROC} cores) ==="
 
 extract() {
@@ -509,7 +514,7 @@ cleanup libcap-2.70
 # ============================================================
 step "Attr 2.5.2"
 # ============================================================
-extract attr-2.5.2.tar.xz
+extract attr-2.5.2.tar.gz
 ./configure --prefix=/usr \
     --disable-static \
     --sysconfdir=/etc

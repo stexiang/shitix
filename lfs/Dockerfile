@@ -27,16 +27,27 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create LFS directory structure with merged /usr layout
-RUN mkdir -pv $LFS/usr/{bin,include,lib,libexec,sbin,share,src} \
-    && mkdir -pv $LFS/usr/share/{doc,info,locale,man,misc,terminfo,zoneinfo} \
-    && mkdir -pv $LFS/usr/share/man/man{1..8} \
+# 注意：不用 {a,b,c} 花括号展开——Ubuntu 的 /bin/sh 是 dash，不支持，
+# 会把字面量目录名建出来。全部写成显式列表。
+RUN mkdir -pv $LFS/usr/bin $LFS/usr/include $LFS/usr/lib $LFS/usr/libexec \
+        $LFS/usr/sbin $LFS/usr/share $LFS/usr/src \
+    && mkdir -pv $LFS/usr/share/doc $LFS/usr/share/info $LFS/usr/share/locale \
+        $LFS/usr/share/man $LFS/usr/share/misc $LFS/usr/share/terminfo \
+        $LFS/usr/share/zoneinfo \
+    && mkdir -pv $LFS/usr/share/man/man1 $LFS/usr/share/man/man2 \
+        $LFS/usr/share/man/man3 $LFS/usr/share/man/man4 \
+        $LFS/usr/share/man/man5 $LFS/usr/share/man/man6 \
+        $LFS/usr/share/man/man7 $LFS/usr/share/man/man8 \
     && ln -sv usr/bin  $LFS/bin \
     && ln -sv usr/lib  $LFS/lib \
     && ln -sv usr/lib  $LFS/lib64 \
     && ln -sv usr/sbin $LFS/sbin \
-    && mkdir -pv $LFS/{boot,dev,etc,home,media,mnt,opt,proc,root,run,srv,sys,tmp,var} \
-    && mkdir -pv $LFS/var/{cache,lib,local,log,mail,opt,run,spool,tmp} \
-    && mkdir -pv $LFS/etc/{sysconfig,default} \
+    && mkdir -pv $LFS/boot $LFS/dev $LFS/etc $LFS/home $LFS/media $LFS/mnt \
+        $LFS/opt $LFS/proc $LFS/root $LFS/run $LFS/srv $LFS/sys \
+        $LFS/tmp $LFS/var \
+    && mkdir -pv $LFS/var/cache $LFS/var/lib $LFS/var/local $LFS/var/log \
+        $LFS/var/mail $LFS/var/opt $LFS/var/run $LFS/var/spool $LFS/var/tmp \
+    && mkdir -pv $LFS/etc/sysconfig $LFS/etc/default \
     && chmod -v 1777 $LFS/tmp $LFS/var/tmp \
     && ln -sv /run $LFS/var/run \
     && ln -sv /run/lock $LFS/var/lock
@@ -45,6 +56,10 @@ RUN mkdir -pv $LFS/usr/{bin,include,lib,libexec,sbin,share,src} \
 COPY scripts/ /build/scripts/
 COPY config/ /build/config/
 COPY patches/ /build/patches/
+
+# 预下载的源码包（宿主机从国内镜像下载，容器内网络不可达上游源）。
+# download-sources.sh 会跳过已存在的文件。
+COPY sources/ /build/sources/
 
 # Make all scripts executable
 RUN chmod +x /build/scripts/*.sh

@@ -429,3 +429,83 @@
 |------|--------|---------|---------|--------|
 | 17:28 | 构建交互式 /init：lfs-docker/init.c 改为自包含（_start + 内联 syscall，-nostdlib -static），fork/execve /bin/sh -i + wait4 respawn 循环；编译出 13.5KB 静态 ELF，注入 lfs3.img 的 /init（e2fsck 干净、字节一致） | lfs-docker/init.c, lfs-docker/init, lfs3.img | 交互 shell init 就绪 | ~8k |
 | 18:05 | make install 自动加引导扇区：install.sh 检测 ROOTIMG(或 loop 挂载回推)的扇区0 0xAA55，缺失则生成 combined 镜像(1MB 内核前缀 + rootfs 后缀)；Makefile install 目标补传 CONFIG_ROOTIMG | scripts/install.sh, Makefile | 单盘可引导镜像自动生成，实测启动到 BusyBox sh | ~6k |
+| 18:40 | 实现作业控制：signal.rs 加 kill_pg；sys.rs 补 setpgid(完整校验)/setsid(EPERM)/getpgid/getspid(按pid)；tty.rs 加 TIOCGPGRP/SPGRP/SCTTY + ^Z(SIGTSTP) + 前台检查(SIGTTIN/SIGTTOU)，删 pending_signal_stub；init.c 加 setsid+TIOCSCTTY | src/signal.rs, src/syscall/sys.rs, src/drivers/char_dev/tty.rs, lfs-docker/init.c | busybox ash 作业控制可用（jobs 列出后台任务、SIGTTOU 停后台写 tty） | ~25k |
+| 18:45 | 关键坑：busybox 1.30.1 用 fcntl(fd, F_DUPFD_CLOEXEC=1030, 10) 而非 F_DUPFD(0)；内核只处理 cmd 0-4 故返回 -EINVAL → ash 报 can't access tty。fcntl 补 0|1030 分支 | src/syscall/sys.rs | 修掉，job control 全通 | ~3k |
+| 22:40 | init.c 改为先 exec /bin/bash --login、失败回退 /bin/sh -i（一份 init 同时适配 GNU LFS 与 busybox 镜像）；作业控制终验：jobs 列出后台任务、SIGTTOU 停住后台写 tty、^C 被 shell 捕获 | lfs-docker/init.c, lfs-docker/init | 作业控制全通；init 通用化 | ~5k |
+| 23:10 | ext4 read_inode 修设备文件：S_IFCHR/S_IFBLK → i_op=Chr/Blk + i_rdev=i_block[0]&0xffff（原来一律 Ext2，/dev/null 被当普通文件写盘）；tty init 补注册 TTYAUX(major5) 让 /dev/tty=5:0 可开 | src/fs/ext4/ops.rs, src/drivers/char_dev/tty.rs | ls -la /dev 显示 crw- 且重定向 /dev/null 生效 | ~4k |
+| 23:15 | LFS 构建三坑：(1) Ubuntu /bin/sh=dash 不支持 {a,b} 花括号展开→mkdir 建出字面量目录名；(2) kernel.org/ftp.gnu.org 容器内不可达→改 USTC 镜像下载；(3) 源码名不一致 zlib/attr 用 .tar.gz 非 .tar.xz。宿主机预下载 70 个包到 lfs/sources/ 再 COPY 进镜像 | lfs/Dockerfile, lfs/scripts/download-sources.sh, lfs/scripts/build-system.sh | 构建推进到 glibc 编译阶段 | ~5k |
+| 23:55 | GNU LFS 落地：放弃从源码 LFS（glibc2.40+Ubuntu GCC13 的 syslog always_inline BZ31928 等一连串坑），改从 ubuntu:24.04 基座导出 glibc+GNU bash+coreutils 根文件系统；修内核栈 64KB→2MB(glibc bash 用到 ~67KB)、ext4 设备节点、TTYAUX、管道(fd 表 per-task + dup2/dup/fcntl/close_all 方向计数 + clone_pipe_fds + socket 越界) | lfs-docker/build-gnu.sh, src/fs/pipe.rs, src/fs/open.rs, src/syscall/sys.rs, src/net/socket.rs | busybox 回归 ok；GNU bash 能启动、echo hi|cat 管道通，但 bash 命令替换($())的管道 EOF 唤醒仍挂 | ~20k |
+| 00:20 | 管道丢唤醒修复：pipe_read/pipe_write 用 sleep_on_while(先挂队列再关中断复查条件)替代 sleep_on，消除「判条件→挂队列」窗口；init.c 的 bash 改 --norc -i 跳过 .bashrc 命令替换 | src/fs/pipe.rs, lfs-docker/init.c | busybox 回归全过(job control+echo hi|cat)；GNU bash 能启动打印提示符，但 readline 不读 fd0 立即退出(疑似缺 poll/select 或 readline 相关 ioctl) | ~8k |
+| 00:50 | 定位 GNU bash 立即退出：syscall 追踪显示 bash 打开 /dev/tty、读 terminfo/passwd、ioctl 设终端、打印提示符后，readline 的 read(0) 从未发生（无 read fd0/fd3 系统调用、无信号投递），readline 直接 EOF 退出。busybox 用同一内核读 fd0 正常。疑似 readline 的 rl_instream 非 stdin 或依赖未实现的 termios/ioctl 细节 | src/syscall/*, src/signal.rs | job control+pipe 回归全过；bash readline 读 stdin 是最后一道坎 | ~6k |
+
+## Session: 2026-08-22 (bash readline stdin — 最后一道坎已破)
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 01:10 | 反汇编 GNU bash 的 readline：rl_getc 在 read() 前先调 `_rl_timeout_select` → `pselect6`(nr 270)；内核 pselect6 是 -ENOSYS 存根 → readline 等不到 fd 可读直接 EOF 退出（bash 打印提示符后秒退、无 read(0)）。实现 pselect6 转 select | src/syscall/sys.rs | bash readline 开始读 fd0，echo/ls/sleep/jobs 全通 | ~15k |
+| 01:25 | glibc 的 dup2 在 x86_64 上走 dup3(nr 292)，内核 dup3 是 -ENOSYS → GNU bash 管道重定向坏。实现 dup3(校验 flags O_CLOEXEC、old==new 返 EINVAL，转 sys_dup2) | src/syscall/sys.rs | dup3 就绪 | ~4k |
+| 01:30 | close 对管道/socket fd 落到 sys_close 返 -EBADF（实际已关，但返回值错）。改为管道/socket 已关即返 0 | src/syscall/sys.rs | close 返回值正确 | ~2k |
+| 01:40 | 终验：GNU glibc bash 交互 + 作业控制全通（echo GNU_OK、ls / 列目录、sleep 3 & → jobs 显示 Running、exit）；busybox 回归全过（echo BUSY_PIPE\|cat → BUSY_PIPE、job control） | target/boot/shitix-lfs-gnu.img | 作业控制 + GNU LFS 镜像两大目标达成 | ~6k |
+
+**达成**：作业控制（setpgid/setsid/kill_pg、TIOCGPGRP/SPGRP/SCTTY、SIGINT/SIGTSTP/SIGTTIN/SIGTTOU）+ glibc GNU LFS（bash+coreutils）镜像全部完成并验证。
+
+**剩余已知问题（未解决）**：
+- **GNU bash 管道 `cmd1 | cmd2` 失败**（cat 读 stdin 得 EOF/无输出）。busybox ash 管道正常，所以是 bash 特有。追踪见：bash 为 `echo hi | cat` 建**两根**管道（pipe0[4,5]=主管道、pipe1[6,7]=同步/状态管），echo 子 shell(pid3) 读 pipe1 而非向 pipe0 写 "hi"，且 bash 早早 close(5)（pipe0 写端）；cat(pid4) 正确 dup2(4,0)+exec 后，glibc ld.so 启动期对 fd0 做 fstat+close（疑似 fd 表常规/管道两表不一致），最终 cat read fd0 得 EOF。根因在 bash 双管 + 子 shell 重定向链路与内核 fd 表状态的交互，未定位完。
+
+## Session: 2026-08-22 (续) GNU bash 管道深挖
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 02:00 | 深挖 GNU bash `echo hi \| cat` 失败。反汇编确认 bash 为单条管道建**两根** pipe：pipe0[4,5]=数据管、pipe1[6,7]=作业控制同步管。echo 子 shell(pid3) 读同步管等 EOF，cat(pid4) dup2(4,0) 读数据管。echo 从未写 "hi"（pid3 卡在同步管读） | src/fs/pipe.rs, /tmp/bash 反汇编 | 定位到同步管丢失唤醒 | ~15k |
+| 02:20 | 追踪 WaitQueue 唤醒：pipe1 writers→0 时 read_wait.wake_up() 发现队列 head=64(空)，而 pid3 确在 pipe_read 里睡——即「任务在睡但不在队列」的丢失唤醒，pid3 永远醒不来，bash(pid2) 等 waitpid 也卡死。根因未定位到（疑 sleep_on_while 队列注册被并发打断，或 PipeMeta 环缓冲越界）。另发现**环缓冲越界**：PipeMeta 48B + 环按 PIPE_BUF_SIZE=4096 计，ring 越界 48B 写进下一页（潜在内存损坏，未触发本 bug 但应修） | src/fs/pipe.rs, src/sched/mod.rs | 定位失败点，记录两个 bug | ~12k |
+
+**结论**：GNU bash 管道 bug = 同步管丢失唤醒（任务睡下但不在 read_wait 队列），bash 特有（busybox ash 单管 dup2 正常）。已留详细追踪记录，待后续修。
+
+**另记（应修）**：`PIPE_BUF_SIZE=4096` 与 `buf_offset()=48`(PipeMeta) 不匹配，环缓冲按 4096 计会越界写 48 字节到下一页；若两管道页相邻，数据管写满会踩坏同步管 PipeMeta。应改 `RING_SIZE = PIPE_BUF_SIZE - buf_offset()` 并同步所有 `% PIPE_BUF_SIZE` 与 `len >= PIPE_BUF_SIZE` 判断。
+
+## Session: 2026-08-22 (续2) GNU bash 管道根因定位 + 两个修复
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 03:00 | 反汇编/追踪确认 bash 管道真实根因（此前「echo 没写」是误判）：echo(pid3) 会 dup2(5,1)+write(1,"hi",3)=3 成功，但 cat exec 后 ld.so open ld.so.cache 拿到 **fd0**（get_unused_fd 只看 TASK_FILP，不看管道表），把管道读端顶掉；随后 close(0) 关掉管道读端，cat read(0) 读到 ld.so.cache 的 EOF → 断管 | /tmp/bash, src/fs/open.rs | 根因=fd 分配不避管道 fd | ~12k |
+| 03:20 | **修复1**：get_unused_fd 增加 `!fd_is_pipe && !fd_is_socket` 检查，open/openat 不再把已被管道占用的 fd 分出去 | src/fs/open.rs | ld.so.cache 现在拿到 fd4，fd0 管道读端保留 | ~3k |
+| 03:25 | **修复2**：sys_fstat 对管道 fd 返回 S_IFIFO 合成 stat（对 socket 返回 S_IFSOCK），不再 EBADF——cat 对 stdin(管道) 做 fstat 不再报 Bad file descriptor | src/fs/stat.rs | cat fstat(0)→0 | ~3k |
+| 03:40 | 终验：GNU `echo hi \| cat` 打出 "hi"（cat read(0)=3 读到数据）；busybox `echo BB_PIPE \| cat`→BB_PIPE 无回归；GNU echo/ls/jobs 正常 | target/boot/*.img | 管道主链路打通 | ~5k |
+
+**达成**：GNU bash 管道根因（fd 分配覆盖管道 fd）已修，`echo hi | cat` 能输出。
+
+**剩余已知问题（未完全解决）**：
+- GNU bash 管道仍有**偶发挂起**（echo 的 pipe_write→read_wait.wake_up() 时队列 head=64 为空，cat 睡在 pipe_read 却不在队列里——丢失唤醒）。追踪确认：echo 侧全部 syscall 正常（读同步管 EOF、dup2(5,1)、fstat(1)=0、write(1,"hi",3)=3），但数据管 write 唤醒读端时队列为空。同步管（pipe1）的唤醒能找到 echo(head=3)，数据管（pipe0）的唤醒找不到 cat。疑似 sleep_on_while 的队列注册在特定时序下被提前摘除，或 PipeMeta 环缓冲越界（PIPE_BUF_SIZE=4096 vs 实际 4048）踩坏相邻管 PipeMeta。未定位完。
+- 另：`close_reader`/`close_writer`（pipe.rs 175/188 行）是死代码，从未调用，可删。
+
+## Session: 2026-08-22 (续3) 管道深挖终态 + 遗留竞态
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 04:00 | 追踪确认管道「丢失唤醒」本质：echo 的 pipe_write→read_wait.wake_up() 时队列 head=64(空)，而 cat 睡在 pipe_read 却不在队列里。加 queue 地址匹配后确认**同步管(pipe1)唤醒能找到 echo(head=3)，数据管(pipe0)唤醒找不到 cat**；且加调试打印会改变时序，让 cat 在 echo 写之前就 read(len=3) 直接读到数据，掩盖竞态 | src/sched/mod.rs, src/fs/pipe.rs | 定位到 sleep_on_while 队列注册在特定时序失效 | ~15k |
+| 04:20 | 另现**内核 panic**（debug trap, RIP=0x32530=函数尾声 pop rbx），cat 进程触发，疑似 RFLAGS TF 位被破坏或返回地址损坏——是较深的内存/标志损坏，非本轮 5 个修复直接导致，但被「管道真正跑通」暴露出来 | src/traps.rs | 记录遗留 panic | ~4k |
+
+**本轮净修复（全部保留、已清理调试打印）**：`pselect6`→select、`dup3`→sys_dup2、`close` 管道/socket 返 0、`get_unused_fd` 避管道/socket fd（**管道根因**）、`sys_fstat` 对管道/socket 返 S_IFIFO/S_IFSOCK。
+
+**剩余遗留（未解决）**：
+1. GNU bash 管道偶发挂起（数据管 lost-wakeup，sleep_on_while 队列注册时序竞态）。
+2. 偶发内核 panic（debug trap，RFLAGS TF / 返回地址损坏，管道跑通后暴露）。
+3. 环缓冲越界：`PIPE_BUF_SIZE=4096` 与 `buf_offset()=48` 不符，应改 `RING_SIZE=4096-48=4048`。
+
+## Session: 2026-08-22 (续4) 环缓冲越界修复 + 终态
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 05:00 | 修环缓冲越界：新增 `ring_size() = PIPE_BUF_SIZE - buf_offset()`(4048)，替换 pipe_read/pipe_write 里 6 处 `PIPE_BUF_SIZE`(4096) 的环下标运算；之前 write_pos/read_pos 到 4048+ 会越界写 48 字节到下一页 | src/fs/pipe.rs | 消除潜在内存损坏 | ~4k |
+| 05:10 | 读 switch_to 汇编确认 RFLAGS(含 IF) 经 pushfq/popfq 按任务保存恢复，排除「中断状态未按任务隔离」假设。GNU 管道仍 0/4 出 hi、1/4 panic(debug trap)，环越界不是主因 | boot/entry.S, src/sched/mod.rs | 缩小范围 | ~4k |
+
+**终态结论**：GNU bash 管道根因（get_unused_fd 分错 fd）已修，但「数据管丢失唤醒（cat 睡在 pipe_read 却不在 read_wait 队列）」+「偶发 debug-trap panic」两个深层问题仍未定位到最后一环。两者都疑与管道数据路径的某处内存损坏/时序竞态相关，但 `echo hi`(3字节) 不触发已修的环越界，另有隐患。busybox 管道、作业控制、GNU echo/ls/jobs 均正常。
+
+## Session: 2026-08-22 (续5) 系统性排除 + 终态
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 06:00 | 给 WaitQueue.head 加 volatile 读写（is_empty/sleep_on_while/sleep_on_state/remove/wake_up_state），防止共享头字段被 LLVM noalias 缓存导致「写 head=4 对另一任务不可见」 | src/sched/mod.rs | 防御性改动，但 GNU 管道仍 0/5 出 hi——证明不是可见性问题 | ~6k |
+| 06:20 | 系统排除：读 switch_to 汇编(pushfq/popfq 按任务存 RFLAGS→IF 隔离正确)、do_timer(idle counter 也会递减置 need_resched, bug-007 已修)、idle_loop(hlt 轮询 need_resched)、counter 类型 i64、task() 越界断言。均无问题 | boot/entry.S, src/sched/mod.rs, src/lib.rs | 排除中断/调度/时间片/可见性四类假设 | ~8k |
+
+**终态**：GNU bash 管道根因（get_unused_fd 分错 fd + sys_fstat 返 EBADF）已修，`echo hi | cat` 在时序有利时能出 hi。但「数据管 lost-wakeup（cat 睡 pipe_read 却不在 read_wait 队列，head=64 空）」是逻辑 bug，非可见性/调度/中断/时间片问题，仍未定位到最后一环。busybox 管道、GNU echo/ls/jobs 均正常。

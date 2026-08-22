@@ -5,6 +5,14 @@ SOURCES=/build/sources
 mkdir -pv $SOURCES
 cd $SOURCES
 
+# 上游源（kernel.org / ftp.gnu.org 等）在部分网络环境不可达，改用国内 LFS 镜像。
+# 镜像里所有包都以 LFS 书里的文件名平铺在一个目录下。
+MIRRORS=(
+    "https://mirrors.ustc.edu.cn/lfs/lfs-packages/12.2"
+    "https://mirror.lzu.edu.cn/lfs/lfs-packages/12.2"
+    "https://mirrors.tuna.tsinghua.edu.cn/lfs/lfs-packages/12.2"
+)
+
 download() {
     local url="$1"
     local file="$(basename "$url")"
@@ -14,17 +22,27 @@ download() {
         return 0
     fi
 
-    for attempt in 1 2 3; do
-        echo "Downloading $file (attempt $attempt)..."
-        if wget --no-check-certificate -q --show-progress -O "$file.tmp" "$url"; then
-            mv "$file.tmp" "$file"
-            echo "OK: $file"
-            return 0
-        fi
-        echo "Attempt $attempt failed for $file"
-        rm -f "$file.tmp"
-        sleep 2
+    for m in "${MIRRORS[@]}"; do
+        for attempt in 1 2 3; do
+            echo "Downloading $file from $m (attempt $attempt)..."
+            if wget --no-check-certificate -q --show-progress -O "$file.tmp" "$m/$file"; then
+                mv "$file.tmp" "$file"
+                echo "OK: $file"
+                return 0
+            fi
+            echo "Attempt $attempt failed for $file"
+            rm -f "$file.tmp"
+            sleep 2
+        done
     done
+
+    # 最后回退到原始上游 URL（部分包可能不在镜像里）
+    echo "Mirrors failed, trying upstream: $url"
+    if wget --no-check-certificate -q --show-progress -O "$file.tmp" "$url"; then
+        mv "$file.tmp" "$file"
+        echo "OK (upstream): $file"
+        return 0
+    fi
 
     echo "FAILED to download: $url"
     return 1
@@ -78,7 +96,7 @@ download https://distfiles.ariadne.space/pkgconf/pkgconf-2.3.0.tar.xz
 
 # Permissions and security
 download https://download.savannah.gnu.org/releases/acl/acl-2.3.2.tar.xz
-download https://download.savannah.gnu.org/releases/attr/attr-2.5.2.tar.xz
+download https://download.savannah.gnu.org/releases/attr/attr-2.5.2.tar.gz
 download https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.70.tar.xz
 download https://github.com/shadow-maint/shadow/releases/download/4.16.0/shadow-4.16.0.tar.xz
 download https://github.com/besser82/libxcrypt/releases/download/v4.4.36/libxcrypt-4.4.36.tar.xz

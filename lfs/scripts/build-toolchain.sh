@@ -12,6 +12,11 @@ fi
 SRC=/build/sources
 NPROC=$(nproc)
 
+# Ubuntu GCC 默认开 -fstack-protector-strong / -fstack-clash-protection，会让
+# glibc 的 syslog always_inline 编译失败（inlining failed）。显式关掉。
+export CFLAGS="-O2 -fno-stack-protector -fno-stack-clash-protection"
+export CXXFLAGS="-O2 -fno-stack-protector -fno-stack-clash-protection"
+
 echo "=== Building LFS Toolchain (${NPROC} cores) ==="
 
 # Helper to extract and enter source directory
@@ -70,7 +75,6 @@ echo "rootsbindir=/usr/sbin" > configparms
     --prefix=/usr \
     --disable-werror \
     --enable-kernel=4.19 \
-    --enable-stack-protector=strong \
     --disable-nscd \
     --with-headers=$LFS/usr/include \
     libc_cv_slibdir=/usr/lib

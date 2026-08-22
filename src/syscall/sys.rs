@@ -525,8 +525,9 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     }
 
     // 8. 设置用户栈 —— glibc 启动（TLS 设置、IFUNC 解析、signal stack）需要较大栈，
-    //    只给一页会溢出。分配 16 页（64KB）栈区，把 argv/envp/auxv 写在最顶页。
-    const STACK_PAGES: usize = 16;
+    //    只给一页会溢出。glibc 动态 bash 实测会用到 ~67KB（超过原 64KB），
+    //    这里给 2MB（512 页），对齐 Linux 默认栈大小量级，留足余量。
+    const STACK_PAGES: usize = 512;
     let stack_top_off = STACK_PAGES * PAGE_SIZE;          // 栈区大小
     // 栈必须放在**高位地址**，远离数据段/堆（brk 在 max_va 之后向上长）。
     // 旧实现 `max(max_va + 0x10000, ...)` 把栈正好放在数据段之后——而 brk
@@ -1322,15 +1323,21 @@ pub fn close(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return -(EBADF as i64);
     }
     let fd = fd as usize;
-    // Pipe cleanup
+    let mut closed = false;
+    // Pipe cleanup（按方向递减计数，两端归零才释放）
     if crate::fs::pipe::fd_is_pipe(fd) {
-        crate::fs::pipe::close_reader(fd);
-        crate::fs::pipe::close_writer(fd);
-        crate::fs::pipe::unregister_fd(fd);
+        crate::fs::pipe::close_fd(fd);
+        closed = true;
     }
     // Socket cleanup
     if crate::net::socket::fd_is_socket(fd) {
         crate::net::socket::close_socket(fd);
+        closed = true;
+    }
+    if closed {
+        // 管道/socket fd 已关，返回 0。之前这里落到 sys_close 会返回 -EBADF，
+        // 让 glibc 误以为 fd 无效（bash 管道的 fd 清理依赖 close 返回 0）。
+        return 0;
     }
     // SAFETY: 同 [`open`]。
     unsafe { crate::fs::open::sys_close(fd) }
@@ -1769,9 +1776,25 @@ pub fn fcntl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
     
     match cmd {
-        // F_DUPFD: duplicate fd, return >= arg
-        0 => {
+        // F_DUPFD (0) / F_DUPFD_CLOEXEC (1030): duplicate fd, return >= arg。
+        // 内核不追踪 close-on-exec 位（execve 后 fd 表保留），两者语义一致。
+        0 | 1030 => {
             let start = arg.max(0);
+            // 管道 fd：复制管道注册（同一端）。
+            if crate::fs::pipe::fd_is_pipe(fd as usize) {
+                let mut new_fd = start;
+                while new_fd < crate::fs::NR_OPEN {
+                    if !crate::fs::pipe::fd_is_pipe(new_fd)
+                        && !crate::net::socket::fd_is_socket(new_fd)
+                        && unsafe { crate::fs::open::task_fd(crate::sched::current_index(), new_fd) == crate::fs::inode::NIL }
+                    {
+                        crate::fs::pipe::dup_fd(fd as usize, new_fd);
+                        return new_fd as i64;
+                    }
+                    new_fd += 1;
+                }
+                return -(crate::klib::errno::EMFILE as i64);
+            }
             let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
             if filp_idx == crate::fs::inode::NIL { return -(EBADF as i64); }
             // Find a free fd >= start
@@ -1841,6 +1864,16 @@ pub fn ioctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         }
         return 0;
     }
+    // 作业控制 ioctl（tcsetpgrp / tcgetpgrp / 控制终端）。
+    if cmd == 0x540E { // TIOCSCTTY
+        return unsafe { crate::drivers::char_dev::tty::tty_ioctl_sctty(fd as usize, arg) };
+    }
+    if cmd == 0x540F { // TIOCGPGRP
+        return unsafe { crate::drivers::char_dev::tty::tty_ioctl_gpgrp(fd as usize, arg) };
+    }
+    if cmd == 0x5410 { // TIOCSPGRP
+        return unsafe { crate::drivers::char_dev::tty::tty_ioctl_spgrp(fd as usize, arg) };
+    }
     -(EINVAL as i64)
 }
 
@@ -1893,9 +1926,9 @@ pub fn pipe(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return -(ENFILE as i64);
     }
 
-    // Register pipe fds
-    pipe::register_fd(fd_r as usize, pipe_idx);
-    pipe::register_fd(fd_w as usize, pipe_idx);
+    // Register pipe fds (read end / write end)
+    pipe::register_fd(fd_r as usize, pipe_idx, pipe::PIPE_DIR_READ);
+    pipe::register_fd(fd_w as usize, pipe_idx, pipe::PIPE_DIR_WRITE);
 
     // Write fds to user
     unsafe {
@@ -2005,12 +2038,88 @@ pub fn getegid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn setuid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
 /// 设置组 ID。
 pub fn setgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 设置进程组。
-pub fn setpgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 创建会话。
+/// 设置进程组。对应原版 `kernel/sys.c:sys_setpgid()`。
+///
+/// `pid == 0` 表示当前进程；`pgid == 0` 表示「以目标进程 pid 建立新组」。
+/// 校验（对齐原版）：
+///   - 目标进程存在，否则 -ESRCH；
+///   - 目标进程与调用者在同一会话（或就是调用者本身），否则 -EPERM；
+///   - 目标进程不是会话首进程（会话首进程不能改进程组），否则 -EPERM；
+///   - `pgid` 要么等于目标 pid（建新组），要么是本会话里已存在的进程组。
+pub fn setpgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pid = args.a0 as i32;
+    let pgid = args.a1 as i32;
+
+    // SAFETY: 只读任务表；系统调用上下文，单核。
+    unsafe {
+        let cur_idx = sched::current_index();
+        let cur_session = (*sched::task_ptr(cur_idx)).session;
+        let cur_pid = (*sched::task_ptr(cur_idx)).pid;
+
+        // 解析目标 pid。
+        let target_pid = if pid == 0 { cur_pid } else { pid };
+        let mut target_idx = usize::MAX;
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state == crate::sched::task::TaskState::Unused { continue; }
+            if (*t).pid == target_pid { target_idx = i; break; }
+        }
+        if target_idx == usize::MAX {
+            return -(crate::klib::errno::ESRCH as i64);
+        }
+
+        let target_session = (*sched::task_ptr(target_idx)).session;
+        let target_own_pid = (*sched::task_ptr(target_idx)).pid;
+        // 会话检查：目标必须是调用者自身，或与调用者同会话。
+        if target_idx != cur_idx && target_session != cur_session {
+            return -(crate::klib::errno::EPERM as i64);
+        }
+        // 会话首进程不能改进程组。
+        if target_session == target_own_pid {
+            return -(crate::klib::errno::EPERM as i64);
+        }
+
+        // 解析目标 pgid。
+        let new_pgid = if pgid == 0 { target_pid } else { pgid };
+        // 校验：等于目标 pid（建新组），或是本会话中已存在的进程组。
+        let mut valid = new_pgid == target_pid;
+        if !valid {
+            for i in 0..sched::NR_TASKS {
+                let t = sched::task_ptr(i);
+                if (*t).state == crate::sched::task::TaskState::Unused { continue; }
+                if (*t).session == target_session && (*t).pgrp == new_pgid {
+                    valid = true;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            return -(crate::klib::errno::EPERM as i64);
+        }
+
+        // 写回。
+        (*sched::task_ptr(target_idx)).pgrp = new_pgid;
+        0
+    }
+}
+
+/// 创建会话。对应原版 `kernel/sys.c:sys_setsid()`。
+///
+/// 调用者不能是进程组首进程（否则 -EPERM）；成功后成为新会话首进程和
+/// 新进程组首进程（session == pgrp == pid），并脱离控制终端。
 pub fn setsid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    unsafe { let t = sched::current(); t.session = t.pid; t.pgrp = t.pid; }
-    0
+    // SAFETY: 只读/写当前任务；系统调用上下文。
+    unsafe {
+        let idx = sched::current_index();
+        let pid = (*sched::task_ptr(idx)).pid;
+        let pgrp = (*sched::task_ptr(idx)).pgrp;
+        if pgrp == pid {
+            return -(crate::klib::errno::EPERM as i64);
+        }
+        (*sched::task_ptr(idx)).session = pid;
+        (*sched::task_ptr(idx)).pgrp = pid;
+        0
+    }
 }
 
 /// 同步文件系统。
@@ -2398,6 +2507,8 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             // 不做这步的话子进程没有 stdin/stdout/stderr，cat 这类外部命令
             // 一 openat 就拿到 fd 0、write(1) 直接 EBADF。
             crate::fs::open::clone_fds(parent_nr, child_nr);
+            // 管道 fd 表也要复制（否则子进程里的管道 fd 丢失/串台）。
+            crate::fs::pipe::clone_pipe_fds(parent_nr, child_nr);
             for fd in 0..crate::fs::NR_OPEN {
                 let fi = crate::fs::open::task_fd(child_nr, fd);
                 if fi != crate::fs::inode::NIL {
@@ -2777,7 +2888,25 @@ pub fn tee(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn vmsplice(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn sync_file_range(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn vhangup(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn dup3(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn dup3(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // dup3(oldfd, newfd, flags)。glibc 的 dup2 在 x86_64 上直接走 dup3(fd,fd2,0)，
+    // 所以管道重定向（bash `echo hi | cat`）全靠它。
+    let (old, new) = (args.a0 as i64, args.a1 as i64);
+    let flags = args.a2 as u64;
+    if old < 0 || new < 0 {
+        return -(EBADF as i64);
+    }
+    // 只允许 0 或 O_CLOEXEC(0x80000)。内核不追踪 close-on-exec 位，flags 只做校验。
+    if flags != 0 && flags != 0x80000 {
+        return -(EINVAL as i64);
+    }
+    // dup3 语义：oldfd == newfd 返回 EINVAL（dup2 直接返回 newfd）。
+    if old == new {
+        return -(EINVAL as i64);
+    }
+    // SAFETY: 契约转交 sys_dup2，fs 层校验 fd。
+    unsafe { crate::fs::open::sys_dup2(old as usize, new as usize) }
+}
 pub fn faccessat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // dirfd=AT_FDCWD(-100) + absolute path: check file accessibility
     let _dirfd = args.a0 as i32;
@@ -3052,22 +3181,42 @@ fn put_triple(args: &SysArgs, v: u32) -> i64 {
     0
 }
 
-/// 取进程组。a0 == 0 表示当前进程；本树只支持当前进程。
+/// 取进程组。a0 == 0 表示当前进程；否则按 pid 查。
 pub fn getpgid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    if args.a0 != 0 {
-        return -(ENOSYS as i64);
+    let pid = args.a0 as i32;
+    // SAFETY: 只读任务表；系统调用上下文。
+    unsafe {
+        if pid == 0 {
+            return (*sched::task_ptr(sched::current_index())).pgrp as i64;
+        }
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state == crate::sched::task::TaskState::Unused { continue; }
+            if (*t).pid == pid {
+                return (*t).pgrp as i64;
+            }
+        }
+        -(crate::klib::errno::ESRCH as i64)
     }
-    // SAFETY: 系统调用上下文里 current 必然有效。
-    unsafe { sched::current() }.pgrp as i64
 }
 
-/// 取会话 ID。限制同 [`getpgid`]。
+/// 取会话 ID。a0 == 0 表示当前进程；否则按 pid 查。
 pub fn getsid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    if args.a0 != 0 {
-        return -(ENOSYS as i64);
+    let pid = args.a0 as i32;
+    // SAFETY: 只读任务表；系统调用上下文。
+    unsafe {
+        if pid == 0 {
+            return (*sched::task_ptr(sched::current_index())).session as i64;
+        }
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state == crate::sched::task::TaskState::Unused { continue; }
+            if (*t).pid == pid {
+                return (*t).session as i64;
+            }
+        }
+        -(crate::klib::errno::ESRCH as i64)
     }
-    // SAFETY: 同上。
-    unsafe { sched::current() }.session as i64
 }
 
 /// 设资源限制。没有 rlimit 强制机制，接受但不生效。
@@ -3345,6 +3494,7 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // 否则子进程没有 stdin/stdout/stderr，cat 等外部命令 write(1) → EBADF。
         // 每个被继承的打开文件表项 f_count++（原版 copy_process 的语义）。
         crate::fs::open::clone_fds(parent_nr, child_nr);
+        crate::fs::pipe::clone_pipe_fds(parent_nr, child_nr);
         for fd in 0..crate::fs::NR_OPEN {
             let fi = crate::fs::open::task_fd(child_nr, fd);
             if fi != crate::fs::inode::NIL {
@@ -3869,10 +4019,24 @@ pub fn newfstatat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     unsafe { core::ptr::write_unaligned(stat_ptr as *mut crate::fs::stat::Stat64, s) };
     0
 }
-/// 带信号屏蔽的 select。转 [`select`] 前要先接上信号。
-pub fn pselect6(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 带信号屏蔽的 poll。同 [`pselect6`]。
-pub fn ppoll(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带信号屏蔽的 select。转 [`select`]，忽略 timeout/sigmask。
+///
+/// readline 的 `rl_getc` 在 `read()` 之前先 `pselect6` 等 fd 可读；这里复用
+/// select 的「VFS 中存在的 fd 即就绪」判定，随后 read() 会阻塞在 tty_read 上，
+/// 所以忽略 timeout（负值=阻塞）不影响正确性。
+pub fn pselect6(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    // pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
+    // 前 4 个参数与 select 完全相同；第 6 个是 `{sigset_t*, size}` 结构指针，忽略。
+    let sel_args = SysArgs {
+        a0: args.a0, a1: args.a1, a2: args.a2, a3: args.a3,
+        a4: 0, a5: 0,
+    };
+    select(&sel_args, regs)
+}
+/// 带信号屏蔽的 poll。同 [`pselect6`]，转 [`poll`]。
+pub fn ppoll(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    poll(args, regs)
+}
 /// 拆分命名空间。没有命名空间。
 pub fn unshare(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 注册健壮 futex 链。同 [`futex`]。

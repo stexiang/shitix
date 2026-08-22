@@ -28,7 +28,7 @@
 //!    都依赖串口驱动或伪终端。
 
 use crate::sched::WaitQueue;
-use crate::{pr_info, pr_warn};
+use crate::pr_info;
 
 /// 队列容量。对应原版 `tty.h` 的 `TTY_BUF_SIZE 1024`。
 pub const TTY_BUF_SIZE: usize = 1024;
@@ -478,10 +478,8 @@ pub unsafe fn copy_to_cooked() {
             }
 
             if t.l_isig() {
-                // 原版给整个前台进程组发信号。signal.rs 还没移植
-                // （见 STATUS.md 的下一阶段），所以这里只记录 + 提示。
-                // 一旦 send_sig 就位，这里换成
-                // `kill_pg(t.pgrp, SIGINT, true)`。
+                // 原版给整个前台进程组发信号。signal.rs 已就位，
+                // 直接 kill_pg(t.pgrp, sig, 1)（priv=1 内核态投递）。
                 if c == t.ch(cc::VINTR) && c != 0 {
                     t.secondary.flush();
                     t.canon_lines = 0;
@@ -489,7 +487,7 @@ pub unsafe fn copy_to_cooked() {
                         super::console::con_write(b"^C\r\n");
                         t.column = 0;
                     }
-                    pending_signal_stub(t.pgrp, SIGINT_STUB);
+                    crate::signal::kill_pg(t.pgrp, crate::signal::Signal::SIGINT as u32, 1);
                     continue;
                 }
                 if c == t.ch(cc::VQUIT) && c != 0 {
@@ -499,7 +497,18 @@ pub unsafe fn copy_to_cooked() {
                         super::console::con_write(b"^\\\r\n");
                         t.column = 0;
                     }
-                    pending_signal_stub(t.pgrp, SIGQUIT_STUB);
+                    crate::signal::kill_pg(t.pgrp, crate::signal::Signal::SIGQUIT as u32, 1);
+                    continue;
+                }
+                if c == t.ch(cc::VSUSP) && c != 0 {
+                    // ^Z：给前台进程组发 SIGTSTP（作业控制挂起）。
+                    t.secondary.flush();
+                    t.canon_lines = 0;
+                    if t.l_echo() {
+                        super::console::con_write(b"^Z\r\n");
+                        t.column = 0;
+                    }
+                    crate::signal::kill_pg(t.pgrp, crate::signal::Signal::SIGTSTP as u32, 1);
                     continue;
                 }
             }
@@ -525,28 +534,21 @@ pub unsafe fn copy_to_cooked() {
     }
 }
 
-/// `SIGINT` 的编号。`src/signal.rs` 到位后从那里引入。
-const SIGINT_STUB: i32 = 2;
-/// `SIGQUIT` 的编号。同上。
-const SIGQUIT_STUB: i32 = 3;
+// ---- 作业控制：前台进程组检查（原版 tty_io.c 的 job_control）----
 
-/// 待投递的终端信号。原版直接 `kill_pg(tty->pgrp, sig, 1)`。
+/// 当前进程是否在终端的后台（不是前台进程组）。
 ///
-/// 信号子系统（`kernel/signal.c`）还没移植，此处只记录最后一次请求，
-/// 供自检确认 `ISIG` 路径真的走到了。`send_sig` 就位后删掉这个函数，
-/// 换成对 `kill_pg` 的调用。
-static mut LAST_TTY_SIGNAL: (i32, i32) = (0, 0);
-
-fn pending_signal_stub(pgrp: i32, sig: i32) {
-    // SAFETY: 只写一个 (i32,i32)，且只在进程上下文的 copy_to_cooked 里调。
-    unsafe { *core::ptr::addr_of_mut!(LAST_TTY_SIGNAL) = (pgrp, sig) }
-    pr_warn!("tty: signal {} to pgrp {} dropped (signal.rs not ported yet)", sig, pgrp);
-}
-
-/// 最后一次被丢弃的终端信号。自检用。
-pub fn last_signal() -> (i32, i32) {
-    // SAFETY: 只读两个 i32。
-    unsafe { *core::ptr::addr_of!(LAST_TTY_SIGNAL) }
+/// 原版 `tty_io.c` 里 `L_NOFLSH`/`job_control` 那套：后台进程组里的任务
+/// 读终端要收 `SIGTTIN`、写终端要收 `SIGTTOU`。我们只有单个 tty，
+/// 前台进程组就是 [`Tty::pgrp`]。
+fn is_background() -> bool {
+    // SAFETY: 只读当前任务与 tty 的 pgrp；进程上下文。
+    unsafe {
+        let me = crate::sched::current();
+        let t = tty();
+        // 前台进程组为 0（还没建会话）时不判后台，避免 init 早期读终端被卡。
+        t.pgrp != 0 && me.pgrp != t.pgrp
+    }
 }
 
 // ---- read / write（原版 tty_read / tty_write）----
@@ -565,6 +567,13 @@ pub fn last_signal() -> (i32, i32) {
 pub unsafe fn tty_read(buf: &mut [u8]) -> i64 {
     if buf.is_empty() {
         return 0;
+    }
+    // 作业控制：后台进程组读终端 → SIGTTIN（默认动作停住）。
+    if is_background() {
+        // SAFETY: 只读当前任务 pgrp；进程上下文。
+        let my_pgrp = unsafe { crate::sched::current().pgrp };
+        crate::signal::kill_pg(my_pgrp, crate::signal::Signal::SIGTTIN as u32, 1);
+        return -(crate::klib::errno::EINTR as i64);
     }
     // SAFETY: 契约转交。
     unsafe {
@@ -632,6 +641,14 @@ pub unsafe fn tty_read(buf: &mut [u8]) -> i64 {
 /// # Safety
 /// 只能在进程上下文调用。
 pub unsafe fn tty_write(buf: &[u8]) -> i64 {
+    // 作业控制：后台进程组写终端 → SIGTTOU（默认动作停住）。
+    // 注意：shell 打印提示符前常处于前台，这条只在后台任务写终端时触发。
+    if is_background() {
+        // SAFETY: 只读当前任务 pgrp；进程上下文。
+        let my_pgrp = unsafe { crate::sched::current().pgrp };
+        crate::signal::kill_pg(my_pgrp, crate::signal::Signal::SIGTTOU as u32, 1);
+        return -(crate::klib::errno::EINTR as i64);
+    }
     // SAFETY: 契约转交。
     unsafe {
         let t = tty();
@@ -691,6 +708,10 @@ pub unsafe fn init() {
     // Register TTY character device (major=4)
     crate::fs::devices::register_chrdev(
         crate::drivers::block::major::TTY_MAJOR, "tty", crate::fs::devices::CharDev::Tty);
+    // 也注册 major=5（TTYAUX）：Linux 标准里 /dev/tty=5:0、/dev/console=5:1。
+    // 不注册的话，标准设备节点打开会 ENODEV，bash 的作业控制打不开 /dev/tty。
+    crate::fs::devices::register_chrdev(
+        crate::drivers::block::major::TTYAUX_MAJOR, "ttyaux", crate::fs::devices::CharDev::Tty);
     // SAFETY: 契约保证独占。
     unsafe {
         let t = tty();
@@ -735,6 +756,67 @@ pub unsafe fn tty_ioctl_set(_fd: usize, arg: usize) -> i64 {
     let t = unsafe { &mut *core::ptr::addr_of_mut!(TTY) };
     // SAFETY: copy 36 bytes from user space (identity mapped)
     unsafe { core::ptr::copy_nonoverlapping(arg as *const u8, &mut t.termios as *mut Termios as *mut u8, 36); }
+    0
+}
+
+/// TIOCGPGRP: 读出终端前台进程组，写进用户态的 `pid_t *`。
+///
+/// # Safety
+/// `arg` 必须指向用户态可写的 `i32`（4 字节）。
+pub unsafe fn tty_ioctl_gpgrp(_fd: usize, arg: usize) -> i64 {
+    let pgrp = unsafe { tty().pgrp };
+    // SAFETY: 写 4 字节到用户态（恒等映射）。
+    unsafe { (arg as *mut i32).write_volatile(pgrp) };
+    0
+}
+
+/// TIOCSPGRP: 设置终端前台进程组。
+///
+/// 规则（对齐原版 `tty_ioctl.c:tiocspgrp`）：调用者必须在终端的控制会话里。
+/// 第一次设置时（`tty.session == 0`）以当前会话建立控制会话。
+///
+/// # Safety
+/// `arg` 必须指向用户态可读的 `i32`（4 字节）。
+pub unsafe fn tty_ioctl_spgrp(_fd: usize, arg: usize) -> i64 {
+    // SAFETY: 读 4 字节用户态数据。
+    let new_pgrp = unsafe { (arg as *const i32).read_volatile() };
+    // SAFETY: 读当前任务的 session/pgrp；进程上下文。
+    let (my_session, my_pgrp) = unsafe {
+        let me = crate::sched::current();
+        (me.session, me.pgrp)
+    };
+    let t = unsafe { tty() };
+    // 建立 / 校验控制会话。
+    if t.session == 0 {
+        t.session = my_session;
+    } else if t.session != my_session {
+        return -(crate::klib::errno::EPERM as i64);
+    }
+    // 前台进程组必须属于当前会话（简化：允许任意值，至少校验非负）。
+    if new_pgrp < 0 {
+        return -(crate::klib::errno::EINVAL as i64);
+    }
+    let _ = my_pgrp;
+    t.pgrp = new_pgrp;
+    0
+}
+
+/// TIOCSCTTY: 把本终端设成调用进程的控制终端。
+///
+/// 只有会话首进程（`session == pid`）能调用；成功即绑定会话与前台进程组。
+pub unsafe fn tty_ioctl_sctty(_fd: usize, _arg: usize) -> i64 {
+    // SAFETY: 读当前任务；进程上下文。
+    let (pid, session, pgrp) = unsafe {
+        let me = crate::sched::current();
+        (me.pid, me.session, me.pgrp)
+    };
+    // 仅会话首进程可设控制终端。
+    if session != pid {
+        return -(crate::klib::errno::EPERM as i64);
+    }
+    let t = unsafe { tty() };
+    t.session = session;
+    t.pgrp = pgrp;
     0
 }
 

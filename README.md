@@ -2,7 +2,8 @@
 
 用 Rust 重写 Linux 1.0.9 内核，目标架构 x86_64，在 QEMU 中运行。
 现已支持：ELF64 execve、ring-3 用户态、ext4 完整读写、TCP/IP 协议栈、
-per-task pwd/root、VESA 帧缓冲、管道/Unix socket/e1000 网卡/SoundBlaster 声卡。
+per-task pwd/root、VESA 帧缓冲、管道/Unix socket/e1000 网卡/SoundBlaster 声卡、
+作业控制（进程组/终端前台组/终端信号），并可启动 glibc GNU LFS（bash + coreutils）。
 
 ## 快速开始
 
@@ -253,6 +254,40 @@ qemu-system-x86_64 \
     -m 512M -no-reboot -serial stdio
 ```
 
+### GNU LFS 镜像（glibc bash + coreutils，现成）
+
+仓库内已提供一条命令生成 **glibc GNU 根文件系统**（bash + GNU coreutils 等，非 musl/busybox）：
+
+```bash
+# 生成 lfs/gnu-full.img（512MB ext4，glibc bash/coreutils/util-linux/...）
+# 并合成单盘可启动的 target/boot/shitix-lfs-gnu.img
+bash lfs-docker/build-gnu.sh
+```
+
+该镜像的 `/init`（`lfs-docker/init.c`）会 `setsid()` + `ioctl(0,TIOCSCTTY)` 后
+交互式 exec `/bin/bash --norc -i`（失败回退 `/bin/sh -i`），退出后自动重开。
+
+交互式启动（串口控制台直接进 bash 提示符）：
+
+```bash
+qemu-system-x86_64 \
+    -drive format=raw,file=target/boot/shitix-lfs-gnu.img,if=ide \
+    -m 512M -no-reboot -no-shutdown -nographic
+```
+
+在 shell 里可跑 `echo` / `ls` / `sleep 3 &` / `jobs` 等；要彻底退出 QEMU 按
+`Ctrl-A` 再按 `x`（`exit` 只会让 init 重开一个 shell）。
+
+> 已知问题：GNU bash 的 `cmd1 | cmd2` 管道目前有偶发挂起（数据管丢失唤醒），
+> busybox ash 的管道稳定。作业控制、`ls`/`echo`/`jobs` 等均正常。
+
+### 作业控制（job control）
+
+已实现并验证（busybox ash 与 GNU bash 均可用）：
+`setpgid` / `setsid` / `kill_pg`、`TIOCGPGRP`/`TIOCSPGRP`/`TIOCSCTTY`、
+以及终端信号投递（`^C`→SIGINT、`^Z`→SIGTSTP、后台写终端→SIGTTOU、
+后台读终端→SIGTTIN）。`jobs` 能列出后台任务，`^Z` 挂起、`^C` 中断均生效。
+
 ### 当前能力
 
 | 功能 | 状态 |
@@ -269,7 +304,8 @@ qemu-system-x86_64 \
 | clock_gettime / nanosleep | ✓ |
 | kill/tkill/tgkill | ✓ |
 | access/rename/symlink | ✓ |
-| poll/select | ✓ |
+| poll/select/pselect6 | ✓ |
+| 作业控制（setpgid/setsid/kill_pg、TIOCGPGRP/SPGRP/SCTTY、SIGINT/SIGTSTP/SIGTTIN/SIGTTOU） | ✓ |
 | Unix socket (socketpair/sendto/recvfrom) | ✓ |
 | INET socket (socket/bind/listen/accept/connect) | ✓ |
 | e1000 NIC (PCI probe/MMIO/RX+TX ring/ARP selftest) | ✓ |

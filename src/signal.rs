@@ -400,6 +400,29 @@ pub fn send_sig_current(signum: u32) -> i32 {
     send_sig(signum, current, 0)
 }
 
+/// 向整个进程组发送信号。对应原版 `kernel/signal.c:kill_pg()`。
+///
+/// 原版遍历任务表，对 `pgrp == pgrp` 的每个任务 `send_sig(sig, task, priv)`。
+/// 返回成功投递的任务数（原版 `found` 计数）。
+pub fn kill_pg(pgrp: i32, signum: u32, _priv: i32) -> i32 {
+    let mut found = 0i32;
+    // SAFETY: 遍历定长任务表；send_sig 内部自己校验任务是否存活。
+    unsafe {
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state == TaskState::Unused {
+                continue;
+            }
+            if (*t).pgrp as i32 == pgrp {
+                if send_sig(signum, i, _priv) == 0 {
+                    found += 1;
+                }
+            }
+        }
+    }
+    found
+}
+
 /// 强制终止任务
 pub fn force_sig(signum: u32, task_idx: usize) -> i32 {
     // force_sig 不做权限检查

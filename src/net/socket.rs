@@ -57,7 +57,7 @@ fn alloc_buf(sock_idx: usize) -> bool {
 
 pub fn register_fd(fd: usize, sock_idx: usize) { unsafe { if fd < MAX_SOCK_FD { SOCK_FD_MAP[fd] = sock_idx; } } }
 pub fn unregister_fd(fd: usize) { unsafe { if fd < MAX_SOCK_FD { SOCK_FD_MAP[fd] = SOCK_NIL; } } }
-pub fn fd_is_socket(fd: usize) -> bool { unsafe { fd < 64 && SOCK_FD_MAP[fd] != SOCK_NIL } }
+pub fn fd_is_socket(fd: usize) -> bool { unsafe { fd < MAX_SOCK_FD && SOCK_FD_MAP[fd] != SOCK_NIL } }
 pub fn fd_to_sock(fd: usize) -> Option<usize> {
     unsafe { if fd < MAX_SOCK_FD && SOCK_FD_MAP[fd] != SOCK_NIL { Some(SOCK_FD_MAP[fd]) } else { None } }
 }

@@ -16,10 +16,15 @@
  */
 
 #define SYS_write  1
+#define SYS_ioctl  16
 #define SYS_fork   57
 #define SYS_execve 59
 #define SYS_exit   60
 #define SYS_wait4  61
+#define SYS_setsid 112
+
+/* 作业控制 ioctl（见内核 tty 层） */
+#define TIOCSCTTY 0x540E
 
 #define WNOHANG 1
 
@@ -61,9 +66,13 @@ static void w(const char *s) {
 void _start(void) {
     static const char banner[]   = "\n== shitix init: starting interactive shell ==\n";
     static const char respawn[]  = "\n== shell exited, respawning... ==\n";
-    static const char execfail[] = "init: exec /bin/sh failed\n";
+    static const char execfail[] = "init: exec /bin/bash and /bin/sh failed\n";
     static const char forkfail[] = "init: fork failed\n";
 
+    /* GNU LFS 用 bash；busybox 镜像没有 bash，回退到 /bin/sh。
+     * 用 --norc 跳过 ~/.bashrc：其命令替换($(dircolors)、$(cat ...))依赖管道
+     * EOF，而内核管道实现还不完整，会让交互启动卡住。 */
+    static char *const bash_argv[] = { (char *)"/bin/bash", (char *)"--norc", (char *)"-i", (char *)0 };
     static char *const sh_argv[] = { (char *)"/bin/sh", (char *)"-i", (char *)0 };
     static char *const sh_envp[] = {
         (char *)"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
@@ -75,6 +84,12 @@ void _start(void) {
 
     w(banner);
 
+    /* 成为会话首进程（session == pgrp == pid），并把 fd0 设成控制终端、
+     * 前台进程组指向自己，这样子 shell 启动时就是前台（否则 busybox ash
+     * 会因 tcgetpgrp 拿不到前台而给自己发 SIGTTIN 停死）。 */
+    sys0(SYS_setsid);
+    sys3(SYS_ioctl, 0, TIOCSCTTY, 0);
+
     for (;;) {
         long pid = sys0(SYS_fork);
         if (pid < 0) {
@@ -82,7 +97,8 @@ void _start(void) {
             sys1(SYS_exit, 1);
         }
         if (pid == 0) {
-            /* 子进程：exec 交互式 shell。成功则不返回。 */
+            /* 子进程：先试 GNU bash，再回退 /bin/sh。成功则不返回。 */
+            sys3(SYS_execve, (long)bash_argv[0], (long)bash_argv, (long)sh_envp);
             sys3(SYS_execve, (long)sh_argv[0], (long)sh_argv, (long)sh_envp);
             w(execfail);
             sys1(SYS_exit, 127);

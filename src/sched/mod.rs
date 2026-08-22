@@ -484,7 +484,9 @@ impl WaitQueue {
 
     /// 队列是否为空。
     pub fn is_empty(&self) -> bool {
-        self.head >= NR_TASKS
+        // SAFETY: 读共享状态用 volatile，防止编译器把 head 缓存进寄存器，
+        // 与睡眠侧通过裸指针的写失去同步（丢失唤醒）。
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.head)) >= NR_TASKS }
     }
 
     /// 把当前任务挂进队列并睡下，直到被 [`wake_up`](Self::wake_up) 唤醒。
@@ -547,9 +549,10 @@ impl WaitQueue {
         // 先挂上队列（原版 add_wait_queue 在 repeat 之前）
         // SAFETY: 已关中断，独占等待链。
         unsafe {
-            (*core::ptr::addr_of_mut!(WAIT_NEXT))[nr] = self.head;
+            (*core::ptr::addr_of_mut!(WAIT_NEXT))[nr] =
+                core::ptr::read_volatile(core::ptr::addr_of!(self.head));
         }
-        self.head = nr;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(self.head), nr);
         while cond() {
             // SAFETY: 已关中断，独占任务表。
             unsafe {
@@ -582,9 +585,10 @@ impl WaitQueue {
             let t = task(nr);
             t.state = state;
             t.timeout = timeout;
-            (*core::ptr::addr_of_mut!(WAIT_NEXT))[nr] = self.head;
+            (*core::ptr::addr_of_mut!(WAIT_NEXT))[nr] =
+                core::ptr::read_volatile(core::ptr::addr_of!(self.head));
         }
-        self.head = nr;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(self.head), nr);
 
         // 原版 __sleep_on 在 schedule() 之前 sti()：睡下之后必须能被中断唤醒。
         // SAFETY: IDT/PIC 就绪。
@@ -605,10 +609,11 @@ impl WaitQueue {
         // SAFETY: 独占等待链。
         unsafe {
             let next = &mut *core::ptr::addr_of_mut!(WAIT_NEXT);
-            if self.head == nr {
-                self.head = next[nr];
+            let head = core::ptr::read_volatile(core::ptr::addr_of!(self.head));
+            if head == nr {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!(self.head), next[nr]);
             } else {
-                let mut p = self.head;
+                let mut p = head;
                 while p < NR_TASKS {
                     if next[p] == nr {
                         next[p] = next[nr];
@@ -644,7 +649,7 @@ impl WaitQueue {
         unsafe {
             let cur_counter = task(current_nr()).counter;
             let next = &*core::ptr::addr_of!(WAIT_NEXT);
-            let mut p = self.head;
+            let mut p = core::ptr::read_volatile(core::ptr::addr_of!(self.head));
             while p < NR_TASKS {
                 let t = task(p);
                 let wakeable = match t.state {

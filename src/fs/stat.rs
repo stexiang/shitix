@@ -207,6 +207,22 @@ pub unsafe fn sys_lstat(path: &[u8], out: &mut Stat64) -> i64 {
 pub unsafe fn sys_fstat(fd: usize, out: &mut Stat64) -> i64 {
     // SAFETY: 契约转交。
     unsafe {
+        // 管道 fd：Linux 的 fstat 对管道返回 S_IFIFO 合成 stat，而不是 EBADF。
+        // 不处理的话 cat 等程序对 stdin(管道读端) 做 fstat 拿到 EBADF，
+        // 直接把管道断掉（GNU bash 管道）。
+        if crate::fs::pipe::fd_is_pipe(fd) {
+            *out = Stat64::zeroed();
+            out.st_mode = 0o010000 | 0o600; // S_IFIFO | rw
+            out.st_nlink = 1;
+            return 0;
+        }
+        // 套接字 fd：S_IFSOCK。
+        if crate::net::socket::fd_is_socket(fd) {
+            *out = Stat64::zeroed();
+            out.st_mode = 0o140000 | 0o600; // S_IFSOCK | rw
+            out.st_nlink = 1;
+            return 0;
+        }
         let f = fd_to_filp(fd);
         if f == NIL {
             return -(EBADF as i64);

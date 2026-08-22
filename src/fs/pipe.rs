@@ -25,11 +25,23 @@ struct PipeMeta {
 }
 
 static mut PIPE_PAGES: [usize; MAX_PIPES] = [0; MAX_PIPES];
-static mut PIPE_FD_MAP: [usize; MAX_PIPE_FD] = [NIL; MAX_PIPE_FD];
+/// 每任务管道 fd 表：fd → 管道下标。NIL = 不是管道 fd。
+/// 和普通 fd 表（TASK_FILP）一样是 per-task 的，否则 fork/exec 会互相踩。
+static mut PIPE_FD_MAP: [[usize; MAX_PIPE_FD]; crate::sched::NR_TASKS] =
+    [[NIL; MAX_PIPE_FD]; crate::sched::NR_TASKS];
+/// 每个管道 fd 的方向：0 = 读端，1 = 写端。
+static mut PIPE_FD_DIR: [[u8; MAX_PIPE_FD]; crate::sched::NR_TASKS] =
+    [[0; MAX_PIPE_FD]; crate::sched::NR_TASKS];
+
+pub const PIPE_DIR_READ: u8 = 0;
+pub const PIPE_DIR_WRITE: u8 = 1;
 
 unsafe fn meta(page: usize) -> *mut PipeMeta {
     page as *mut PipeMeta
 }
+
+/// 当前任务下标（fd 表都是 per-task 的）。
+fn cur() -> usize { crate::sched::current_index() }
 
 pub fn alloc_pipe() -> Option<usize> {
     unsafe {
@@ -54,23 +66,109 @@ pub fn alloc_pipe() -> Option<usize> {
     None
 }
 
-pub fn register_fd(fd: usize, pipe_idx: usize) {
-    unsafe { if fd < MAX_PIPE_FD { PIPE_FD_MAP[fd] = pipe_idx; } }
+pub fn register_fd(fd: usize, pipe_idx: usize, dir: u8) {
+    unsafe {
+        if fd < MAX_PIPE_FD {
+            let c = cur();
+            PIPE_FD_MAP[c][fd] = pipe_idx;
+            PIPE_FD_DIR[c][fd] = dir;
+        }
+    }
 }
 
 pub fn unregister_fd(fd: usize) {
-    unsafe { if fd < MAX_PIPE_FD { PIPE_FD_MAP[fd] = NIL; } }
+    unsafe {
+        if fd < MAX_PIPE_FD { PIPE_FD_MAP[cur()][fd] = NIL; }
+    }
 }
 
 pub fn fd_is_pipe(fd: usize) -> bool {
-    unsafe { fd < MAX_PIPE_FD && PIPE_FD_MAP[fd] != NIL }
+    unsafe { fd < MAX_PIPE_FD && PIPE_FD_MAP[cur()][fd] != NIL }
 }
 
 pub fn fd_to_pipe(fd: usize) -> Option<usize> {
     unsafe {
-        if fd < MAX_PIPE_FD && PIPE_FD_MAP[fd] != NIL {
-            Some(PIPE_FD_MAP[fd])
+        if fd < MAX_PIPE_FD && PIPE_FD_MAP[cur()][fd] != NIL {
+            Some(PIPE_FD_MAP[cur()][fd])
         } else { None }
+    }
+}
+
+/// 管道 fd 的方向。fd 必须是管道 fd。
+pub fn fd_dir(fd: usize) -> u8 {
+    unsafe { if fd < MAX_PIPE_FD { PIPE_FD_DIR[cur()][fd] } else { PIPE_DIR_READ } }
+}
+
+/// 复制一个管道 fd（dup / dup2 / fcntl F_DUPFD 用）：
+/// `newfd` 指向同一个管道的同一端，并给对应端加一次引用计数。
+/// 返回 false 表示 oldfd 不是管道 fd。
+pub fn dup_fd(oldfd: usize, newfd: usize) -> bool {
+    if let Some(idx) = fd_to_pipe(oldfd) {
+        let dir = fd_dir(oldfd);
+        unsafe {
+            register_fd(newfd, idx, dir);
+            let page = PIPE_PAGES[idx];
+            if page != 0 {
+                let m = meta(page);
+                if dir == PIPE_DIR_READ {
+                    (*m).readers = (*m).readers.saturating_add(1);
+                } else {
+                    (*m).writers = (*m).writers.saturating_add(1);
+                }
+            }
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// 关闭一个管道 fd：按方向递减对应端计数；读写两端都归零时释放管道页。
+pub fn close_fd(fd: usize) {
+    if let Some(idx) = fd_to_pipe(fd) {
+        let dir = fd_dir(fd);
+        unsafe {
+            let page = PIPE_PAGES[idx];
+            if page != 0 {
+                let m = meta(page);
+                if dir == PIPE_DIR_READ {
+                    (*m).readers = (*m).readers.saturating_sub(1);
+                    if (*m).readers == 0 { (*m).write_wait.wake_up(); }
+                } else {
+                    (*m).writers = (*m).writers.saturating_sub(1);
+                    if (*m).writers == 0 { (*m).read_wait.wake_up(); }
+                }
+                if (*m).readers == 0 && (*m).writers == 0 {
+                    free_page(page);
+                    PIPE_PAGES[idx] = 0;
+                }
+            }
+        }
+        unregister_fd(fd);
+    }
+}
+
+/// fork 时复制管道 fd 表，并给每个被复制的 fd 对应端加一次引用计数。
+/// 对应普通 fd 表的 [`crate::fs::open::clone_fds`]。
+pub fn clone_pipe_fds(from: usize, to: usize) {
+    if from >= crate::sched::NR_TASKS || to >= crate::sched::NR_TASKS || from == to {
+        return;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(&raw const PIPE_FD_MAP[from], &raw mut PIPE_FD_MAP[to], 1);
+        core::ptr::copy_nonoverlapping(&raw const PIPE_FD_DIR[from], &raw mut PIPE_FD_DIR[to], 1);
+        // 每个被复制的 fd 给对应端加一次引用计数。
+        for fd in 0..MAX_PIPE_FD {
+            let idx = PIPE_FD_MAP[to][fd];
+            if idx == NIL { continue; }
+            let dir = PIPE_FD_DIR[to][fd];
+            let page = PIPE_PAGES[idx];
+            if page != 0 {
+                let m = meta(page);
+                if dir == PIPE_DIR_READ { (*m).readers += 1; }
+                else { (*m).writers += 1; }
+            }
+        }
     }
 }
 
@@ -107,6 +205,12 @@ pub fn close_writer(fd: usize) {
 
 fn buf_offset() -> usize { core::mem::size_of::<PipeMeta>() }
 
+/// 环缓冲实际可用字节数。PipeMeta 占页首 `buf_offset()` 字节，
+/// 环缓冲只能用剩下的 `PIPE_BUF_SIZE - buf_offset()` 字节；之前按
+/// `PIPE_BUF_SIZE`(4096) 计会让 write_pos/read_pos 到 4048+ 时越界写 48 字节
+/// 到下一页，踩坏相邻页（潜在内存损坏）。
+fn ring_size() -> usize { PIPE_BUF_SIZE - buf_offset() }
+
 pub fn pipe_read(idx: usize, buf: *mut u8, count: usize) -> i64 {
     if buf.is_null() || count == 0 { return 0; }
     unsafe {
@@ -118,13 +222,13 @@ pub fn pipe_read(idx: usize, buf: *mut u8, count: usize) -> i64 {
         loop {
             if (*m).len > 0 {
                 let n = core::cmp::min(count - total as usize, (*m).len);
-                let first = core::cmp::min(n, PIPE_BUF_SIZE - (*m).read_pos);
+                let first = core::cmp::min(n, ring_size() - (*m).read_pos);
                 // 走 copy_to_user（translate 逐页 + 惰性解析），不要直接解引用用户
                 // 地址：直接 copy_nonoverlapping 会读内核恒等映射而不是用户页表。
                 let pml4 = (*crate::sched::task_ptr(crate::sched::current_index())).pml4;
                 let r1 = crate::mm::area::copy_to_user(buf as u64 + total as u64, ring.add((*m).read_pos), first, pml4);
                 if r1 < 0 { return r1; }
-                (*m).read_pos = ((*m).read_pos + first) % PIPE_BUF_SIZE;
+                (*m).read_pos = ((*m).read_pos + first) % ring_size();
                 (*m).len -= first;
                 total += first as i64;
                 if first < n {
@@ -140,7 +244,17 @@ pub fn pipe_read(idx: usize, buf: *mut u8, count: usize) -> i64 {
             }
             if (*m).writers == 0 { return total; }
             if total > 0 { return total; }
-            (*m).read_wait.sleep_on();
+            // 用 sleep_on_while 而非 sleep_on：先挂队列、再在关中断下复查条件。
+            // 否则「判完 writers!=0 到挂上队列」之间写端关闭、wake_up 落空，
+            // 读者永久睡死（bash 命令替换的 EOF 读就死在这）。
+            let len_p = core::ptr::addr_of!((*m).len);
+            let writers_p = core::ptr::addr_of!((*m).writers);
+            // SAFETY: m 是有效管道页指针；sleep_on_while 契约要求进程上下文。
+            unsafe {
+                (*m).read_wait.sleep_on_while(|| {
+                    core::ptr::read_volatile(len_p) == 0 && core::ptr::read_volatile(writers_p) != 0
+                })
+            }
         }
     }
 }
@@ -156,15 +270,15 @@ pub fn pipe_write(idx: usize, buf: *const u8, count: usize) -> i64 {
         let mut total: i64 = 0;
         loop {
             if (*m).readers == 0 { return -(EPIPE as i64); }
-            let free = PIPE_BUF_SIZE - (*m).len;
+            let free = ring_size() - (*m).len;
             if free > 0 {
                 let n = core::cmp::min(count - total as usize, free);
-                let first = core::cmp::min(n, PIPE_BUF_SIZE - (*m).write_pos);
+                let first = core::cmp::min(n, ring_size() - (*m).write_pos);
                 // 走 copy_from_user（translate 逐页 + 惰性解析），避免直接解引用用户地址。
                 let pml4 = (*crate::sched::task_ptr(crate::sched::current_index())).pml4;
                 let r1 = crate::mm::area::copy_from_user(ring.add((*m).write_pos), buf as u64 + total as u64, first, pml4);
                 if r1 < 0 { return r1; }
-                (*m).write_pos = ((*m).write_pos + first) % PIPE_BUF_SIZE;
+                (*m).write_pos = ((*m).write_pos + first) % ring_size();
                 (*m).len += first;
                 total += first as i64;
                 if first < n {
@@ -179,7 +293,16 @@ pub fn pipe_write(idx: usize, buf: *const u8, count: usize) -> i64 {
                 if total as usize >= count { return total; }
             }
             if (*m).readers == 0 { return -(EPIPE as i64); }
-            (*m).write_wait.sleep_on();
+            // 同 pipe_read：用 sleep_on_while 消除丢失唤醒窗口。
+            let len_p = core::ptr::addr_of!((*m).len);
+            let readers_p = core::ptr::addr_of!((*m).readers);
+            // SAFETY: m 有效；sleep_on_while 契约要求进程上下文。
+            unsafe {
+                (*m).write_wait.sleep_on_while(|| {
+                    core::ptr::read_volatile(len_p) >= ring_size()
+                        && core::ptr::read_volatile(readers_p) != 0
+                })
+            }
         }
     }
 }

@@ -438,8 +438,20 @@ pub mod full {
             if block_off + info.inode_size as usize <= data.len() {
                 let raw = &data[block_off..block_off + info.inode_size as usize];
                 if let Some(ei) = Ext4Inode::from_bytes(raw) {
-                    i.i_op = FsType::Ext2;
                     i.i_mode = ei.i_mode;
+                    // 设备文件（S_IFCHR/S_IFBLK）必须设成对应的 i_op + i_rdev，
+                    // 否则 open 会当成普通文件（读不成字符设备，bash 打不开
+                    // /dev/tty、重定向 /dev/null 写盘）。on-disk 的 i_block[0]
+                    // 存设备号（old_encode_dev：major<<8|minor）。
+                    if crate::fs::mode::is_chr(ei.i_mode) {
+                        i.i_op = FsType::Chr;
+                        i.i_rdev = (ei.i_block[0] & 0xFFFF) as u16;
+                    } else if crate::fs::mode::is_blk(ei.i_mode) {
+                        i.i_op = FsType::Blk;
+                        i.i_rdev = (ei.i_block[0] & 0xFFFF) as u16;
+                    } else {
+                        i.i_op = FsType::Ext2;
+                    }
                     i.i_uid = ei.uid() as u16;
                     i.i_gid = ei.gid() as u16;
                     i.i_nlink = ei.i_links_count as u16;

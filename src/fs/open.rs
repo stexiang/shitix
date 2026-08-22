@@ -66,7 +66,15 @@ pub fn get_unused_fd() -> usize {
     unsafe {
         let nr = crate::sched::current_index();
         for fd in 0..NR_OPEN {
-            if TASK_FILP[nr][fd] == NIL {
+            // 必须同时避开管道/socket fd：管道 fd 不在 TASK_FILP 里（只挂在
+            // PIPE_FD_MAP），单看 TASK_FILP==NIL 会把已被管道占用的 fd 分出去，
+            // 覆盖管道读端（GNU bash 管道：cat exec 后 ld.so open ld.so.cache
+            // 拿到 fd0，把管道读端顶掉，cat 再 read(0) 读到的是 ld.so.cache 的
+            // EOF，整个管道断掉）。
+            if TASK_FILP[nr][fd] == NIL
+                && !crate::fs::pipe::fd_is_pipe(fd)
+                && !crate::net::socket::fd_is_socket(fd)
+            {
                 return fd;
             }
         }
@@ -197,6 +205,27 @@ pub unsafe fn sys_close(fd: usize) -> i64 {
 pub unsafe fn sys_dup(fd: usize) -> i64 {
     // SAFETY: 契约转交。
     unsafe {
+        // 管道 fd：复制管道注册。目标 fd 必须同时不在管道表和普通 fd 表里。
+        if crate::fs::pipe::fd_is_pipe(fd) {
+            let nr = crate::sched::current_index();
+            let mut new = NIL;
+            for cand in 0..NR_OPEN {
+                if !crate::fs::pipe::fd_is_pipe(cand)
+                    && !crate::net::socket::fd_is_socket(cand)
+                    && task_fd(nr, cand) == NIL
+                {
+                    new = cand;
+                    break;
+                }
+            }
+            if new == NIL {
+                return -(EMFILE as i64);
+            }
+            if crate::fs::pipe::dup_fd(fd, new) {
+                return new as i64;
+            }
+            return -(EBADF as i64);
+        }
         let f = fd_to_filp(fd);
         if f == NIL {
             return -(EBADF as i64);
@@ -221,22 +250,30 @@ pub unsafe fn sys_dup(fd: usize) -> i64 {
 pub unsafe fn sys_dup2(oldfd: usize, newfd: usize) -> i64 {
     // SAFETY: 契约转交。
     unsafe {
-        let f = fd_to_filp(oldfd);
-        if f == NIL {
-            return -(EBADF as i64);
-        }
         if newfd >= NR_OPEN {
             return -(EBADF as i64);
         }
-        // 见函数文档：同一个 fd 直接返回
+        let old_is_pipe = crate::fs::pipe::fd_is_pipe(oldfd);
+        let f = if old_is_pipe { NIL } else { fd_to_filp(oldfd) };
+        if !old_is_pipe && f == NIL {
+            return -(EBADF as i64);
+        }
+        // 见函数文档：同一个 fd 直接返回（但先确认 oldfd 有效）
         if oldfd == newfd {
             return newfd as i64;
         }
-        if fd_to_filp(newfd) != NIL {
+        // 关掉目标 fd（可能是管道或普通文件）
+        if crate::fs::pipe::fd_is_pipe(newfd) {
+            crate::fs::pipe::close_fd(newfd);
+        } else if fd_to_filp(newfd) != NIL {
             sys_close(newfd);
         }
-        filp(f).f_count += 1;
-        set_fd(newfd, f);
+        if old_is_pipe {
+            crate::fs::pipe::dup_fd(oldfd, newfd);
+        } else {
+            filp(f).f_count += 1;
+            set_fd(newfd, f);
+        }
         newfd as i64
     }
 }
@@ -357,6 +394,14 @@ pub unsafe fn close_all() {
     // SAFETY: 契约转交。
     unsafe {
         for fd in 0..NR_OPEN {
+            // 管道 fd 也要关（否则退出后 writers/readers 永不归零，父进程
+            // 的 pipe_read 读不到 EOF 会永久睡死）。
+            if crate::fs::pipe::fd_is_pipe(fd) {
+                crate::fs::pipe::close_fd(fd);
+            }
+            if crate::net::socket::fd_is_socket(fd) {
+                crate::net::socket::close_socket(fd);
+            }
             if fd_to_filp(fd) != NIL {
                 sys_close(fd);
             }

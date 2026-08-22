@@ -31,6 +31,21 @@ mount -o loop $IMG_FILE $MNT
 
 tar xzf $ROOTFS -C $MNT
 
+# The kernel's execve only loads ELF (no #! shebang support), and the LFS
+# configure-system.sh wrote /sbin/init as a bash script. Replace both /init
+# and /sbin/init with the compiled static ELF init (setsid + TIOCSCTTY +
+# exec /bin/bash --login, falls back to /bin/sh).
+INIT_ELF="$(cd "$(dirname "$0")/.." && pwd)/lfs-docker/init"
+if [ -f "$INIT_ELF" ]; then
+    echo "Installing ELF init from $INIT_ELF"
+    rm -f "$MNT/init" "$MNT/sbin/init"
+    cp "$INIT_ELF" "$MNT/init"
+    cp "$INIT_ELF" "$MNT/sbin/init"
+    chmod 755 "$MNT/init" "$MNT/sbin/init"
+else
+    echo "WARNING: $INIT_ELF not found — leaving the (non-bootable) bash-script init"
+fi
+
 # Create essential device nodes
 echo "Creating device nodes..."
 mknod -m 666 $MNT/dev/null    c 1 3
