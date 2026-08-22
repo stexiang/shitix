@@ -421,3 +421,28 @@ LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接
   会拿旧镜像空跑——仪器化排查时务必先确认镜像时间戳。
 - 验证：debug selftest 全过（SHITIX_BOOT_OK）；glibc bash（gnu-full.img）
   echo/ls -la/cat 全通；busybox lfs3 无回归（喂命令要先 sleep 等提示符）。
+
+### 本次会话修复（Batch E/F/G + SMP CI，2026-08-22）
+
+- **Batch E**（fad9229）：POSIX 消息队列（`src/fs/mqueue.rs`，mq_open/
+  timedsend/timedreceive/unlink/notify/getsetattr，mqd_t 魔数编码）+
+  pidfd_open/send_signal/getfd（PIDFD_MAGIC=0x5046_4400 编码 fd）。
+- **Batch F**（cc7d4bf）：eventfd/timerfd/signalfd/inotify 真实阻塞
+  （O_NONBLOCK 返回 EAGAIN，否则 schedule() 让出循环——无 waitqueue，
+  注意自检里「空读」必须用 NONBLOCK，否则单任务死循环）；epoll 兴趣表 +
+  真实就绪查询（eventfd 计数/timerfd 到期/inotify 队列/pipe poll_status），
+  不再「fd 存在即就绪」；inotify watch 表 + 事件队列，VFS 钩子
+  （open O_CREAT/unlink/mkdir/rmdir/rename → notify_path_event）。
+- **镜像空间教训**：0x90000 安全区 = 512KB 镜像上限。NIL=usize::MAX
+  编码的 per-task fd 表会把整表烧进 .data：TASK_FILP(32KB)+
+  PIPE_FD_MAP(16KB)+event FD_MAP(16KB)=64KB。已统一改成 **0=空、
+  存下标+1**（全 0 初始化落 BSS），syssize 32676→28725 clicks。
+  以后新静态大表务必 0 哨兵。
+- **SMP**：ap_trampoline.S + INIT-SIPI-SIPI 早已可用，缺的只是 QEMU
+  没给多核。test.sh 现默认 `-smp 4`（SMP=1 退回单核）：4 CPU online、
+  run_on_all_cpus 并行求和与单核参考值一致。调度器仍只在 BSP 上跑，
+  AP 仅响应派工。
+- **Batch G**（fea7aa6）：umount2（清 i_mount + iput 被挂根）、getcpu
+  写回（恒 0/0，调度只在 BSP）。reboot/chroot/shebang 此前已实现。
+- **push 被拒**：GITHUB_TOKEN 属 alphashit，对 stexiang/shitix 无写权限
+  （403），提交只到本地 feat/vm-swap-mm 分支，待用户换凭据后 push。
