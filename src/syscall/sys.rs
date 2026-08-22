@@ -5844,18 +5844,37 @@ pub fn timer_getoverrun(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn timer_delete(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// vserver 保留号，Linux 从未实现。
 pub fn vserver(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 打开 POSIX 消息队列。只有 SysV 消息队列。
-pub fn mq_open(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 删除 POSIX 消息队列。同 [`mq_open`]。
-pub fn mq_unlink(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 带超时发送。同 [`mq_open`]。
-pub fn mq_timedsend(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 带超时接收。同 [`mq_open`]。
-pub fn mq_timedreceive(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 注册消息到达通知。同 [`mq_open`]。
-pub fn mq_notify(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 读写队列属性。同 [`mq_open`]。
-pub fn mq_getsetattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 打开 POSIX 消息队列。实现见 `fs/mqueue.rs`（静态队列表，
+/// mqd_t 用魔数编码，不进 fd 表）。
+pub fn mq_open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::mqueue::sys_mq_open(
+        args.a0 as *const u8, args.a1 as i32, args.a2 as u32, args.a3 as *const u64)
+}
+/// 删除 POSIX 消息队列。
+pub fn mq_unlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::mqueue::sys_mq_unlink(args.a0 as *const u8)
+}
+/// 带超时发送。
+pub fn mq_timedsend(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::mqueue::sys_mq_timedsend(
+        args.a0 as i64, args.a1 as *const u8, args.a2 as usize,
+        args.a3 as u32, args.a4 as *const u64)
+}
+/// 带超时接收。
+pub fn mq_timedreceive(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::mqueue::sys_mq_timedreceive(
+        args.a0 as i64, args.a1 as *mut u8, args.a2 as usize,
+        args.a3 as *mut u32, args.a4 as *const u64)
+}
+/// 注册消息到达通知（存根成功，见 fs/mqueue.rs）。
+pub fn mq_notify(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::mqueue::sys_mq_notify(args.a0 as i64, args.a1)
+}
+/// 读写队列属性（O_NONBLOCK 可改）。
+pub fn mq_getsetattr(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::mqueue::sys_mq_getsetattr(
+        args.a0 as i64, args.a1 as *const u64, args.a2 as *mut u64)
+}
 /// 等子进程（可不收尸）。`wait4` 已有，WNOWAIT 语义还没有。
 pub fn waitid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 设 I/O 优先级。`ll_rw_blk` 的请求队列没有优先级。
@@ -6105,7 +6124,36 @@ pub fn execveat(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     -(ENOSYS as i64)
 }
 /// 取进程的 pidfd。没有 pidfd 类型。
-pub fn pidfd_open(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// pidfd 编码：`0x5046_4400 | pid`（"PFD"）。不进 fd 表——pidfd 只服务
+/// pidfd_* 三个系统调用，用魔数编码避免和普通 fd 混淆（语义同 mq）。
+const PIDFD_MAGIC: i64 = 0x5046_4400;
+
+/// 按 pid 找任务下标（跳过 Unused 槽位）。
+fn find_task_by_pid(pid: i32) -> Option<usize> {
+    // SAFETY: 系统调用上下文读任务表。
+    unsafe {
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state != crate::sched::task::TaskState::Unused && (*t).pid as i32 == pid {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// 打开一个进程的 pidfd。对应 Linux 5.3 的 `pidfd_open(2)`。
+pub fn pidfd_open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pid = args.a0 as i32;
+    let flags = args.a1 as u32;
+    if pid <= 0 || flags & !0o4000 != 0 {
+        return -(EINVAL as i64);
+    }
+    match find_task_by_pid(pid) {
+        None => -(ESRCH as i64),
+        Some(_) => PIDFD_MAGIC | pid as i64,
+    }
+}
 /// [`clone`] 的结构体参数版本。
 pub fn clone3(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// [`faccessat`] 的带 flags 版本。
@@ -6119,7 +6167,42 @@ pub fn epoll_pwait2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 // --- 正式表 424..=448（335..423 是 x32 保留段，官方 x86_64 表里没有）------------
 
 /// 给 pidfd 发信号。没有 pidfd 类型，见 [`pidfd_open`]。
-pub fn pidfd_send_signal(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 经 pidfd 给进程发信号。对应 Linux 5.1 的 `pidfd_send_signal(2)`。
+/// siginfo 同 rt_sigqueueinfo：只允许 si_code <= 0。
+pub fn pidfd_send_signal(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pidfd = args.a0 as i64;
+    let sig = args.a1 as i32;
+    let info = args.a2;
+    let flags = args.a3 as u32;
+    if flags != 0 || pidfd & !0xFFFF != PIDFD_MAGIC {
+        return -(EINVAL as i64);
+    }
+    if sig == 0 {
+        // sig==0 只做存在性检查（同 kill(pid, 0)）
+        return if find_task_by_pid((pidfd & 0xFFFF) as i32).is_some() {
+            0
+        } else {
+            -(ESRCH as i64)
+        };
+    }
+    if sig < 1 || sig > 31 {
+        return -(EINVAL as i64);
+    }
+    if info != 0 {
+        // SAFETY: 用户指针读 si_code（siginfo_t 第 3 个 i32）。
+        let si_code = unsafe { core::ptr::read_volatile((info as *const i32).add(2)) };
+        if si_code > 0 {
+            return -(EPERM as i64);
+        }
+    }
+    match find_task_by_pid((pidfd & 0xFFFF) as i32) {
+        None => -(ESRCH as i64),
+        Some(idx) => {
+            crate::signal::send_sig(sig as u32, idx, 0);
+            0
+        }
+    }
+}
 /// 克隆一棵挂载树。需要挂载树，现在只支持单个根。
 pub fn open_tree(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 移动挂载点。同 [`open_tree`]。
@@ -6197,7 +6280,35 @@ pub fn openat2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     openat(&sub, _regs)
 }
 /// 从别的进程偷一个 fd。同 [`pidfd_open`]。
-pub fn pidfd_getfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 把另一个进程的 fd 复制进本进程。对应 Linux 5.6 的 `pidfd_getfd(2)`。
+/// 等价于「远程 dup」：共享同一个打开文件表项（f_count++）。
+pub fn pidfd_getfd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pidfd = args.a0 as i64;
+    let fd = args.a1 as usize;
+    let flags = args.a2 as u32;
+    if flags != 0 || pidfd & !0xFFFF != PIDFD_MAGIC {
+        return -(EINVAL as i64);
+    }
+    let target = match find_task_by_pid((pidfd & 0xFFFF) as i32) {
+        None => return -(ESRCH as i64),
+        Some(i) => i,
+    };
+    let f = crate::fs::open::task_fd(target, fd);
+    if f == crate::fs::inode::NIL {
+        return -(EBADF as i64);
+    }
+    // SAFETY: 系统调用上下文；f 是目标任务持有的有效 filp 下标。
+    unsafe {
+        crate::fs::file_table::filp(f).f_count += 1;
+        let new = crate::fs::open::get_unused_fd();
+        if new == crate::fs::inode::NIL {
+            crate::fs::file_table::filp(f).f_count -= 1;
+            return -(crate::klib::errno::EMFILE as i64);
+        }
+        crate::fs::open::set_fd(new, f);
+        new as i64
+    }
+}
 /// 对别的进程做 madvise。需要跨进程地址空间访问。
 pub fn process_madvise(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 改挂载点属性。同 [`open_tree`]。

@@ -402,6 +402,34 @@ fn ipc_selftest() {
         shm_ok &= unsafe { mm::shm::sys_shmctl(id, mm::shm::IPC_RMID, core::ptr::null_mut()) } == 0;
     }
     kprintln!("ipc: shm attach/write/detach/rmid ok={}", shm_ok);
+
+    // POSIX 消息队列：open、prio 排序收发、getsetattr、unlink
+    let name = b"/itest\0";
+    let mqd = fs::mqueue::sys_mq_open(name.as_ptr(), 0o100 | 0o4000, 0o600, core::ptr::null());
+    let mut mq_ok = mqd > 0;
+    if mq_ok {
+        // 低 prio 先进、高 prio 后进，接收必须先拿到高 prio
+        mq_ok &= fs::mqueue::sys_mq_timedsend(mqd, b"lo".as_ptr(), 2, 1, core::ptr::null()) == 0;
+        mq_ok &= fs::mqueue::sys_mq_timedsend(mqd, b"hi".as_ptr(), 2, 9, core::ptr::null()) == 0;
+        let mut rb = [0u8; 8];
+        let mut prio = 0u32;
+        let n = fs::mqueue::sys_mq_timedreceive(
+            mqd, rb.as_mut_ptr(), 8, &mut prio, core::ptr::null());
+        mq_ok &= n == 2 && prio == 9 && &rb[..2] == b"hi";
+        let n = fs::mqueue::sys_mq_timedreceive(
+            mqd, rb.as_mut_ptr(), 8, &mut prio, core::ptr::null());
+        mq_ok &= n == 2 && prio == 1 && &rb[..2] == b"lo";
+        // 空队列 + O_NONBLOCK → EAGAIN
+        mq_ok &= fs::mqueue::sys_mq_timedreceive(
+            mqd, rb.as_mut_ptr(), 8, &mut prio, core::ptr::null())
+            == -(crate::klib::errno::EAGAIN as i64);
+        let mut attr = [0u64; 4];
+        mq_ok &= fs::mqueue::sys_mq_getsetattr(
+            mqd, core::ptr::null(), attr.as_mut_ptr()) == 0;
+        mq_ok &= attr[1] == 8 && attr[2] == 256 && attr[3] == 0;
+        mq_ok &= fs::mqueue::sys_mq_unlink(name.as_ptr()) == 0;
+    }
+    kprintln!("ipc: posix mq open/prio/recv/unlink ok={}", mq_ok);
 }
 
 /// klib 自检：ctype 表、string 系列、number 补位、simple_strtoul、printk 过滤。

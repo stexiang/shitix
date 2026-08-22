@@ -23,6 +23,7 @@ pub mod ext4;        // ext4 filesystem support
 pub mod file_table;
 pub mod inode;
 pub mod minix;
+pub mod mqueue;
 pub mod namei;
 pub mod open;
 pub mod pipe;
