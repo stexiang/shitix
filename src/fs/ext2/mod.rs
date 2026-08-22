@@ -1,31 +1,14 @@
-//! ext2/ext3/ext4 文件系统实现
-//! 
-//! 参考 linux-1.0.9 的 `fs/ext2/` 目录
-//! 
-//! ## 状态
-//! 
-//! 核心数据结构已定义，需要与缓冲区缓存和 VFS 层集成。
-//! 
-//! ## 待完成
-//! 
-//! - [ ] 与 buffer cache 集成
-//! - [ ] 超级块读取/解析
-//! - [ ] inode 读取/写入
-//! - [ ] 目录操作
-//! - [ ] 块分配/释放
-//! - [ ] 文件读写
+//! ext2 磁盘数据结构定义。
+//!
+//! 历史上这里有一套独立的 ext2 实现骨架，已被 `ext4/` 目录下的完整
+//! ext2/ext4 读写实现取代（ext4 无 extent 时就是 ext2 经典块布局）。
+//! 现在只保留 `ext4/` 仍引用的磁盘结构定义。
+//!
+//! 参考 linux-1.0.9 的 `include/linux/ext2_fs.h`。
 
 pub mod super_block;
 pub mod inode;
-pub mod bitmap;
-pub mod dir;
-pub mod namei;
-pub mod file;
-pub mod truncate;
-pub mod io;
-pub mod ops;
 
 // Re-exports for convenience
 pub use super_block::{Ext2SuperBlock, Ext2GroupDesc, EXT2_SUPER_MAGIC};
-pub use inode::{Ext2Inode, Ext2DirEntry, Ext2InodeInfo};
-pub use bitmap::{BlockBitmap, InodeBitmap};
+pub use inode::{Ext2Inode, Ext2DirEntry};

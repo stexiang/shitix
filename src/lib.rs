@@ -313,7 +313,95 @@ fn mm_selftest() {
 
     // 4. vmalloc：非连续物理页映射成连续虚拟区间
     mm::vmalloc::selftest();
+
+    // 5. SysV IPC：sem/msg/shm 全链路
+    ipc_selftest();
     serial::print("mm: selftest done\n");
+}
+
+/// SysV IPC 自检：信号量计数与阻塞判定、消息队列收发、共享内存读写。
+/// 原版没有对应物（ipc/ 自带一致性靠用户态 ipcs 测试）。
+fn ipc_selftest() {
+    kprintln!("--- ipc selftest ---");
+
+    // 信号量：SETVAL=1 → P 成功 → NOWAIT 的 P 失败(EAGAIN) → V 归还
+    let sem = mm::sem::sys_semget(mm::sem::IPC_PRIVATE, 2, mm::sem::IPC_CREAT | 0o600);
+    let mut sem_ok = sem >= 0;
+    if sem_ok {
+        let id = sem as usize;
+        sem_ok &= mm::sem::sys_semctl(id, 0, mm::sem::SETVAL, 1) == 0;
+        // sembuf {num u16, op i16, flg i16}，8 字节槽位
+        let mut opbuf = [0u8; 8];
+        // SAFETY: opbuf 是本栈上的 8 字节缓冲区，按 sembuf 布局写字段。
+        unsafe {
+            (opbuf.as_mut_ptr() as *mut u16).write_unaligned(0); // sem_num=0
+            (opbuf.as_mut_ptr().add(2) as *mut i16).write_unaligned(-1); // P
+            (opbuf.as_mut_ptr().add(4) as *mut i16).write_unaligned(0);
+        }
+        sem_ok &= mm::sem::sem_op_timed(id, opbuf.as_ptr(), 1, None) == 0;
+        // 已归零，NOWAIT 再 P 必须 EAGAIN
+        // SAFETY: 同上，改 flg=IPC_NOWAIT。
+        unsafe { (opbuf.as_mut_ptr().add(4) as *mut i16).write_unaligned(mm::sem::IPC_NOWAIT as i16) };
+        sem_ok &= mm::sem::sem_op_timed(id, opbuf.as_ptr(), 1, None) == -(crate::klib::errno::EAGAIN as i64);
+        // V 归还后 GETVAL 回到 1
+        // SAFETY: 同上，改 op=+1、flg=0。
+        unsafe {
+            (opbuf.as_mut_ptr().add(2) as *mut i16).write_unaligned(1);
+            (opbuf.as_mut_ptr().add(4) as *mut i16).write_unaligned(0);
+        }
+        sem_ok &= mm::sem::sem_op_timed(id, opbuf.as_ptr(), 1, None) == 0;
+        sem_ok &= mm::sem::sys_semctl(id, 0, mm::sem::GETVAL, 0) == 1;
+        sem_ok &= mm::sem::sys_semctl(id, 0, mm::sem::IPC_RMID, 0) == 0;
+    }
+    kprintln!("ipc: sem P/V/nowait/rmid ok={}", sem_ok);
+
+    // 消息队列：发 mtype=1 "ping"，按 mtype 收回
+    let mq = mm::msg::sys_msgget(mm::msg::IPC_PRIVATE, mm::msg::IPC_CREAT | 0o600);
+    let mut msg_ok = mq >= 0;
+    if msg_ok {
+        let id = mq as usize;
+        let mut buf = [0u8; 16];
+        // SAFETY: buf 是本栈上的 16 字节缓冲区，按 msgbuf 布局写 mtype+mtext。
+        unsafe {
+            (buf.as_mut_ptr() as *mut i64).write_volatile(1);
+            core::ptr::copy_nonoverlapping(b"ping".as_ptr(), buf.as_mut_ptr().add(8), 4);
+        }
+        msg_ok &= mm::msg::sys_msgsnd(id, buf.as_ptr(), 4, 0) == 0;
+        let mut rbuf = [0u8; 16];
+        let n = mm::msg::sys_msgrcv(id, rbuf.as_mut_ptr(), 16, 1, 0);
+        msg_ok &= n == 4;
+        // SAFETY: rbuf 刚由 msgrcv 写入。
+        msg_ok &= unsafe {
+            (rbuf.as_ptr() as *const i64).read_volatile() == 1
+                && &rbuf[8..12] == b"ping"
+        };
+        // 空队列 NOWAIT → ENOMSG(42)
+        msg_ok &= mm::msg::sys_msgrcv(id, rbuf.as_mut_ptr(), 16, 0, mm::msg::IPC_NOWAIT) == -42;
+        msg_ok &= mm::msg::sys_msgctl(id, mm::msg::IPC_RMID, core::ptr::null_mut()) == 0;
+    }
+    kprintln!("ipc: msg send/recv/nowait/rmid ok={}", msg_ok);
+
+    // 共享内存：创建 1 页段，映到 boot 页表固定高位地址，跨映射读写
+    let shm = mm::shm::sys_shmget(mm::shm::IPC_PRIVATE, 4096, mm::shm::IPC_CREAT | 0o600);
+    let mut shm_ok = shm >= 0;
+    if shm_ok {
+        let id = shm as usize;
+        let va = 0x6000_0000usize;
+        // SAFETY: boot pml4=0x4000，va 区间在自检前无人使用。
+        let got = unsafe { mm::shm::sys_shmat(id, va, 0x4000, |_| 0) };
+        shm_ok &= got == va as i64;
+        if got == va as i64 {
+            // SAFETY: va 刚映射了段的第一页，独占使用。
+            unsafe { core::ptr::write_volatile(va as *mut u64, 0x1234_5678_9ABC_DEF0) };
+            // SAFETY: 同上。
+            shm_ok &= unsafe { core::ptr::read_volatile(va as *const u64) } == 0x1234_5678_9ABC_DEF0;
+            // SAFETY: 解除本自检建立的映射。
+            shm_ok &= unsafe { mm::shm::sys_shmdt(va, 0x4000) } == 0;
+        }
+        // SAFETY: IPC_RMID 后立即释放（nattch 已归零）。
+        shm_ok &= unsafe { mm::shm::sys_shmctl(id, mm::shm::IPC_RMID, core::ptr::null_mut()) } == 0;
+    }
+    kprintln!("ipc: shm attach/write/detach/rmid ok={}", shm_ok);
 }
 
 /// klib 自检：ctype 表、string 系列、number 补位、simple_strtoul、printk 过滤。

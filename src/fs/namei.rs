@@ -86,6 +86,7 @@ pub unsafe fn read_symlink_target(ip: usize) -> Option<([u8; 256], usize)> {
             return None;
         }
         match iop {
+            FsType::Minix => super::minix::namei::read_symlink(ip),
             #[cfg(feature = "extra-drivers")]
             FsType::Ext2 => super::ext4::ops::full::read_symlink(ip),
             _ => None,
@@ -584,6 +585,47 @@ pub unsafe fn do_mkdir(path: &[u8], m: u16) -> i64 {
             FsType::Ext2 => super::ext4::namei::mkdir(dir, last, m),
             #[cfg(not(feature = "extra-drivers"))]
             FsType::Ext2 => super::minix::namei::mkdir(dir, last, m),
+            _ => Err(ENOTDIR),
+        };
+        inode::iput(dir);
+        match r {
+            Ok(n) => {
+                inode::iput(n);
+                0
+            }
+            Err(e) => -(e as i64),
+        }
+    }
+}
+
+/// 建符号链接。对应原版 `sys_symlink()`：
+/// dir_namei 定位父目录 → 权限检查 → 按 fs 类型分发到各 fs 的 symlink。
+/// 目标不解析（允许悬空链接，原版同样不查目标存在）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn do_symlink(target: &[u8], path: &[u8]) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let (dir, last) = match dir_namei(path) {
+            Ok(x) => x,
+            Err(e) => return -(e as i64),
+        };
+        if last.is_empty() {
+            inode::iput(dir);
+            return -(ENOENT as i64);
+        }
+        if !permission(dir, MAY_WRITE) {
+            inode::iput(dir);
+            return -(EACCES as i64);
+        }
+        let dir_op = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        let r = match dir_op {
+            FsType::Minix => super::minix::namei::symlink(dir, last, target),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::symlink(dir, last, target),
+            #[cfg(not(feature = "extra-drivers"))]
+            FsType::Ext2 => super::minix::namei::symlink(dir, last, target),
             _ => Err(ENOTDIR),
         };
         inode::iput(dir);

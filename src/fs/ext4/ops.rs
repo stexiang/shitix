@@ -200,8 +200,15 @@ pub mod full {
                 data[block_off+24..block_off+26].copy_from_slice(&i.i_gid.to_le_bytes());
                 data[block_off+26..block_off+28].copy_from_slice(&i.i_nlink.to_le_bytes());
                 // i_blocks：分配的 512 字节扇区数（直接+间接指针块数 × fs_block_size/512）。
+                // 快速符号链接（≤60 字节目标内联在 i_block 区）必须保持
+                // i_blocks==0——is_fast_symlink() 靠它区分快慢链接，一旦把
+                // 目标文本的字节当块号数出非零 i_blocks，读侧就会走 bmap 慢
+                // 链接路径把目标文本当块号读。
+                let is_fast_lnk = mode::is_lnk(i.i_mode) && i.i_size <= 60;
                 let mut nblocks = 0u32;
-                for k in 0..15 { if i.data[k] != 0 { nblocks += 1; } }
+                if !is_fast_lnk {
+                    for k in 0..15 { if i.data[k] != 0 { nblocks += 1; } }
+                }
                 let sectors = nblocks * (info.fs_block_size / 512) as u32;
                 data[block_off+28..block_off+32].copy_from_slice(&sectors.to_le_bytes());
                 // i_block 区：12 个直接块 + 3 个间接块指针，每个 u32 小端，

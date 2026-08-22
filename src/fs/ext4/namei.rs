@@ -283,6 +283,8 @@ pub unsafe fn mknod(dir: usize, name: &[u8], m: u16, _rdev: u16) -> Result<usize
 
         let ft = if mode::is_dir(m) {
             file_type::EXT4_FT_DIR
+        } else if mode::is_lnk(m) {
+            file_type::EXT4_FT_SYMLINK
         } else if mode::is_chr(m) {
             file_type::EXT4_FT_CHRDEV
         } else if mode::is_blk(m) {
@@ -294,6 +296,66 @@ pub unsafe fn mknod(dir: usize, name: &[u8], m: u16, _rdev: u16) -> Result<usize
         };
 
         add_entry(dir, ino, name, ft)?;
+        Ok(ip)
+    }
+}
+
+/// 建符号链接。对应原版 `ext2_symlink()`：
+/// ≤60 字节走快速链接（目标内联在 i_block 区，i_blocks=0），
+/// 更长则分配一个数据块写目标（慢链接）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn symlink(dir: usize, name: &[u8], target: &[u8]) -> Result<usize, i32> {
+    // SAFETY: 契约转交。
+    unsafe {
+        if target.is_empty() || target.len() > 4096 {
+            return Err(ENAMETOOLONG);
+        }
+        // mknod 建好 S_IFLNK 节点（i_nlink=1、目录项 filetype=SYMLINK）
+        let m = crate::fs::mode::S_IFLNK | 0o777;
+        let ip = mknod(dir, name, m, 0)?;
+        {
+            let i = inode::inode(ip);
+            i.i_size = target.len() as u32;
+            i.i_dirt = true;
+            if target.len() <= 60 {
+                // 快速链接：目标按小端字节序填进 i.data 的 60 字节区。
+                // write_inode 对 is_lnk&&i_size<=60 特判 i_blocks=0。
+                let mut raw = [0u8; 60];
+                raw[..target.len()].copy_from_slice(target);
+                for k in 0..15 {
+                    i.data[k] = u32::from_le_bytes([raw[k*4], raw[k*4+1], raw[k*4+2], raw[k*4+3]]);
+                }
+                return Ok(ip);
+            }
+        }
+        // 慢链接：分配数据块写目标。bmap 的逻辑块号以 1024 字节缓冲块
+        // 为单位（同 find_entry 的读路径）。
+        let sb_nr = inode::inode(ip).i_sb;
+        let dev = sb(sb_nr).s_dev;
+        let mut sub = 0usize;
+        loop {
+            let phys = crate::fs::ext4::ops::full::bmap(ip, sub as u32, true);
+            if phys == 0 {
+                // 分配失败：回滚目录项与 inode
+                let _ = unlink(dir, name);
+                return Err(ENOSPC);
+            }
+            let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                Some(b) => b,
+                None => { let _ = unlink(dir, name); return Err(EIO); }
+            };
+            let d = buffer::bh(bn).data_mut();
+            let s = sub * BLOCK_SIZE;
+            let chunk = target.len().saturating_sub(s).min(BLOCK_SIZE);
+            d[..BLOCK_SIZE].fill(0);
+            d[..chunk].copy_from_slice(&target[s..s + chunk]);
+            buffer::mark_buffer_dirty(bn);
+            buffer::brelse(bn);
+            if s + BLOCK_SIZE >= target.len() { break; }
+            sub += 1;
+        }
         Ok(ip)
     }
 }

@@ -65,6 +65,9 @@ pub fn do_exit(code: ExitCode) -> ! {
         // swap_free(entry)）。
         crate::mm::swap::free_task_swap((*sched::task_ptr(nr)).pml4);
 
+        // 摘掉该任务的全部 SysV 共享内存附加（原版 shm_exit）。
+        crate::mm::shm::exit_task(nr, (*sched::task_ptr(nr)).pml4);
+
         // 把子进程托付出去。原版遍历 p_cptr 链把孩子挂到 init 名下，
         // 我们的亲子关系是 `parent` 下标，所以扫一遍任务表。
         reparent_children(nr);

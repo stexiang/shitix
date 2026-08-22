@@ -356,6 +356,63 @@ pub unsafe fn mknod(dir: usize, name: &[u8], m: u16, rdev: u16) -> Result<usize,
     }
 }
 
+/// 建符号链接。对应原版 `minix_symlink()`：
+/// 新 inode 设 S_IFLNK|0777，目标写进第一个数据块（minix 无快链接）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn symlink(dir: usize, name: &[u8], target: &[u8]) -> Result<usize, i32> {
+    // SAFETY: 契约转交。
+    unsafe {
+        if target.is_empty() || target.len() > BLOCK_SIZE {
+            return Err(ENAMETOOLONG);
+        }
+        let n = mknod(dir, name, mode::S_IFLNK | 0o777, 0)?;
+        // mknod 对非 reg/dir/chr/blk 设 FsType::None；链接要能按 minix
+        // 数据块读目标 → 设 Minix。
+        inode::inode(n).i_op = FsType::Minix;
+        inode::inode(n).i_size = target.len() as u32;
+        let b = super::inode_ops::minix_bread(n, 0, true);
+        if b == NIL {
+            inode::inode(n).i_nlink = 0;
+            inode::iput(n);
+            return Err(ENOSPC);
+        }
+        let d = bh(b).data_mut();
+        d[..BLOCK_SIZE].fill(0);
+        d[..target.len()].copy_from_slice(target);
+        bh(b).b_uptodate = true;
+        bh(b).b_dirt = true;
+        buffer::brelse(b);
+        inode::inode(n).i_dirt = true;
+        Ok(n)
+    }
+}
+
+/// 读符号链接目标（minix 无快链接，目标恒在第一块）。
+/// 返回 (缓冲, 长度)。对应原版 `minix_follow_link` 的读盘部分。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn read_symlink(ip: usize) -> Option<([u8; 256], usize)> {
+    // SAFETY: 契约转交。
+    unsafe {
+        let size = inode::inode(ip).i_size as usize;
+        if size == 0 {
+            return None;
+        }
+        let b = super::inode_ops::minix_bread(ip, 0, false);
+        if b == NIL {
+            return None;
+        }
+        let len = size.min(BLOCK_SIZE).min(255);
+        let mut out = [0u8; 256];
+        out[..len].copy_from_slice(&bh(b).data()[..len]);
+        buffer::brelse(b);
+        Some((out, len))
+    }
+}
+
 /// 建目录。对应原版 `minix_mkdir()`。
 ///
 /// 新目录里要先放好 `.` 和 `..` 两项，并把父目录的 `i_nlink` 加一

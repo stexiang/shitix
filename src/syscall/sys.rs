@@ -5,7 +5,7 @@
 //! 其余在分发表里指向 [`ni_syscall`]。每个函数的文档注明原版位置。
 
 use super::{SysArgs, nr};
-use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP, ESRCH, ENAMETOOLONG};
+use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP, ESRCH, ENAMETOOLONG, EAGAIN};
 use crate::klib::printk::Level;
 use crate::sched;
 use crate::traps::PtRegs;
@@ -1350,6 +1350,18 @@ pub fn brk(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         if old_brk == 0 { (*t).brk = heap_base; }
         let cur_brk = (*t).brk;
 
+        // RLIMIT_DATA 强制（原版 do_brk→check_data_rlimit 语义）：
+        // 数据段（堆）增长不能超过软限。
+        if new_brk > cur_brk {
+            let rlim = (*t).rlim[sched::task::RLIMIT_DATA];
+            if rlim.rlim_cur != sched::task::RLIM_INFINITY {
+                let grow = (new_brk - cur_brk) as u64;
+                if grow > rlim.rlim_cur {
+                    return -(crate::klib::errno::ENOMEM as i64);
+                }
+            }
+        }
+
         if new_brk > cur_brk {
             let start = crate::mm::page::page_align(cur_brk);
             let end = crate::mm::page::page_align(new_brk + crate::mm::PAGE_SIZE - 1);
@@ -1561,6 +1573,17 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
     use crate::klib::errno::{ENOMEM, EINVAL, EBADF, ENOSYS};
     if len == 0 { return -(EINVAL as i64); }
+
+    // RLIMIT_AS 强制（原版 do_mmap→may_expand_vm 语义）：
+    // 单次映射长度不能超过剩余虚拟地址空间软限。没有完整 VMA 总量统计，
+    // 用「请求长度 ≤ 软限」近似——足够拦住 glibc malloc 那种 ~1.4GB 预留
+    // 被限小后仍返回成功导致越界写的情况。
+    {
+        let rlim = unsafe { (*sched::task_ptr(sched::current_index())).rlim[sched::task::RLIMIT_AS] };
+        if rlim.rlim_cur != sched::task::RLIM_INFINITY && len > rlim.rlim_cur {
+            return -(ENOMEM as i64);
+        }
+    }
 
     const MAP_ANONYMOUS: u64 = 0x20;
     const MAP_PRIVATE: u64 = 0x02;
@@ -1915,15 +1938,10 @@ pub fn symlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // Create a regular file and write the target into it.
-    // This is a minimal "fast symlink" approximation.
-    unsafe {
-        let fd = crate::fs::open::sys_creat(link_path, 0o777);
-        if fd < 0 { return fd; }
-        let n = crate::fs::read_write::write(fd as usize, target);
-        crate::fs::open::sys_close(fd as usize);
-        if n < 0 { n } else { 0 }
-    }
+    // 真实符号链接（S_IFLNK inode）：minix 目标存第一数据块，ext2/ext4
+    // ≤60 字节走快链接（内联 i_block）。不再是「普通文件存目标路径」的近似。
+    // SAFETY: 系统调用上下文。
+    unsafe { crate::fs::namei::do_symlink(target, link_path) }
 }
 
 /// 读取符号链接目标。对应原版 `fs/namei.c:sys_readlink()`。
@@ -2484,29 +2502,42 @@ pub fn getdents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd < 0 {
         return -(EBADF as i64);
     }
+    // getdents 是批量接口：循环填充直到缓冲放不下下一项或目录读完。
+    // 每项是变长的 linux_dirent64 记录：d_ino(8) d_off(8) d_reclen(2)
+    // d_type(1) d_name(NUL 结尾)，reclen 按 8 对齐。原版 1.0.9 的
+    // sys_readdir 一次一项，但 getdents(78)/getdents64(217) 是
+    // 现代批量语义，glibc 的 readdir 一次 read 一整个目录靠的就是它。
     let need = core::mem::size_of::<crate::fs::Dirent>() as u64;
     if args.a2 < need {
         return -(EINVAL as i64);
     }
     // 用 user_ok（低 1GB 直过 + 高位查页表）而非 check_range 1GB：
     // readdir 的缓冲可能是高位 malloc/mmap 出来的，1GB 护栏会误拒。
-    if !unsafe { user_ok(args.a1, need, crate::mm::area::AccessMode::Write) } {
+    if !unsafe { user_ok(args.a1, args.a2, crate::mm::area::AccessMode::Write) } {
         return -(EFAULT as i64);
     }
-    // 一次只返回一项：fs 层的 readdir 就是单项语义（原版 1.0.9 的
-    // `sys_readdir` 同样一次一项，getdents 是 1.2 之后才有的批量接口）。
-    // 用 zeroed() 而不是结构体字面量：Dirent 带 #[repr(C)]，d_name 之后的
-    // 尾随 padding（对齐到 8）字面量不初始化，会把内核栈垃圾写进用户缓冲。
-    let mut d: crate::fs::Dirent = unsafe { core::mem::zeroed() };
-    d.d_reclen = need as u16;
-    // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
-    let r = unsafe { crate::fs::read_write::readdir(fd as usize, &mut d) };
-    if r <= 0 {
-        return r;
+    let mut written = 0u64;
+    loop {
+        if args.a2 - written < need {
+            break;
+        }
+        // 用 zeroed() 而不是结构体字面量：Dirent 带 #[repr(C)]，d_name 之后的
+        // 尾随 padding（对齐到 8）字面量不初始化，会把内核栈垃圾写进用户缓冲。
+        let mut d: crate::fs::Dirent = unsafe { core::mem::zeroed() };
+        d.d_reclen = need as u16;
+        // SAFETY: 系统调用上下文，fs 层会睡；fd 无效返回 -EBADF。
+        let r = unsafe { crate::fs::read_write::readdir(fd as usize, &mut d) };
+        if r <= 0 {
+            if written > 0 {
+                break; // 已写出若干项：EOF/错误留给下一次调用
+            }
+            return r;
+        }
+        // SAFETY: user_ok 已确认 [a1, a1+a2) 可写，written+need<=a2。
+        unsafe { ((args.a1 + written) as *mut crate::fs::Dirent).write_unaligned(d) };
+        written += need;
     }
-    // SAFETY: check_range 已确认目标落在恒等映射内可写。
-    unsafe { (args.a1 as *mut crate::fs::Dirent).write_unaligned(d) };
-    need as i64
+    written as i64
 }
 /// 获取目录项64。
 pub fn getdents64(args: &SysArgs, regs: &mut PtRegs) -> i64 {
@@ -3248,23 +3279,102 @@ pub fn mremap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 pub fn msync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
 // IPC syscalls
-pub fn shmget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn shmat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    // Return a dummy shared memory address
-    let _shmid = args.a0;
-    let shmaddr = args.a1;
-    if shmaddr != 0 { shmaddr as i64 } else { (crate::umm::USERSPACE_START + 0x1000000) as i64 }
+/// SysV 共享内存：获取/创建段。对应原版 `ipc/shm.c:sys_shmget()`。
+pub fn shmget(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::mm::shm::sys_shmget(args.a0 as i32, args.a1 as usize, args.a2 as i32)
 }
-pub fn shmdt(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn shmctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn semget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn semop(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn semctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn semtimedop(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn msgget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn msgsnd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn msgrcv(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn msgctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// SysV 共享内存：附加到当前地址空间。对应原版 `sys_shmat()`。
+/// shmaddr==0 时按 mmap_base 向下挑选空闲区（同匿名 mmap）。
+pub fn shmat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    let shmaddr = args.a1 as usize;
+    let nr = sched::current_index();
+    let pml4 = unsafe { (*sched::task_ptr(nr)).pml4 };
+    if pml4 == 0 { return -(EINVAL as i64); }
+    // SAFETY: 系统调用上下文；pick_addr 只改当前任务的 mmap_base。
+    unsafe {
+        crate::mm::shm::sys_shmat(id as usize, shmaddr, pml4, |nbytes| {
+            let t = sched::task_ptr(nr);
+            let base = (*t).mmap_base;
+            let alloc_end = if base < nbytes as u64 { 0usize } else { (base - nbytes as u64) as usize & !0xFFF };
+            if alloc_end != 0 { (*t).mmap_base = alloc_end as u64; }
+            alloc_end
+        })
+    }
+}
+/// SysV 共享内存：解除附加。对应原版 `sys_shmdt()`。
+pub fn shmdt(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let nr = sched::current_index();
+    let pml4 = unsafe { (*sched::task_ptr(nr)).pml4 };
+    // SAFETY: 系统调用上下文。
+    unsafe { crate::mm::shm::sys_shmdt(args.a0 as usize, pml4) }
+}
+/// SysV 共享内存：控制（IPC_STAT / IPC_RMID）。对应原版 `sys_shmctl()`。
+pub fn shmctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    // SAFETY: 用户指针由 IPC_STAT 分支写。
+    unsafe { crate::mm::shm::sys_shmctl(id as usize, args.a1 as i32, args.a2 as *mut u8) }
+}
+/// SysV 信号量：获取/创建集合。对应原版 `ipc/sem.c:sys_semget()`。
+pub fn semget(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::mm::sem::sys_semget(args.a0 as i32, args.a1 as i32, args.a2 as i32)
+}
+/// SysV 信号量：一组原子操作。对应原版 `sys_semop()`。
+pub fn semop(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    crate::mm::sem::sem_op_timed(id as usize, args.a1 as *const u8, args.a2 as usize, None)
+}
+/// SysV 信号量：控制。对应原版 `sys_semctl()`。
+pub fn semctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    crate::mm::sem::sys_semctl(id as usize, args.a1 as usize, args.a2 as i32, args.a3)
+}
+/// SysV 信号量：带超时的操作。对应 Linux 2.6 的 `sys_semtimedop()`。
+pub fn semtimedop(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    let ts = args.a3 as *const u64;
+    let deadline = if ts.is_null() {
+        None
+    } else {
+        // SAFETY: 用户指针，timespec {sec, nsec}。
+        let (sec, nsec) = unsafe { (core::ptr::read_volatile(ts), core::ptr::read_volatile(ts.add(1))) };
+        if nsec >= 1_000_000_000 { return -(EINVAL as i64); }
+        let hz = sched::task::HZ;
+        let ticks = sec.saturating_mul(hz).saturating_add((nsec.saturating_mul(hz) + 999_999_999) / 1_000_000_000);
+        Some(sched::jiffies().saturating_add(ticks))
+    };
+    crate::mm::sem::sem_op_timed(id as usize, args.a1 as *const u8, args.a2 as usize, deadline)
+}
+/// SysV 消息队列：获取/创建队列。对应原版 `ipc/msg.c:sys_msgget()`。
+pub fn msgget(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::mm::msg::sys_msgget(args.a0 as i32, args.a1 as i32)
+}
+/// SysV 消息队列：发送。对应原版 `sys_msgsnd()`。
+pub fn msgsnd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    crate::mm::msg::sys_msgsnd(id as usize, args.a1 as *const u8, args.a2 as usize, args.a3 as i32)
+}
+/// SysV 消息队列：接收。对应原版 `sys_msgrcv()`。
+pub fn msgrcv(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    crate::mm::msg::sys_msgrcv(
+        id as usize, args.a1 as *mut u8, args.a2 as usize,
+        args.a3 as i64, args.a4 as i32,
+    )
+}
+/// SysV 消息队列：控制（IPC_RMID / IPC_STAT）。对应原版 `sys_msgctl()`。
+pub fn msgctl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let id = args.a0 as i64;
+    if id < 0 { return -(EINVAL as i64); }
+    crate::mm::msg::sys_msgctl(id as usize, args.a1 as i32, args.a2 as *mut u8)
+}
 
 // Time syscalls
 
@@ -5243,8 +5353,57 @@ pub fn rt_sigpending(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     unsafe { core::ptr::write_volatile(set, pending) };
     0
 }
-/// 带超时地等信号（rt 版）。
-pub fn rt_sigtimedwait(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带超时地等信号（rt 版）。对应原版 `kernel/signal.c:sys_rt_sigtimedwait()`：
+/// 在 set 中有信号挂起时取出最低号信号、清除 pending 位、填 siginfo（本内核
+/// 只填 si_signo/si_code=SI_USER）并返回信号号；否则睡到超时。
+/// timeout=NULL 无限等；{0,0} 只查一次，无则 -EAGAIN。
+pub fn rt_sigtimedwait(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let set_ptr = args.a0 as *const u64;
+    let info_ptr = args.a1 as *mut i32;
+    let ts_ptr = args.a2 as *const u64;
+    let sigsetsize = args.a3;
+    if sigsetsize != 8 { return -(EINVAL as i64); }
+    if set_ptr.is_null() { return -(EFAULT as i64); }
+    // SAFETY: 用户指针，读屏蔽集。位号==信号号。
+    let set = unsafe { core::ptr::read_volatile(set_ptr) };
+    // SIGKILL(9)/SIGSTOP(19) 不可等待
+    let set = set & !((1u64 << 9) | (1u64 << 19));
+    let deadline = if ts_ptr.is_null() {
+        u64::MAX
+    } else {
+        // SAFETY: 用户指针，timespec {sec, nsec} 两个 u64。
+        let (sec, nsec) = unsafe { (core::ptr::read_volatile(ts_ptr), core::ptr::read_volatile(ts_ptr.add(1))) };
+        if nsec >= 1_000_000_000 { return -(EINVAL as i64); }
+        let hz = sched::task::HZ as u64;
+        let ticks = sec.saturating_mul(hz).saturating_add((nsec.saturating_mul(hz) + 999_999_999) / 1_000_000_000);
+        sched::jiffies().saturating_add(ticks)
+    };
+    loop {
+        let idx = sched::current_index();
+        // SAFETY: 系统调用上下文读当前任务 pending 位图。
+        let pending = unsafe { (*sched::task_ptr(idx)).signal } & set;
+        if pending != 0 {
+            let signo = pending.trailing_zeros();
+            // SAFETY: 取走信号：清 pending 位（原版 dequeue_signal 语义）。
+            unsafe { (*sched::task_ptr(idx)).signal &= !(1u64 << signo); }
+            if !info_ptr.is_null() {
+                // siginfo_t 头两个字段：si_signo / si_errno，si_code 在第 3 个
+                // SAFETY: 用户指针，写 3 个 i32。
+                unsafe {
+                    core::ptr::write_volatile(info_ptr, signo as i32);
+                    core::ptr::write_volatile(info_ptr.add(1), 0);
+                    core::ptr::write_volatile(info_ptr.add(2), 0); // SI_USER
+                }
+            }
+            return signo as i64;
+        }
+        if sched::jiffies() >= deadline {
+            return -(EAGAIN as i64);
+        }
+        // SAFETY: 系统调用上下文让出 CPU，同 rt_sigsuspend 的等待路径。
+        unsafe { sched::schedule() };
+    }
+}
 /// 带 siginfo 发信号。本内核不传递 siginfo 内容（setup_frame 里 si 全 0），
 /// 但按 POSIX 语义校验：用户态只允许 si_code <= 0，然后按 kill 投递。
 pub fn rt_sigqueueinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
@@ -5974,7 +6133,9 @@ pub fn fsmount(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 新式挂载 API：由已有挂载点取上下文。同 [`fsopen`]。
 pub fn fspick(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 批量关闭 fd 区间 [first, last]。对应 Linux 5.9 的 `close_range(2)`。
-/// 区间内未打开的 fd 静默跳过（语义就是「保证这段全关」），flags 暂未支持。
+/// 区间内未打开的 fd 静默跳过（语义就是「保证这段全关」）。
+/// flags 支持 CLOSE_RANGE_CLOEXEC（只打 close-on-exec 标记不关）和
+/// CLOSE_RANGE_UNSHARE（本内核 fd 表本来就每任务私有，等价于无操作）。
 pub fn close_range(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let first = args.a0 as u32;
     let last = args.a1 as u32;
@@ -5982,11 +6143,23 @@ pub fn close_range(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if first > last {
         return -(EINVAL as i64);
     }
-    if flags != 0 {
-        // CLOEXEC/UNSHARE/CLOSERANGE 语义都建立在 fd 表独立拷贝之上，暂不支持
+    const CLOSE_RANGE_UNSHARE: u32 = 2;
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
         return -(EINVAL as i64);
     }
     let last = (last as usize).min(crate::fs::NR_OPEN - 1);
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        // 不关闭，只给区间内已打开的 fd 打 close-on-exec 标记
+        let nr = sched::current_index();
+        for fd in first as usize..=last {
+            if crate::fs::open::fd_to_filp(fd) != 0 {
+                unsafe { (*sched::task_ptr(nr)).close_on_exec |= 1u64 << (fd & 63) };
+            }
+        }
+        return 0;
+    }
+    // UNSHARE：本内核 fd 表本来就是每任务私有（clone_fds 全量拷贝），无需动作
     for fd in first as usize..=last {
         close_one_fd(fd);
     }

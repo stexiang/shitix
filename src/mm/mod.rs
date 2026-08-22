@@ -15,10 +15,13 @@
 pub mod area;
 pub mod kmalloc;
 pub mod mmap_vma;
+pub mod msg;
 pub mod page;
 pub mod page_alloc;
 pub mod paging;
 pub mod page_ref;
+pub mod sem;
+pub mod shm;
 pub mod swap;
 pub mod vmalloc;
 
