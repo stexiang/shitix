@@ -275,13 +275,30 @@ unsafe fn dir_namei_base(path: &[u8], start: usize) -> Result<(usize, &[u8]), i3
     }
 }
 
+/// 在目录 `dir` 中按 inode 号反查名字（`getcwd` 的 `..` 回溯用）。
+/// 对应现代内核 dcache 的 `d_parent`+`d_name` 回溯的等价物：本树没有
+/// dcache，就用「扫父目录找子 inode 号」这条 1.0.9 时代的老路。
+///
+/// # Safety
+/// 只能在进程上下文调用。`dir` 是已 `iget` 的目录 inode。
+pub unsafe fn lookup_ino_name(dir: usize, ino: u32, out: &mut [u8; 255]) -> Option<usize> {
+    // SAFETY: 契约转交。
+    unsafe {
+        let iop = core::ptr::addr_of!((*inode::inode_ptr(dir)).i_op).read_volatile();
+        match iop {
+            FsType::Minix => super::minix::namei::lookup_ino(dir, ino, out),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::namei::lookup_ino(dir, ino, out),
+            _ => None,
+        }
+    }
+}
+
 /// 在一个目录里查一个分量。对应原版 `lookup()`。
 ///
 /// 处理 `..` 的两个特例（原版 `lookup` 开头那段）：
 /// 1. 在**根目录**里 `..` 就是根目录自己
 /// 2. 在一个**挂载点的根**里 `..` 要跳回被盖住的那个目录所在的文件系统
-///
-/// 少了第 2 条，`cd /mnt/..` 会停在挂载的文件系统里出不来。
 ///
 /// # Safety
 /// 只能在进程上下文调用。
@@ -431,8 +448,16 @@ pub unsafe fn open_namei(path: &[u8], flags: u32, m: u16) -> Result<usize, i32> 
                     inode::iput(dir);
                     return Err(EEXIST);
                 }
-                // 原版 open_namei 对已存在的目标会 follow_link（除非 O_NOFOLLOW，
-                // 这里没移植 O_NOFOLLOW，统一跟随，与原版一致）。open 拿到
+                // O_NOFOLLOW：末尾分量是符号链接就报 ELOOP（原版
+                // open_namei 的 `if (flag & O_NOFOLLOW) { iput; return -ELOOP; }`）
+                if flags & oflags::O_NOFOLLOW != 0
+                    && mode::is_lnk(core::ptr::addr_of!((*inode::inode_ptr(n)).i_mode).read_volatile())
+                {
+                    inode::iput(n);
+                    inode::iput(dir);
+                    return Err(ELOOP);
+                }
+                // 原版 open_namei 对已存在的目标 follow_link。open 拿到
                 // 的应是链接指向的真实文件。
                 let followed = follow_link(dir, n);
                 followed?

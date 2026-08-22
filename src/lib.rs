@@ -140,6 +140,11 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
         panic!("sched_init failed: {}", klib::errno::strerror(e));
     }
 
+    // 对应原版 time_init()：从 CMOS RTC 读开机时刻（startup_time），
+    // current_time()（inode 时间戳/sys_time）据此返回真实墙钟。
+    // SAFETY: 启动期，sched::init 之后。
+    unsafe { drivers::rtc::init() };
+
     trap_selftest();
     syscall_selftest();
     sched_selftest();

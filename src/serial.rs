@@ -66,6 +66,27 @@ pub fn getc() -> u8 {
     unsafe { inb(PORT) }
 }
 
+/// 打开 RX 中断（IER bit0 = Received Data Available）。
+/// 与 IRQ4 注册（`irq::request_irq(4, …)`，在 `char_dev::init` 里）配套：
+/// 之后收到的字符由中断处理函数喂给 tty 的 read_q，不再依赖
+/// read 路径里的轮询兜底（轮询代码保留，作中断未启用期的退路）。
+pub fn enable_rx_irq() {
+    // SAFETY: 内核态独占 COM1；写 IER 只开接收中断，发送端仍轮询。
+    unsafe { outb(PORT + 1, 0x01) }
+}
+
+/// IRQ4 处理：把 UART FIFO 里积压的字符全部喂给 tty。
+/// 对应原版 `drivers/char/serial.c:rs_interrupt()` 的 receive 分支。
+pub fn irq_rx_handler(_irq: usize, _regs: &mut crate::traps::PtRegs) {
+    // SAFETY: 中断上下文；receive_char 只碰 read_q 不睡。
+    unsafe {
+        while has_char() {
+            let c = getc();
+            crate::drivers::char_dev::tty::receive_char(c);
+        }
+    }
+}
+
 /// 让 `write!` / `sprintln!` 能往串口写。
 pub struct Writer;
 

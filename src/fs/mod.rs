@@ -151,6 +151,10 @@ pub mod oflags {
     pub const O_TRUNC: u32 = 0o1000;
     pub const O_APPEND: u32 = 0o2000;
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// 末尾分量若是符号链接则失败（-ELOOP）。Linux 2.1.126+。
+    pub const O_NOFOLLOW: u32 = 0o20000;
+    /// open 即设 FD_CLOEXEC（execve 时自动关闭）。Linux 2.6.23+。
+    pub const O_CLOEXEC: u32 = 0o2000000;
 }
 
 /// `lseek` 的 whence。对应原版 `SEEK_SET`/`SEEK_CUR`/`SEEK_END`。

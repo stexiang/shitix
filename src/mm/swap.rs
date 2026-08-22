@@ -49,6 +49,12 @@ pub fn nr_free_slots() -> u32 {
     map[..n as usize].iter().filter(|&&c| c == 0).count() as u32
 }
 
+/// 交换区总槽数（sysinfo 用）。
+pub fn total_slots() -> u32 {
+    // SAFETY: swapon 后只读。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(NR_SLOTS)) }
+}
+
 /// 在块设备上启用交换区。对应原版 `sys_swapon()`。
 ///
 /// 第 0 页写入签名头；数据槽位 1..=nr_slots。重复 swapon 报 EBUSY。

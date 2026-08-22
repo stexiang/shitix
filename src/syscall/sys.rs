@@ -5,13 +5,14 @@
 //! 其余在分发表里指向 [`ni_syscall`]。每个函数的文档注明原版位置。
 
 use super::{SysArgs, nr};
-use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP, ESRCH};
+use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP, ESRCH, ENAMETOOLONG};
 use crate::klib::printk::Level;
 use crate::sched;
 use crate::traps::PtRegs;
 
 /// 时间值结构
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TimeVal {
     pub tv_sec: i64,
     pub tv_usec: i64,
@@ -70,6 +71,7 @@ pub struct RUsage {
 
 /// 资源限制
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RLimit {
     pub rlim_cur: u64,
     pub rlim_max: u64,
@@ -251,7 +253,7 @@ pub fn ni_syscall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 执行程序。对应原版 `fs/exec.c:sys_execve()` + `fs/binfmt_elf.c:load_elf_binary()`。
 pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
-    use crate::klib::errno::{EINVAL, ENOENT, ENOMEM, ENOEXEC};
+    use crate::klib::errno::{EINVAL, ENOENT, ENOMEM, ENOEXEC, ELOOP as ELOOP_ERR};
     use crate::elf::{parse_elf64, is_executable64, parse_phdr64, ElfPType};
     use crate::mm::{get_free_page, free_page, paging, page_align, PAGE_SIZE};
     use crate::umm::USERSPACE_START;
@@ -267,37 +269,82 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         Err(e) => { return e; }
     };
 
-    // 2. 从文件系统打开并读取 ELF（通过 VFS namei → read）
-    let fd = unsafe { crate::fs::open::sys_open(path, crate::fs::oflags::O_RDONLY, 0) };
-    if fd < 0 {
-        return fd;
-    }
-    let fd = fd as usize;
-
+    // 2. 从文件系统打开并读取 ELF（通过 VFS namei → read）。
+    // 支持 shebang（`#!interp [arg]`）：首两字节是 "#!" 时解析解释器行，
+    // 改为 exec 解释器本身，原脚本路径进 argv（Linux fs/binfmt_script.c）。
+    // 最多套 4 层（解释器本身也可能是脚本，如 busybox 的 #!/bin/sh）。
     let buf = crate::mm::get_free_page();
     if buf == 0 {
-        unsafe { crate::fs::open::sys_close(fd); }
         return -(ENOMEM as i64);
     }
-    let page_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, crate::mm::PAGE_SIZE) };
-    let n = unsafe { crate::fs::read_write::read(fd, page_slice) };
-    // Don't close fd yet — we'll need it for segment data loading
-    let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
-
-    // 3. 解析 ELF64
-    let header = match parse_elf64(elf_data) {
-        Ok(h) => h,
-        Err(_) => {
+    // shebang 注入的内核侧字符串（解释器路径与可选参数），argv 构建时用
+    let mut shebang_interp: Option<([u8; 128], usize)> = None;
+    let mut shebang_arg: Option<([u8; 128], usize)> = None;
+    let mut cur_path = [0u8; 128];
+    cur_path[..path.len().min(128)].copy_from_slice(&path[..path.len().min(128)]);
+    let mut cur_path_len = path.len().min(128);
+    let mut fd: usize = 0;
+    let mut n: i64 = 0;
+    let mut header = None;
+    for _depth in 0..4 {
+        let f = unsafe { crate::fs::open::sys_open(&cur_path[..cur_path_len], crate::fs::oflags::O_RDONLY, 0) };
+        if f < 0 {
             crate::mm::free_page(buf);
+            return f;
+        }
+        fd = f as usize;
+        let page_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, crate::mm::PAGE_SIZE) };
+        n = unsafe { crate::fs::read_write::read(fd, page_slice) };
+        let data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
+        if data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
+            // 解析 "#!interp [arg]\n"
+            let line_end = data.iter().position(|&c| c == b'\n').unwrap_or(data.len());
+            let line = &data[2..line_end];
+            // 跳过前导空白，取解释器路径（到空白为止），余下整体当一个参数
+            let mut i = 0;
+            while i < line.len() && (line[i] == b' ' || line[i] == b'\t') { i += 1; }
+            let istart = i;
+            while i < line.len() && line[i] != b' ' && line[i] != b'\t' { i += 1; }
+            let ipath = &line[istart..i];
+            while i < line.len() && (line[i] == b' ' || line[i] == b'\t') { i += 1; }
+            let iarg = &line[i..];
+            if ipath.is_empty() || ipath.len() > 127 {
+                unsafe { crate::fs::open::sys_close(fd); }
+                crate::mm::free_page(buf);
+                return -(ENOEXEC as i64);
+            }
+            let mut ib = [0u8; 128];
+            ib[..ipath.len()].copy_from_slice(ipath);
+            shebang_interp = Some((ib, ipath.len()));
+            if !iarg.is_empty() && iarg.len() <= 127 {
+                let mut ab = [0u8; 128];
+                ab[..iarg.len()].copy_from_slice(iarg);
+                shebang_arg = Some((ab, iarg.len()));
+            }
             unsafe { crate::fs::open::sys_close(fd); }
-            return -(ENOEXEC as i64);
+            cur_path = ib;
+            cur_path_len = ipath.len();
+            continue;
+        }
+        // 3. 解析 ELF64
+        match parse_elf64(data) {
+            Ok(h) if is_executable64(&h).is_ok() => { header = Some(h); break; }
+            _ => {
+                crate::mm::free_page(buf);
+                unsafe { crate::fs::open::sys_close(fd); }
+                return -(ENOEXEC as i64);
+            }
+        }
+    }
+    let header = match header {
+        Some(h) => h,
+        None => {
+            // 套了 4 层还是脚本
+            crate::mm::free_page(buf);
+            return -(ELOOP_ERR as i64);
         }
     };
-    if is_executable64(&header).is_err() {
-        crate::mm::free_page(buf);
-        unsafe { crate::fs::open::sys_close(fd); }
-        return -(ENOEXEC as i64);
-    }
+    let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
 
     // 3.5 PIE base
     let is_pie = header.e_type == 3;
@@ -679,18 +726,31 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         platform_va = put_const(b"x86_64", &mut cur);
 
         // argv：args.a1 是 char*[]（NULL 终止）。逐项拷字符串。
+        // shebang（#!/interp [arg]）时按 Linux binfmt_script 的语义重建 argv：
+        // [interp, arg?, script_path, 原 argv[1..]]。
         let argv_arr = args.a1;
+        let mut orig_idx: u64 = 0;
+        if let Some((ib, ilen)) = shebang_interp {
+            if argc < MAX_ARGS { argv_vas[argc] = put_const(&ib[..ilen], &mut cur); argc += 1; }
+            if let Some((ab, alen)) = shebang_arg {
+                if argc < MAX_ARGS { argv_vas[argc] = put_const(&ab[..alen], &mut cur); argc += 1; }
+            }
+            // 脚本路径（execve 的第一个参数）作为解释器的实参
+            if argc < MAX_ARGS { argv_vas[argc] = put_user(filename_ptr, &mut cur); argc += 1; }
+            orig_idx = 1; // 原 argv[0]（=脚本路径）已由 filename_ptr 提供
+        }
         if argv_arr != 0 {
             loop {
                 if argc >= MAX_ARGS { break; }
                 // 指针数组本身在 0x7f_… 高位（父进程栈），check_range 1GB 会判无效
                 // 导致 argc=0；用 user_ok（低段直过 + 高位查页表）。
-                if !user_ok(argv_arr + (argc as u64) * 8, 8, crate::mm::area::AccessMode::Read) { break; }
-                let p = core::ptr::read_volatile((argv_arr + (argc as u64) * 8) as *const u64);
+                if !user_ok(argv_arr + orig_idx * 8, 8, crate::mm::area::AccessMode::Read) { break; }
+                let p = core::ptr::read_volatile((argv_arr + orig_idx * 8) as *const u64);
                 if p == 0 { break; } // NULL 终止
                 let va = put_user(p, &mut cur);
                 argv_vas[argc] = va;
                 argc += 1;
+                orig_idx += 1;
             }
         }
         // argv[0] 可能为空（execve 无 argv）→ 用 filename 补 argv[0]
@@ -828,6 +888,22 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         core::arch::asm!("wrmsr",
             in("ecx") 0xC000_0101u64, in("eax") 0u32, in("edx") 0u32,
             options(nomem, nostack, preserves_flags));
+    }
+
+    // 8.5 关闭 close-on-exec 的 fd（FD_CLOEXEC，open 的 O_CLOEXEC 或
+    // fcntl F_SETFD 设置）。原版 do_execve → flush_old_exec → close_files
+    // 按位图逐个 sys_close。
+    {
+        let nr = sched::current_index();
+        let coe = unsafe { (*sched::task_ptr(nr)).close_on_exec };
+        if coe != 0 {
+            for fd in 0..crate::fs::NR_OPEN {
+                if coe & (1u64 << fd) != 0 {
+                    close_one_fd(fd);
+                }
+            }
+            unsafe { (*sched::task_ptr(nr)).close_on_exec = 0 };
+        }
     }
 
     // 9. 改写 pt_regs：下次 iretq 到新程序入口
@@ -1368,9 +1444,18 @@ pub fn open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
+    // O_CLOEXEC 是「打开后设 FD_CLOEXEC」的约定，不是文件打开语义，
+    // 剥掉再往下传（fs 层不认识它）。
+    let flags = args.a1 as u32;
+    let cloexec = flags & crate::fs::oflags::O_CLOEXEC != 0;
     // SAFETY: 系统调用上下文，fs 层会睡（getblk/wait_on_buffer），
     // 所以只能在有 current 的任务里调——系统调用天然满足。
-    unsafe { crate::fs::open::sys_open(path, args.a1 as u32, args.a2 as u16) }
+    let fd = unsafe { crate::fs::open::sys_open(path, flags & !crate::fs::oflags::O_CLOEXEC, args.a2 as u16) };
+    if fd >= 0 && cloexec {
+        let nr = sched::current_index();
+        unsafe { (*sched::task_ptr(nr)).close_on_exec |= 1u64 << (fd as usize & 63) };
+    }
+    fd
 }
 
 /// 关闭文件。对应原版 `fs/open.c:sys_close()`。
@@ -1667,19 +1752,83 @@ pub fn getcwd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         return -(EINVAL as i64);
     }
     
-    // TODO: 实现 getcwd
-    // 目前返回 "/"
-    let cwd = b"/";
-    if size < cwd.len() + 1 {
-        return -(EINVAL as i64);
+    if !unsafe { user_ok(args.a0, size as u64, crate::mm::area::AccessMode::Write) } {
+        return -(EFAULT as i64);
     }
-    
-    // SAFETY: buf 已校验。
+
+    // 真实回溯：从 pwd 出发，反复在父目录里按 inode 号反查自己的名字，
+    // 直到 task 的 root（chroot 边界）。对应现代内核 prepend_path 沿
+    // d_parent 走的语义；本树没有 dcache，用「扫父目录」代替。
+    // SAFETY: 系统调用上下文。
     unsafe {
-        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf, cwd.len());
-        *buf.add(cwd.len()) = 0;
+        let nr = sched::current_index();
+        let t = sched::task_ptr(nr);
+        let pwd = (*t).pwd;
+        let root = (*t).root;
+        if pwd == usize::MAX {
+            return -(ENOENT as i64);
+        }
+        // 分量栈（自叶向根收集，输出时倒序）。深度封顶 32 层防路径死循环。
+        let mut comps: [([u8; 255], usize); 32] = [([0; 255], 0); 32];
+        let mut depth = 0usize;
+        let mut cur = pwd;
+        // 非 pwd/root 的中间 inode 是我们 lookup_one("..") 多拿的引用，用完要还。
+        while cur != root {
+            let cur_ino = crate::fs::inode::inode(cur).i_ino;
+            let parent = match crate::fs::namei::lookup_one(cur, b"..") {
+                Ok(p) => p,
+                Err(e) => {
+                    if cur != pwd { crate::fs::inode::iput(cur); }
+                    return -(e as i64);
+                }
+            };
+            if parent == cur {
+                // 到达文件系统根但不是 chroot 根（被卸载/孤儿目录）：
+                // 按原版 prepend_path 的语义报「不可达」。
+                if cur != pwd { crate::fs::inode::iput(cur); }
+                return -(ENOENT as i64);
+            }
+            let mut name = [0u8; 255];
+            let nlen = crate::fs::namei::lookup_ino_name(parent, cur_ino, &mut name);
+            // 换到父目录：还掉子目录的额外引用（pwd 是任务持有的，不还）
+            if cur != pwd { crate::fs::inode::iput(cur); }
+            let nlen = match nlen {
+                Some(n) if depth < 32 => n,
+                _ => {
+                    if parent != root { crate::fs::inode::iput(parent); }
+                    return if depth >= 32 { -(ENAMETOOLONG as i64) } else { -(ENOENT as i64) };
+                }
+            };
+            comps[depth] = (name, nlen);
+            depth += 1;
+            cur = parent;
+        }
+        // 末尾 cur==root 是 lookup_one 多拿的引用（0 次迭代时例外：pwd==root）
+        if depth > 0 { crate::fs::inode::iput(cur); }
+
+        // 组装 "/a/b/c"
+        let mut path_len = 1usize; // 开头的 '/'
+        for d in 0..depth {
+            path_len += 1 + comps[d].1;
+        }
+        if size < path_len + 1 {
+            return -(ERANGE as i64);
+        }
+        let mut w = buf;
+        if depth == 0 {
+            *w = b'/';
+            w = w.add(1);
+        } else {
+            for d in (0..depth).rev() {
+                *w = b'/';
+                w = w.add(1);
+                core::ptr::copy_nonoverlapping(comps[d].0.as_ptr(), w, comps[d].1);
+                w = w.add(comps[d].1);
+            }
+        }
+        *w = 0;
     }
-    
+
     buf as i64
 }
 
@@ -1895,10 +2044,27 @@ pub fn fcntl(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             }
             -(crate::klib::errno::EMFILE as i64)
         }
-        // F_GETFD
-        1 => 0,
-        // F_SETFD
-        2 => 0,
+        // F_GETFD：返回该 fd 的 close-on-exec 标志（FD_CLOEXEC=1）
+        1 => {
+            if fd < 0 || fd as usize >= crate::fs::NR_OPEN { return -(EBADF as i64); }
+            let nr = sched::current_index();
+            let coe = unsafe { (*sched::task_ptr(nr)).close_on_exec };
+            ((coe >> (fd as usize & 63)) & 1) as i64
+        }
+        // F_SETFD：按 arg 的 bit0 设/清 close-on-exec
+        2 => {
+            if fd < 0 || fd as usize >= crate::fs::NR_OPEN { return -(EBADF as i64); }
+            let nr = sched::current_index();
+            let t = unsafe { sched::task_ptr(nr) };
+            unsafe {
+                if arg & 1 != 0 {
+                    (*t).close_on_exec |= 1u64 << (fd as usize & 63);
+                } else {
+                    (*t).close_on_exec &= !(1u64 << (fd as usize & 63));
+                }
+            }
+            0
+        }
         // F_GETFL
         3 => {
             let filp_idx = unsafe { crate::fs::open::fd_to_filp(fd as usize) };
@@ -2067,6 +2233,7 @@ pub fn kill(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // pid == -1: send to all processes (except init)
     // pid < -1: send to all processes in pgrp |pid|
     let mut sent = 0i32;
+    let mut denied = 0i32;
     unsafe {
         for i in 0..crate::sched::NR_TASKS {
             let t = crate::sched::task_ptr(i);
@@ -2077,29 +2244,47 @@ pub fn kill(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
                 else if pid == -1 { tpid > 1 }
                 else { (*t).pgrp as i32 == -pid };
             if deliver {
-                crate::signal::send_sig(sig as u32, i, 0);
-                sent += 1;
+                if crate::signal::send_sig(sig as u32, i, 0) == 0 {
+                    sent += 1;
+                } else {
+                    denied += 1;
+                }
             }
         }
     }
-    if sent == 0 { -(crate::klib::errno::ESRCH as i64) } else { 0 }
+    // 全被权限拒 → EPERM；有目标但一个都没投出去且不是权限问题 → ESRCH
+    if sent > 0 { 0 }
+    else if denied > 0 { -(crate::klib::errno::EPERM as i64) }
+    else { -(crate::klib::errno::ESRCH as i64) }
 }
 
 /// 设置 alarm。对应原版 `kernel/sched.c:sys_alarm()`。
 pub fn alarm(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let seconds = args.a0 as u64;
-    crate::pr_warn!("sys_alarm: {} seconds (not implemented)", seconds);
-    0
+    // 等价于 setitimer(ITIMER_REAL, {seconds,0}, NULL)，返回旧的剩余秒数
+    let nr = sched::current_index();
+    let t = unsafe { sched::task_ptr(nr) };
+    let hz = sched::task::HZ;
+    let old = unsafe { (*t).it_real_value };
+    unsafe {
+        (*t).it_real_value = seconds * hz;
+        (*t).it_real_incr = 0;
+    }
+    (old / hz) as i64
 }
 
 /// 获取当前时间。对应原版 `kernel/time.c:sys_gettimeofday()`。
+/// 秒数 = startup_time（RTC）+ jiffies/HZ；微秒取当前秒的 tick 尾数。
 pub fn gettimeofday(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let tv = args.a0 as *mut TimeVal;
     let tz = args.a1 as *mut Timezone;
-    if tv.is_null() { return -(EFAULT as i64); }
     unsafe {
-        (*tv).tv_sec = 0;
-        (*tv).tv_usec = 0;
+        if !tv.is_null() {
+            let hz = sched::task::HZ;
+            let j = sched::jiffies();
+            (*tv).tv_sec = sched::current_time() as i64;
+            (*tv).tv_usec = ((j % hz) * 1_000_000 / hz) as i64;
+        }
         if !tz.is_null() {
             (*tz).tz_minuteswest = 0;
             (*tz).tz_dsttime = 0;
@@ -2497,21 +2682,56 @@ pub fn mount(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 /// 卸载文件系统。
 pub fn umount(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 设置/获取资源限制（`prlimit64`）。只支持当前进程；无资源限制子系统，
-/// 读取返回「无限」（-1），写入忽略。
+/// 设置/获取资源限制（`prlimit64`）。pid=0 操作当前进程，否则按 pid 查
+/// 任务表；权限规则同 [`setrlimit`]。
 pub fn prlimit64(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // prlimit64(pid, resource, new_limit, old_limit)
-    let _pid = args.a0 as i32;
-    let _resource = args.a1 as u32;
-    let _new_limit = args.a2;
+    let pid = args.a0 as i32;
+    let resource = args.a1 as usize;
+    let new_limit = args.a2;
     let old_limit = args.a3;
-    if old_limit != 0 {
-        let rlim = old_limit as *mut RLimit;
-        // SAFETY: 缺 verify_area，同 getrlimit 的限制。
-        unsafe {
-            (*rlim).rlim_cur = -1i64 as u64;
-            (*rlim).rlim_max = -1i64 as u64;
+    if resource >= sched::task::RLIM_NLIMITS {
+        return -(EINVAL as i64);
+    }
+    // pid==0 是自己；否则按 pid 找任务
+    let nr = if pid <= 0 {
+        sched::current_index()
+    } else {
+        let mut found = usize::MAX;
+        for i in 0..sched::NR_TASKS {
+            let t = unsafe { sched::task_ptr(i) };
+            if unsafe { (*t).state } != sched::task::TaskState::Unused
+                && unsafe { (*t).pid } == pid
+            {
+                found = i;
+                break;
+            }
         }
+        if found == usize::MAX {
+            return -(ESRCH as i64);
+        }
+        found
+    };
+    let t = unsafe { sched::task_ptr(nr) };
+    if old_limit != 0 {
+        let r = unsafe { (*t).rlim[resource] };
+        let rlim = old_limit as *mut RLimit;
+        // SAFETY: 用户指针，rlimit 是 POD。
+        unsafe { (*rlim).rlim_cur = r.rlim_cur; (*rlim).rlim_max = r.rlim_max; }
+    }
+    if new_limit != 0 {
+        // SAFETY: 用户指针，rlimit 是 POD。
+        let new = unsafe { (*(new_limit as *const RLimit)) };
+        let old = unsafe { (*t).rlim[resource] };
+        if new.rlim_cur > new.rlim_max {
+            return -(EINVAL as i64);
+        }
+        if new.rlim_max > old.rlim_max || new.rlim_cur > old.rlim_max {
+            if unsafe { (*t).euid } != 0 {
+                return -(EPERM as i64);
+            }
+        }
+        unsafe { (*t).rlim[resource] = sched::task::Rlimit { rlim_cur: new.rlim_cur, rlim_max: new.rlim_max }; }
     }
     0
 }
@@ -2834,27 +3054,74 @@ pub fn wait4(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // 页表恒等映射所以用户指针可直接写（还没有独立用户地址空间）。
     unsafe { crate::exit::sys_wait4(pid, args.a1, args.a2) }
 }
-/// 设置间隔定时器。没有定时器投递子系统（ITIMER_REAL→SIGALRM 未接），
-/// 接受设置但不起效；`old` 写回「未激活」。
+/// 设置间隔定时器。对应原版 `kernel/itimer.c:sys_setitimer()`。
+/// 三种定时器都在 `do_timer` 里递减并投递信号（REAL→SIGALRM、
+/// VIRTUAL→SIGVTALRM、PROF→SIGPROF），到期用 interval 重装。
 pub fn setitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let which = args.a0 as i32;
-    let _new = args.a1 as *const ItimerVal;
+    let new = args.a1 as *const ItimerVal;
     let old = args.a2 as *mut ItimerVal;
     if which < 0 || which > 2 {
         return -(EINVAL as i64);
     }
+    let nr = sched::current_index();
+    let t = unsafe { sched::task_ptr(nr) };
     if !old.is_null() {
-        // SAFETY: 缺 verify_area，同 sys_write 的限制。
-        unsafe {
-            (*old).it_interval.tv_sec = 0;
-            (*old).it_interval.tv_usec = 0;
-            (*old).it_value.tv_sec = 0;
-            (*old).it_value.tv_usec = 0;
-        }
+        // SAFETY: 用户指针，itimer 字段是 POD。
+        unsafe { write_itimer(old, t, which as usize) };
+    }
+    if new.is_null() {
+        return 0;
+    }
+    // SAFETY: 用户指针，itimer 字段是 POD。
+    let (val, inter) = unsafe { ((*new).it_value, (*new).it_interval) };
+    if val.tv_sec < 0 || val.tv_usec < 0 || val.tv_usec >= 1_000_000
+        || inter.tv_sec < 0 || inter.tv_usec < 0 || inter.tv_usec >= 1_000_000
+    {
+        return -(EINVAL as i64);
+    }
+    // timeval → tick：非零至少 1 tick（原版 1.0.9 是「sec*HZ + usec*HZ/1000000」，下取整）
+    let to_ticks = |tv: TimeVal| -> u64 {
+        if tv.tv_sec == 0 && tv.tv_usec == 0 { return 0; }
+        let hz = sched::task::HZ;
+        (tv.tv_sec as u64 * hz + (tv.tv_usec as u64 * hz) / 1_000_000).max(1)
+    };
+    unsafe {
+        let (v, i) = match which {
+            0 => (&mut (*t).it_real_value, &mut (*t).it_real_incr),
+            1 => (&mut (*t).it_virt_value, &mut (*t).it_virt_incr),
+            _ => (&mut (*t).it_prof_value, &mut (*t).it_prof_incr),
+        };
+        *v = to_ticks(val);
+        *i = to_ticks(inter);
     }
     0
 }
-/// 取间隔定时器。无定时器子系统 → 恒返回「未激活」。
+
+/// 把任务 `t` 的第 `which` 个 itimer 读成 itimerval 写到用户 `out`。
+///
+/// # Safety
+/// `out` 必须指向可写的用户 itimerval。
+unsafe fn write_itimer(out: *mut ItimerVal, t: *const sched::task::Task, which: usize) {
+    let (v, i) = unsafe {
+        match which {
+            0 => ((*t).it_real_value, (*t).it_real_incr),
+            1 => ((*t).it_virt_value, (*t).it_virt_incr),
+            _ => ((*t).it_prof_value, (*t).it_prof_incr),
+        }
+    };
+    let hz = sched::task::HZ;
+    let to_tv = |ticks: u64| TimeVal {
+        tv_sec: (ticks / hz) as i64,
+        tv_usec: ((ticks % hz) * 1_000_000 / hz) as i64,
+    };
+    // SAFETY: 契约转交。
+    unsafe {
+        (*out).it_value = to_tv(v);
+        (*out).it_interval = to_tv(i);
+    }
+}
+/// 取间隔定时器。对应原版 `kernel/itimer.c:sys_getitimer()`。
 pub fn getitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let which = args.a0 as i32;
     let v = args.a1 as *mut ItimerVal;
@@ -2864,13 +3131,10 @@ pub fn getitimer(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if which < 0 || which > 2 {
         return -(EINVAL as i64);
     }
-    // SAFETY: 缺 verify_area，同 sys_write 的限制。
-    unsafe {
-        (*v).it_interval.tv_sec = 0;
-        (*v).it_interval.tv_usec = 0;
-        (*v).it_value.tv_sec = 0;
-        (*v).it_value.tv_usec = 0;
-    }
+    let nr = sched::current_index();
+    let t = unsafe { sched::task_ptr(nr) };
+    // SAFETY: 用户指针，itimer 字段是 POD。
+    unsafe { write_itimer(v, t, which as usize) };
     0
 }
 
@@ -3203,8 +3467,15 @@ pub fn openat(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             return -(EBADF as i64);
         }
     }
+    // O_CLOEXEC 处理同 open()：剥掉标志、成功后置 close_on_exec 位。
+    let flags = args.a2 as u32;
+    let cloexec = flags & crate::fs::oflags::O_CLOEXEC != 0;
     // SAFETY: 同 sys_open。
-    let r = unsafe { crate::fs::open::sys_open(path, args.a2 as u32, args.a3 as u16) };
+    let r = unsafe { crate::fs::open::sys_open(path, flags & !crate::fs::oflags::O_CLOEXEC, args.a3 as u16) };
+    if r >= 0 && cloexec {
+        let nr = sched::current_index();
+        unsafe { (*sched::task_ptr(nr)).close_on_exec |= 1u64 << (r as usize & 63) };
+    }
     r
 }
 
@@ -3309,8 +3580,18 @@ pub fn getrusage(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 /// 资源限制。
 pub fn getrlimit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let resource = args.a0 as usize;
     let rlim = args.a1 as *mut RLimit;
-    if !rlim.is_null() { unsafe { (*rlim).rlim_cur = -1i64 as u64; (*rlim).rlim_max = -1i64 as u64; } }
+    if resource >= sched::task::RLIM_NLIMITS {
+        return -(EINVAL as i64);
+    }
+    if rlim.is_null() {
+        return -(EFAULT as i64);
+    }
+    let nr = sched::current_index();
+    let r = unsafe { (*sched::task_ptr(nr)).rlim[resource] };
+    // SAFETY: 用户指针，rlimit 是 POD。
+    unsafe { (*rlim).rlim_cur = r.rlim_cur; (*rlim).rlim_max = r.rlim_max; }
     0
 }
 
@@ -4133,9 +4414,10 @@ pub fn gettid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 }
 
 /// 秒级时间。对应原版 `kernel/time.c:sys_time()`。
-/// 没有 RTC 驱动，用 jiffies/HZ 当作开机以来的秒数。
+/// RTC 驱动已接：startup_time（CMOS）+ jiffies/HZ。
 pub fn time(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
-    let secs = (sched::jiffies() / crate::sched::task::HZ) as i64;
+    // startup_time（RTC）+ jiffies/HZ：不再是「从 0 起算的 tick 秒」
+    let secs = sched::current_time() as i64;
     let p = args.a0 as *mut i64;
     if !p.is_null() {
         // SAFETY: 缺 verify_area，同 sys_write 的限制。
@@ -4456,8 +4738,35 @@ pub fn getsid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
 }
 
-/// 设资源限制。没有 rlimit 强制机制，接受但不生效。
-pub fn setrlimit(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 设资源限制。对应原版 `kernel/sys.c:sys_setrlimit()`：
+/// 软限不能超过硬限，抬硬限要 root。限制本身存进 task 的 rlim 表，
+/// 由 brk/mmap/fork 等使用方查表强制。
+pub fn setrlimit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let resource = args.a0 as usize;
+    let rlim = args.a1 as *const RLimit;
+    if resource >= sched::task::RLIM_NLIMITS {
+        return -(EINVAL as i64);
+    }
+    if rlim.is_null() {
+        return -(EFAULT as i64);
+    }
+    let nr = sched::current_index();
+    let t = unsafe { sched::task_ptr(nr) };
+    // SAFETY: 用户指针，rlimit 是 POD。
+    let new = unsafe { ((*rlim).rlim_cur, (*rlim).rlim_max) };
+    let old = unsafe { (*t).rlim[resource] };
+    if new.0 > new.1 {
+        return -(EINVAL as i64);
+    }
+    // 抬硬限或软限超过旧硬限都要特权（原版 suser()）
+    if new.1 > old.rlim_max || new.0 > old.rlim_max {
+        if unsafe { (*t).euid } != 0 {
+            return -(EPERM as i64);
+        }
+    }
+    unsafe { (*t).rlim[resource] = sched::task::Rlimit { rlim_cur: new.0, rlim_max: new.1 }; }
+    0
+}
 /// 调度参数（优先级）。本树的 nice 值在 `getpriority`/`setpriority` 里，
 /// 这四个 POSIX 实时调度接口没有对应实现。
 pub fn sched_setparam(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
@@ -4682,6 +4991,11 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         (*child).utime = 0; (*child).stime = 0;
         (*child).signal = 0;
         (*child).exit_code = 0;
+        // fork/clone 不继承间隔定时器（fork(2)：「the child ... its interval
+        // timers are reset」），rlim 则随结构体复制继承。
+        (*child).it_real_value = 0; (*child).it_real_incr = 0;
+        (*child).it_virt_value = 0; (*child).it_virt_incr = 0;
+        (*child).it_prof_value = 0; (*child).it_prof_incr = 0;
         (*child).counter = (*parent).counter / 2;
         if (*child).counter == 0 { (*child).counter = 1; }
         (*parent).counter /= 2;

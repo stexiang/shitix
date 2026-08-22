@@ -449,6 +449,41 @@ fn do_timer(_irq: usize, regs: &mut crate::traps::PtRegs) {
         cur.stime += 1;
     }
 
+    // 间隔定时器（原版 sched.c:do_timer 里的 it_real 全表扫描 +
+    // it_virt/it_prof 的当前任务递减；1.0.9 这段在 do_timer 开头）。
+    // 到期发信号并用 incr 重装（incr=0 即一次性）。send_sig 只置位
+    // 并唤醒，中断上下文里安全。
+    unsafe {
+        // ITIMER_REAL：墙钟，对所有任务走（不管它在不在跑）
+        for i in 0..NR_TASKS {
+            let t = task_ptr(i);
+            if (*t).state == TaskState::Unused { continue; }
+            if (*t).it_real_value != 0 {
+                (*t).it_real_value -= 1;
+                if (*t).it_real_value == 0 {
+                    crate::signal::send_sig(crate::signal::Signal::SIGALRM as u32, i, 1);
+                    (*t).it_real_value = (*t).it_real_incr;
+                }
+            }
+        }
+        // ITIMER_VIRTUAL：只算用户态 tick
+        if regs.from_user() && cur.it_virt_value != 0 {
+            cur.it_virt_value -= 1;
+            if cur.it_virt_value == 0 {
+                crate::signal::send_sig(crate::signal::Signal::SIGVTALRM as u32, current_index(), 1);
+                cur.it_virt_value = cur.it_virt_incr;
+            }
+        }
+        // ITIMER_PROF：用户态+内核态都算
+        if cur.it_prof_value != 0 {
+            cur.it_prof_value -= 1;
+            if cur.it_prof_value == 0 {
+                crate::signal::send_sig(crate::signal::Signal::SIGPROF as u32, current_index(), 1);
+                cur.it_prof_value = cur.it_prof_incr;
+            }
+        }
+    }
+
     // 时间片递减。原版这段在 do_timer 末尾：
     //   if ((--current->counter)<=0) { current->counter = 0; need_resched = 1; }
     //

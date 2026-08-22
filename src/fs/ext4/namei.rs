@@ -98,6 +98,57 @@ pub unsafe fn find_entry(dir: usize, name: &[u8]) -> Option<u32> {
     }
 }
 
+/// 在目录中按 inode 号反查名字（getcwd 的 `..` 回溯用）。
+/// 与 [`find_entry`] 同款的整块读取 + DirIter 扫描，匹配条件换成 inode 号。
+/// 返回名字长度；名字拷进 `out`（不带 NUL）。
+///
+/// # Safety
+/// 只能在进程上下文调用。`dir` 是已 `iget` 的目录 inode。
+pub unsafe fn lookup_ino(dir: usize, ino: u32, out: &mut [u8; 255]) -> Option<usize> {
+    unsafe {
+        let sb_nr = inode::inode(dir).i_sb;
+        let dev = sb(sb_nr).s_dev;
+        let size = inode::inode(dir).i_size as u64;
+        let info = crate::fs::ext4::ops::full::ext4_info(sb_nr);
+        let fs_block = if info.fs_block_size > 0 { info.fs_block_size as u64 } else { BLOCK_SIZE as u64 };
+        let scale = (fs_block / BLOCK_SIZE as u64).max(1);
+
+        let mut lblock = 0u64;
+        while lblock * fs_block < size {
+            if scale <= 4 {
+                let mut buf = [0u8; 4096];
+                let nbytes = (scale as usize) * BLOCK_SIZE;
+                let mut valid = true;
+                for sub in 0..scale {
+                    let phys = crate::fs::ext4::ops::full::bmap(dir, (lblock * scale + sub) as u32, false);
+                    if phys == 0 { valid = false; break; }
+                    let bn = match buffer::bread(dev, phys, BLOCK_SIZE) {
+                        Some(b) => b, None => { valid = false; break; }
+                    };
+                    let d = bh(bn).data();
+                    let s = (sub as usize) * BLOCK_SIZE;
+                    buf[s..s + BLOCK_SIZE].copy_from_slice(&d[..BLOCK_SIZE]);
+                    buffer::brelse(bn);
+                }
+                if valid {
+                    for entry in DirIter::new(&buf[..nbytes]) {
+                        if entry.inode != ino { continue; }
+                        let nlen = entry.name_len as usize;
+                        let ns = entry.name_off;
+                        if ns + nlen <= nbytes && nlen <= out.len() {
+                            out[..nlen].copy_from_slice(&buf[ns..ns + nlen]);
+                            return Some(nlen);
+                        }
+                        return None;
+                    }
+                }
+            }
+            lblock += 1;
+        }
+        None
+    }
+}
+
 /// `lookup` — 在目录中查找名字并返回对应的 inode。
 /// 对应 minix 的 `minix_lookup()`。
 ///

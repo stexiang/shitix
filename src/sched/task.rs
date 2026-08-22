@@ -216,6 +216,56 @@ pub struct Task {
     pub sgid: u32,
     /// 文件系统组 ID。原版 `gid_t fsgid`
     pub fsgid: u32,
+
+    // ---- 间隔定时器。对应原版 task_struct 的 it_real_value/it_real_incr/
+    // it_virt_value/it_virt_incr/it_prof_value/it_prof_incr，单位都是 tick ----
+    /// ITIMER_REAL 剩余 tick（墙钟，do_timer 每 tick 全表递减）→ SIGALRM
+    pub it_real_value: u64,
+    /// ITIMER_REAL 重装值（0 = 一次性）
+    pub it_real_incr: u64,
+    /// ITIMER_VIRTUAL 剩余 tick（只算用户态时间）→ SIGVTALRM
+    pub it_virt_value: u64,
+    pub it_virt_incr: u64,
+    /// ITIMER_PROF 剩余 tick（用户态+内核态都算）→ SIGPROF
+    pub it_prof_value: u64,
+    pub it_prof_incr: u64,
+
+    // ---- 资源限制。对应原版 task_struct 的 rlim[RLIM_NLIMITS] ----
+    /// 资源限制表（{soft, hard} 对）。下标是 RLIMIT_* 常量。
+    pub rlim: [Rlimit; RLIM_NLIMITS],
+}
+
+/// 资源限制项。对应 `struct rlimit`。
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Rlimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+/// RLIM_NLIMITS（x86_64 共 16 项）
+pub const RLIM_NLIMITS: usize = 16;
+pub const RLIMIT_CPU: usize = 0;
+pub const RLIMIT_FSIZE: usize = 1;
+pub const RLIMIT_DATA: usize = 2;
+pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_CORE: usize = 4;
+pub const RLIMIT_RSS: usize = 5;
+pub const RLIMIT_NPROC: usize = 6;
+pub const RLIMIT_NOFILE: usize = 7;
+pub const RLIMIT_AS: usize = 9;
+/// RLIM_INFINITY
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// init 任务的默认限制（对应原版 INIT_RLIMITS）
+const fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
+    const INF: Rlimit = Rlimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY };
+    let mut r = [INF; RLIM_NLIMITS];
+    r[RLIMIT_STACK] = Rlimit { rlim_cur: 8 * 1024 * 1024, rlim_max: RLIM_INFINITY };
+    r[RLIMIT_CORE] = Rlimit { rlim_cur: 0, rlim_max: RLIM_INFINITY };
+    r[RLIMIT_NOFILE] = Rlimit { rlim_cur: crate::fs::NR_OPEN as u64, rlim_max: crate::fs::NR_OPEN as u64 };
+    r[RLIMIT_NPROC] = Rlimit { rlim_cur: NR_TASKS as u64, rlim_max: NR_TASKS as u64 };
+    r
 }
 
 impl Task {
@@ -265,6 +315,13 @@ impl Task {
             egid: 0,
             sgid: 0,
             fsgid: 0,
+            it_real_value: 0,
+            it_real_incr: 0,
+            it_virt_value: 0,
+            it_virt_incr: 0,
+            it_prof_value: 0,
+            it_prof_incr: 0,
+            rlim: default_rlimits(),
         }
     }
 

@@ -78,28 +78,28 @@ impl SysInfo {
         let hz = sched::task::HZ;
         info.uptime = (jiffies / hz) as i64;
 
-        // 负载平均值（简化版本，这里设为 0）
-        // TODO: 实现真实的负载计算
-        info.loads = [0; 3];
+        // 负载平均值：以「可运行任务数」为底做 1/5/15 分钟定点指数平均
+        // （定点 11 位，公式同内核 CALC_LOAD：load = load*(1-exp) + n*exp，
+        // EXP_1 = 1884/2048, EXP_5 = 2014/2048, EXP_15 = 2037/2048）。
+        // 每 5 秒（5*HZ tick）采样一次。
+        info.loads = update_loads();
 
         // 进程计数
         info.procs = count_tasks() as u16;
 
-        // 内存信息（使用 mm 模块获取）
-        // SAFETY: 只读内存统计
-        unsafe {
-            let (total, free, _, _) = mm_info();
-            info.totalram = total;
-            info.freeram = free;
-        }
+        // 内存信息（真实页分配器统计）
+        let (total, free) = mm_info();
+        info.totalram = total;
+        info.freeram = free;
 
-        // 交换空间（目前没有实现交换）
-        info.totalswap = 0;
-        info.freeswap = 0;
+        // 交换空间（页为单位）
+        info.totalswap = crate::mm::swap::total_slots() as u64;
+        info.freeswap = crate::mm::swap::nr_free_slots() as u64;
 
-        // 共享内存和缓冲区（目前没有实现）
+        // 共享内存没单独记账；缓冲区缓存头数固定 NR_BUFFERS
         info.sharedram = 0;
-        info.bufferram = 0;
+        info.bufferram = (crate::fs::buffer::NR_BUFFERS * crate::fs::buffer::BLOCK_SIZE
+            / crate::mm::PAGE_SIZE) as u64;
 
         // 高端内存（64 位架构没有高端内存）
         info.totalhigh = 0;
@@ -127,12 +127,59 @@ fn count_tasks() -> usize {
     count
 }
 
-/// 获取内存统计信息
-/// 返回 (total_pages, free_pages, shared_pages, buffer_pages)
-unsafe fn mm_info() -> (u64, u64, u64, u64) {
-    // TODO: 从 mm 模块获取真实的内存统计
-    // 目前返回占位值
-    (0, 0, 0, 0)
+/// 获取内存统计信息。返回 (totalram, freeram)，单位页。
+fn mm_info() -> (u64, u64) {
+    let total = (crate::mm::page_alloc::high_memory() / crate::mm::PAGE_SIZE) as u64;
+    let free = crate::mm::page_alloc::nr_free_pages() as u64;
+    (total, free)
+}
+
+/// 可运行任务数（含当前任务）。对应内核 `nr_running` 的采样。
+fn nr_running() -> u64 {
+    let mut n = 0;
+    // SAFETY: 只读任务表。
+    unsafe {
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state == sched::task::TaskState::Running {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// 定点 11 位的负载平均。对应内核 `avenrun[]` + `calc_load()`。
+static mut AVENRUN: [u64; 3] = [0; 3];
+static mut LAST_LOAD_TICK: u64 = 0;
+
+/// 每 5*HZ tick 采样一次 nr_running，更新三组指数平均。
+/// 返回定点值 * 2048（Linux sysinfo 的 loads 语义：需 /65536 得真实值，
+/// 这里直接给 SI_LOAD_SHIFT=16 的定点，与 struct sysinfo 的约定一致）。
+fn update_loads() -> [u64; 3] {
+    const FSHIFT: u32 = 11;
+    const EXP_1: u64 = 1884; // 1 分钟
+    const EXP_5: u64 = 2014; // 5 分钟
+    const EXP_15: u64 = 2037; // 15 分钟
+    let hz = sched::task::HZ;
+    // SAFETY: sysinfo 查询上下文，单线程路径。
+    unsafe {
+        let now = sched::jiffies();
+        let last = *core::ptr::addr_of!(LAST_LOAD_TICK);
+        if now >= last + 5 * hz || *core::ptr::addr_of!(AVENRUN) == [0; 3] {
+            *core::ptr::addr_of_mut!(LAST_LOAD_TICK) = now;
+            let n = nr_running() << FSHIFT;
+            let ar = &mut *core::ptr::addr_of_mut!(AVENRUN);
+            for (i, exp) in [EXP_1, EXP_5, EXP_15].iter().enumerate() {
+                let old = ar[i];
+                // calc_load: load = old*exp + n*(FIXED_1-exp)，再右移 FSHIFT
+                ar[i] = (old * exp + n * ((1 << FSHIFT) - exp)) >> FSHIFT;
+            }
+        }
+        let ar = *core::ptr::addr_of!(AVENRUN);
+        // 转成 sysinfo 的 SI_LOAD_SHIFT=16 定点
+        [ar[0] << 5, ar[1] << 5, ar[2] << 5]
+    }
 }
 
 /// 初始化 info 模块

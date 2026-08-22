@@ -38,5 +38,10 @@ pub unsafe fn init() {
         tty::init();
         keyboard::init();
         mem::init();
+        // 串口 RX 由轮询升级为 IRQ4（对应原版 serial.c 的 rs_init）。
+        // tty 队列先建好，中断处理才能往里塞字符。
+        if crate::irq::request_irq(4, crate::serial::irq_rx_handler, false).is_ok() {
+            crate::serial::enable_rx_irq();
+        }
     }
 }

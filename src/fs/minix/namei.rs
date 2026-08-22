@@ -100,6 +100,53 @@ pub unsafe fn find_entry(dir: usize, name: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+/// 在目录中按 inode 号反查名字（getcwd 的 `..` 回溯用）。
+/// 与 [`find_entry`] 同款的逐块扫描，匹配条件换成 inode 号。
+/// 返回名字长度；名字拷进 `out`（不带 NUL，截到 out.len()）。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn lookup_ino(dir: usize, ino: u32, out: &mut [u8; 255]) -> Option<usize> {
+    // SAFETY: 契约转交。
+    unsafe {
+        let sb_nr = inode::inode(dir).i_sb;
+        if sb_nr == NIL {
+            return None;
+        }
+        let dirsize = sb(sb_nr).s_dirsize;
+        let size = inode::inode(dir).i_size as u64;
+        let mut off = 0u64;
+        while off < size {
+            let block = (off / BLOCK_SIZE as u64) as u32;
+            let b = super::minix_bread(dir, block, false);
+            if b == NIL {
+                off = (block as u64 + 1) * BLOCK_SIZE as u64;
+                continue;
+            }
+            let mut in_block = (off % BLOCK_SIZE as u64) as usize;
+            while in_block + dirsize <= BLOCK_SIZE && off < size {
+                let raw = &bh(b).data()[in_block..in_block + dirsize];
+                let eino = u16::from_le_bytes([raw[0], raw[1]]);
+                if eino != 0 && eino as u32 == ino {
+                    let nraw = &raw[DIRENT_INO_SIZE..];
+                    let namelen = nraw.iter().position(|&c| c == 0).unwrap_or(dirsize - DIRENT_INO_SIZE);
+                    let nlen = namelen.min(out.len());
+                    out[..nlen].copy_from_slice(&nraw[..nlen]);
+                    buffer::brelse(b);
+                    return Some(nlen);
+                }
+                in_block += dirsize;
+                off += dirsize as u64;
+            }
+            buffer::brelse(b);
+            if in_block + dirsize > BLOCK_SIZE {
+                off = (block as u64 + 1) * BLOCK_SIZE as u64;
+            }
+        }
+        None
+    }
+}
+
 /// 往目录里加一项（inode 号先留 0，由调用方填）。
 /// 对应原版 `minix_add_entry()`。
 ///

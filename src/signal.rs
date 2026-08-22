@@ -342,8 +342,28 @@ pub fn send_sig(signum: u32, task_idx: usize, _priv: i32) -> i32 {
             return -1;
         }
 
-        // 权限检查：非特权只能向自己的进程组发送信号
-        // TODO: 实现完整的权限检查
+        // 权限检查（原版 kernel/signal.c:check_permission 的语义）：
+        // priv=1（内核路径，trap/exit/notify_parent）无条件放行；
+        // priv=0（sys_kill 用户路径）只允许：
+        //   - 发送者是 root（euid==0）
+        //   - 目标的 uid/suid 与发送者的 euid/uid 匹配（自己给自己发也算）
+        //   - SIGCONT 可以发给同 session 的进程（作业控制恢复用）
+        if _priv == 0 {
+            let me = sched::task_ptr(sched::current_index());
+            let (s_uid, s_euid, s_session) =
+                ((*me).uid, (*me).euid, (*me).session);
+            let (t_uid, t_suid, t_session) =
+                ((*task).uid, (*task).suid, (*task).session);
+            let allowed = s_euid == 0
+                || t_uid == s_euid
+                || t_suid == s_euid
+                || t_uid == s_uid
+                || t_suid == s_uid
+                || (signum == Signal::SIGCONT as u32 && s_session == t_session);
+            if !allowed {
+                return -1; // -EPERM（send_sig 的返回约定是 0/-1）
+            }
+        }
 
         // ---- 原版 generate() 的过滤，别省 ----
         // `kernel/signal.c:generate()` 在置位**之前**会先把「反正不会有动作」
