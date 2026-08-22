@@ -211,6 +211,47 @@ pub unsafe fn init_gdt() {
     }
 }
 
+/// 仅供 AP（应用处理器）启动时调用：装载与 BSP 相同的 GDT 和 IDT，
+/// 但 **不** `ltr` —— TSS 由 BSP 独占（AP 不跑用户任务，没有特权级
+/// 切换要用 rsp0），且 TSS 描述符已被 BSP 的 `ltr` 标成 busy，AP 再
+/// `ltr` 同一张会 #GP。
+///
+/// CS 用 retfq 重载到 `KERNEL_CS`：AP 醒来时 CS 是蹦床 GDT 的 0x18，
+/// 恰好等于本表的用户代码段索引，虽然 flat 段下继续执行不会出错，
+/// 但任何远转移都会拿错段，必须换掉。
+///
+/// # Safety
+/// 只在 AP 蹦床把执行权交给 Rust 后调用一次。调用者必须保证
+/// [`init_gdt`]/[`init_idt`] 已在 BSP 上完成（表已建好）。
+pub unsafe fn ap_load_tables() {
+    let gdt_ptr = DescriptorTablePointer {
+        limit: (size_of::<[GdtEntry; GDT_LEN]>() - 1) as u16,
+        base: core::ptr::addr_of!(GDT) as u64,
+    };
+    let idt_ptr = DescriptorTablePointer {
+        limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
+        base: core::ptr::addr_of!(IDT) as u64,
+    };
+    // SAFETY: 两张表都由 BSP 建好后不再改动；lretq 用的新 CS 是合法的
+    // 64 位内核代码段。栈操作是指令语义的一部分，不能声明 nostack。
+    unsafe {
+        core::arch::asm!(
+            "lgdt ({gdt})",
+            "lidt ({idt})",
+            "pushq {cs}",
+            "leaq 2f(%rip), %rax",
+            "pushq %rax",
+            "lretq",
+            "2:",
+            gdt = in(reg) &gdt_ptr,
+            idt = in(reg) &idt_ptr,
+            cs = in(reg) selector::KERNEL_CS as u64,
+            out("rax") _,
+            options(att_syntax, preserves_flags)
+        );
+    }
+}
+
 /// 改写 TSS.rsp0 —— 每次调度切到新任务时调用，让下一次从用户态陷入时
 /// 落到该任务自己的内核栈上。
 ///

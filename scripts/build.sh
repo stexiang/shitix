@@ -78,6 +78,14 @@ done
 
 mkdir -p "$OUT"
 
+step "汇编 AP 蹦床 (SMP 启动用)"
+# 必须先于 cargo build：lib.rs 用 include_bytes! 把蹦床二进制嵌进内核
+as --64 -o "$OUT/ap_trampoline.o" boot/ap_trampoline.S
+ld -m elf_x86_64 -Ttext 0x2000 --oformat=binary \
+    -o "$OUT/ap_trampoline.bin" "$OUT/ap_trampoline.o"
+tramp_size=$(stat -c%s "$OUT/ap_trampoline.bin")
+[[ "$tramp_size" -le 3840 ]] || die "AP 蹦床超出了信箱前的 3840 字节 ($tramp_size)"
+
 step "编译 Rust 内核 ($PROFILE)"
 # snap 版 cargo/rustc 走 snap-confine，而 snap-confine 的 AppArmor profile
 # 不允许 mmap /usr/local/**，于是 /etc/ld.so.preload 里的宿主机统计库加载失败，

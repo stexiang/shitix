@@ -1,9 +1,11 @@
 //! SMP 自检。
 //!
 //! 覆盖：APIC 寄存器定义、CPU 状态管理、LAPIC 检测与寄存器读写、
-//! IPI 发送（无真实 AP 时也能测 ICR 轮询）、LAPIC 定时器配置。
+//! IPI 发送（无真实 AP 时也能测 ICR 轮询）、LAPIC 定时器配置，
+//! 以及 AP 启动后的多核并行计算正确性（[`parallel_selftest`]）。
 
 use super::*;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// 主入口：运行所有 SMP 自检项。
 /// 返回 `true` 表示全部通过。
@@ -72,5 +74,73 @@ pub unsafe fn selftest() -> bool {
     check(!is_apic_initialized(), "APIC_INIT false");
     set_lapic_base(old_base);
 
+    // 8. 自旋锁基本语义（本核内）
+    let lock = SpinLock::new();
+    check(!lock.is_locked(), "SpinLock initial unlocked");
+    lock.lock();
+    check(lock.is_locked(), "SpinLock locked");
+    lock.unlock();
+    check(!lock.is_locked(), "SpinLock unlocked");
+
+    ok
+}
+
+// ---- 并行计算自检 ----
+
+/// 各核算出的部分和
+static PAR_RESULTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// 本次参与计算的核数（BSP 派工前写入）
+static PAR_NCPUS: AtomicUsize = AtomicUsize::new(1);
+/// 求和规模
+const PAR_N: u64 = 4_000_000;
+
+/// 被求和函数：确定性强、每步便宜、结果 < 1_000_003 保证总和不溢出 u64
+fn par_f(i: u64) -> u64 {
+    (i * i + 3 * i + 7) % 1_000_003
+}
+
+/// 派到每个核上的 worker：算自己那一截的部分和
+extern "C" fn par_job(cpu: usize, _arg: usize) {
+    let ncpu = PAR_NCPUS.load(Ordering::Relaxed) as u64;
+    let chunk = PAR_N / ncpu;
+    let start = cpu as u64 * chunk;
+    let end = if cpu as u64 + 1 == ncpu { PAR_N } else { start + chunk };
+    let mut s = 0u64;
+    for i in start..end {
+        s += par_f(i);
+    }
+    PAR_RESULTS[cpu].store(s, Ordering::Release);
+}
+
+/// 多核并行计算自检：所有在线核（含 BSP）各算一段
+/// `sum (i*i + 3i + 7) % 1000003`，汇总后与 BSP 单核算出的参考值对照。
+/// 单核环境（无 AP）同样成立：唯一 worker 就是 BSP 自己。
+pub fn parallel_selftest() -> bool {
+    let ncpu = get_cpu_count() as usize;
+    PAR_NCPUS.store(ncpu, Ordering::Relaxed);
+    for r in &PAR_RESULTS {
+        r.store(0, Ordering::Relaxed);
+    }
+
+    run_on_all_cpus(par_job, 0);
+
+    let mut par = 0u64;
+    for r in PAR_RESULTS.iter().take(ncpu) {
+        par += r.load(Ordering::Relaxed);
+    }
+
+    let mut serial = 0u64;
+    for i in 0..PAR_N {
+        serial += par_f(i);
+    }
+
+    let ok = par == serial;
+    crate::sprintln!(
+        "smp parallel: {} CPU(s), sum={} ref={} {}",
+        ncpu,
+        par,
+        serial,
+        if ok { "ok" } else { "FAIL" }
+    );
     ok
 }

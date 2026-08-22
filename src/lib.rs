@@ -148,6 +148,15 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     let smp_ok = unsafe { smp::tests::selftest() };
     sprintln!("smp: done ({})", if smp_ok { "ok" } else { "FAIL" });
 
+    // 真正启动 SMP：映射 LAPIC MMIO、使能 BSP LAPIC、按 INIT-SIPI-SIPI
+    // 拉起所有 AP。必须在用户进程创建之前调（此时 cr3 是内核引导 PML4，
+    // 低 1GB 恒等映射完好，蹦床与信箱都靠它）。AP 起来后停在派工等待
+    // 循环里，不参与调度。
+    smp::smp_init();
+    if !smp::tests::parallel_selftest() {
+        sprintln!("smp: parallel selftest FAIL");
+    }
+
     // ---- 模块 5：文件系统与设备驱动 ----
     // 顺序对应原版 start_kernel()：buffer_init/inode_init/file_table_init
     // → blk_dev_init/chr_dev_init → mount_root

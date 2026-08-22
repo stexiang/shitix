@@ -19,6 +19,10 @@ pub mod flags {
     pub const PRESENT: u64 = 1 << 0;
     pub const RW: u64 = 1 << 1;
     pub const USER: u64 = 1 << 2;
+    /// 页级写穿（bit 3）。MMIO 映射用。
+    pub const PWT: u64 = 1 << 3;
+    /// 页级禁用缓存（bit 4）。MMIO（如 LAPIC 0xFEE00000）必须禁缓存。
+    pub const PCD: u64 = 1 << 4;
     pub const ACCESSED: u64 = 1 << 5;
     pub const DIRTY: u64 = 1 << 6;
     /// 2MB/1GB 大页标记（原版 32 位内核未用到，setup.S 建映射时用了）
