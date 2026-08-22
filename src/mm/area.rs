@@ -53,7 +53,7 @@ pub fn verify_area(pml4: usize, vaddr: u64, len: u64, mode: AccessMode) -> i64 {
                 // 下一轮循环重新 get_page_flags 拿到 PRESENT。glibc 的 read/write
                 // 缓冲区常是 malloc 刚 mmap 出来的保留页，不 resolve 会 EFAULT。
                 if unsafe { paging::is_reserved(pml4, cur as usize) }
-                    && unsafe { paging::resolve_reserved(pml4, cur as usize) }
+                    && unsafe { crate::mm::mmap_vma::resolve_any(crate::sched::current_index(), pml4, cur as usize) }
                 {
                     continue;
                 }
@@ -98,7 +98,7 @@ pub unsafe fn copy_from_user(kern_dst: *mut u8, user_src: u64, len: usize, pml4:
         if phys.is_none() {
             // 惰性分配页（mmap/brk 的 RESERVED、PRESENT=0）：先落实再重查。
             if paging::is_reserved(pml4, src_va as usize)
-                && unsafe { paging::resolve_reserved(pml4, src_va as usize) }
+                && unsafe { crate::mm::mmap_vma::resolve_any(crate::sched::current_index(), pml4, src_va as usize) }
             {
                 phys = unsafe { paging::translate(pml4, src_va as usize) };
             }
@@ -141,7 +141,7 @@ pub unsafe fn copy_to_user(user_dst: u64, kern_src: *const u8, len: usize, pml4:
         if phys.is_none() {
             // 惰性分配页：先落实再重查。
             if paging::is_reserved(pml4, dst_va as usize)
-                && unsafe { paging::resolve_reserved(pml4, dst_va as usize) }
+                && unsafe { crate::mm::mmap_vma::resolve_any(crate::sched::current_index(), pml4, dst_va as usize) }
             {
                 phys = unsafe { paging::translate(pml4, dst_va as usize) };
             }

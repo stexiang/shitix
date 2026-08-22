@@ -305,6 +305,9 @@ fn mm_selftest() {
     let held = free0 as isize - mm::nr_free_pages() as isize;
     kprintln!("free pages now: {} (start {}), page tables held={} (expect 2)",
              mm::nr_free_pages(), free0, held);
+
+    // 4. vmalloc：非连续物理页映射成连续虚拟区间
+    mm::vmalloc::selftest();
     serial::print("mm: selftest done\n");
 }
 
@@ -737,6 +740,55 @@ fn syscall_selftest() {
     };
     kprintln!("syscall: splice/tee -> {}", if sp_ok { "ok" } else { "FAIL" });
 
+    // ---- pipe 的 select/poll 真实就绪（读端空不就绪、有数据就绪、
+    //      写端未满就绪、写端关闭后读端 EOF 就绪）----
+    let psel_ok = unsafe {
+        let mut fds = [0i32; 2];
+        let p = syscall::syscall3(nr::PIPE, fds.as_mut_ptr() as u64, 0, 0);
+        if p != 0 || fds[0] < 0 {
+            false
+        } else {
+            let (rfd, wfd) = (fds[0] as u64, fds[1] as u64);
+            // poll：空管道读端不就绪，写端可写就绪。
+            let mut pfd_r = syscall::sys::PollFd { fd: rfd as i32, events: 1, revents: 0 };
+            let mut pfd_w = syscall::sys::PollFd { fd: wfd as i32, events: 4, revents: 0 };
+            let n0 = syscall::syscall3(nr::POLL,
+                &mut pfd_r as *mut _ as u64, 1, 0);
+            let n1 = syscall::syscall3(nr::POLL,
+                &mut pfd_w as *mut _ as u64, 1, 0);
+            let empty_ok = n0 == 0 && pfd_r.revents == 0
+                && n1 == 1 && pfd_w.revents & 4 != 0;
+            // 灌数据后读端就绪。
+            let pin = crate::fs::pipe::fd_to_pipe(wfd as usize).unwrap();
+            crate::fs::pipe::pipe_write_kernel(pin, b"x".as_ptr(), 1);
+            let mut pfd_r2 = syscall::sys::PollFd { fd: rfd as i32, events: 1, revents: 0 };
+            let n2 = syscall::syscall3(nr::POLL,
+                &mut pfd_r2 as *mut _ as u64, 1, 0);
+            let data_ok = n2 == 1 && pfd_r2.revents & 1 != 0;
+            // select：只把读端放进 readfds，空读端应消耗掉数据后再查。
+            let mut out = [0u8; 1];
+            let pout = crate::fs::pipe::fd_to_pipe(rfd as usize).unwrap();
+            crate::fs::pipe::pipe_read_kernel(pout, out.as_mut_ptr(), 1);
+            let mut rset: u64 = 1 << rfd;
+            let mut wset: u64 = 1 << wfd;
+            let ns = syscall::syscall6(nr::SELECT, (wfd as usize + 1) as u64,
+                &mut rset as *mut u64 as u64, &mut wset as *mut u64 as u64,
+                0, 0, 0);
+            // 空管道：读端不就绪，写端就绪；且读端不能出现在 writefds、
+            // 写端不能出现在 readfds（方向校验）。
+            let sel_ok = ns == 1 && rset == 0 && wset == (1 << wfd);
+            // 关掉写端 → 读端 EOF 就绪（POLLIN）。
+            syscall::syscall3(nr::CLOSE, wfd, 0, 0);
+            let mut pfd_r3 = syscall::sys::PollFd { fd: rfd as i32, events: 1, revents: 0 };
+            let n3 = syscall::syscall3(nr::POLL,
+                &mut pfd_r3 as *mut _ as u64, 1, 0);
+            let eof_ok = n3 == 1 && pfd_r3.revents & 1 != 0;
+            syscall::syscall3(nr::CLOSE, rfd, 0, 0);
+            empty_ok && data_ok && sel_ok && eof_ok
+        }
+    };
+    kprintln!("syscall: pipe select/poll readiness -> {}", if psel_ok { "ok" } else { "FAIL" });
+
     // ---- 第二批补齐的 syscall：rt_sigpending/capget/sched_getattr/syslog/
     //      close_range/execveat。都是内核态直接调 int 0x80 链路。----
     let batch_ok = unsafe {
@@ -952,6 +1004,9 @@ fn build_shell_elf() -> (&'static [u8], usize) {
 }
 
 fn fs_init_thread(_arg: u64) {
+    // swap 自检在 LFS/自检两种模式下都跑（用的是 ramdisk，两种模式下
+    // 此刻都没被文件系统占用；selftest 结束即 swapoff）。
+    crate::mm::swap::selftest();
     if LFS_BOOT {
         sprintln!("LFS: === LFS boot mode ===");
 

@@ -478,7 +478,16 @@ unsafe fn get_free_page_locked() -> usize {
 /// 取一页并清零。对应原版 `mm.h` 里的 inline `get_free_page()`
 /// （它在 `__get_free_page` 之后做 `rep stosl`）。
 pub fn get_free_page() -> usize {
-    let page = get_free_page_raw();
+    let mut page = get_free_page_raw();
+    // OOM 且 swap 已启用：从当前任务换出一页再重试（对应原版
+    // get_free_page 失败后 try_to_free_page → swap_out 的回收路径）。
+    // 只在进程上下文做——中断里不能跑块 I/O。
+    if page == 0 && crate::mm::swap::is_active() {
+        // SAFETY: 进程上下文；reclaim_once 内部会跑缓冲缓存 I/O（可能睡）。
+        if unsafe { crate::mm::swap::reclaim_once() } {
+            page = get_free_page_raw();
+        }
+    }
     // 返回 0 只有「真的没内存」一种合法解释。计数还剩几万页却拿到 0，
     // 说明链表或返回值出了问题——上层看到的是「out of memory」，离原因
     // 极远（实测：ramdisk init 在第 19/21/26 页突然 OOM，而空闲页 65214）。

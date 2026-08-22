@@ -10,14 +10,17 @@
 //! | [`paging`] | `mm/memory.c` 的 `put_page`/`remap_page_range`/`invalidate` |
 //! | [`page_ref`] | COW 页面引用计数管理 |
 //!
-//! 尚未移植的部分：`mm/swap.c` 的换页（缺块设备）、`mm/vmalloc.c`（依赖前两者）。
+//! 尚未移植的部分：`mm/swap.c` 已移植（[`swap`]，无 LRU/swap cache 的简化版）。
 
 pub mod area;
 pub mod kmalloc;
+pub mod mmap_vma;
 pub mod page;
 pub mod page_alloc;
 pub mod paging;
 pub mod page_ref;
+pub mod swap;
+pub mod vmalloc;
 
 pub use kmalloc::{kfree, kmalloc, kzalloc};
 pub use page::{PAGE_SIZE, page_align};

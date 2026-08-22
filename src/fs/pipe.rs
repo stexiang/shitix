@@ -99,6 +99,33 @@ pub fn fd_dir(fd: usize) -> u8 {
     unsafe { if fd < MAX_PIPE_FD { PIPE_FD_DIR[cur()][fd] } else { PIPE_DIR_READ } }
 }
 
+/// select/poll 的就绪状态查询。返回 (readable, writable, hangup)。
+///
+/// 对应原版 `pipe_select()`：读端在「有数据」或「写端全部关闭（EOF）」时
+/// 可读；写端在「环缓冲未满」时可写，读端全部关闭时写会 EPIPE，poll 语义
+/// 报 hangup。非管道 fd 不应调用（调用方先 `fd_is_pipe`）。
+pub fn fd_poll_status(fd: usize) -> (bool, bool, bool) {
+    unsafe {
+        let idx = match fd_to_pipe(fd) { Some(i) => i, None => return (false, false, false) };
+        let page = PIPE_PAGES[idx];
+        if page == 0 { return (false, false, true); }
+        let m = meta(page);
+        match fd_dir(fd) {
+            PIPE_DIR_READ => {
+                let readable = (*m).len > 0 || (*m).writers == 0;
+                (readable, false, false)
+            }
+            _ => {
+                if (*m).readers == 0 {
+                    (false, false, true) // 写会得到 EPIPE
+                } else {
+                    (false, (*m).len < ring_size(), false)
+                }
+            }
+        }
+    }
+}
+
 /// 复制一个管道 fd（dup / dup2 / fcntl F_DUPFD 用）：
 /// `newfd` 指向同一个管道的同一端，并给对应端加一次引用计数。
 /// 返回 false 表示 oldfd 不是管道 fd。

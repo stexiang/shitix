@@ -31,6 +31,8 @@ pub mod flags {
     /// 物理页待首次访问时再分配」（对应 Linux mmap/brk 的惰性语义）。
     /// 用 bit 9（x86_64 软件可用位），不与 PRESENT/RW/USER 冲突。
     pub const RESERVED: u64 = 1 << 9;
+    /// 换出到 swap 的页（PRESENT=0 + SWAPPED，bits 12+ 存槽号）。
+    pub const SWAPPED: u64 = 1 << 10;
     pub const NO_EXEC: u64 = 1 << 63;
 
     /// 同原版 `PAGE_SHARED`：present + rw + user
@@ -42,7 +44,7 @@ pub mod flags {
 }
 
 /// 抹掉标志位、取出物理地址的掩码（52 位物理地址空间）。
-const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+pub const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 /// 高半区直接映射基址：物理 0..1GB 映射到 `PHYS_MAP_BASE .. PHYS_MAP_BASE+1GB`。
 ///
@@ -187,6 +189,46 @@ pub unsafe fn map_page(pml4: usize, vaddr: usize, paddr: usize, prot: u64) -> bo
         let Some(pd) = next_level(pdpt, pdpt_index(vaddr), user) else { return false };
         let Some(pt) = next_level(pd, pd_index(vaddr), user) else { return false };
         set_entry(pt, pt_index(vaddr), (page_base(paddr) as u64) | prot | flags::PRESENT);
+    }
+    invalidate_page(vaddr);
+    true
+}
+
+/// 读叶子页表项原值（即使 PRESENT=0，如 RESERVED/SWAPPED 项）。
+/// 中间层缺页或遇巨页时返回 None。
+///
+/// # Safety
+/// 同 [`translate`]。
+pub unsafe fn leaf_entry(pml4: usize, vaddr: usize) -> Option<u64> {
+    // SAFETY: 逐级查 PRESENT 再下钻（SWAPPED/RESERVED 叶子只在 PRESENT 的
+    // 中间层之下出现）。
+    unsafe {
+        let e = entry(pml4, pml4_index(vaddr));
+        if e & flags::PRESENT == 0 { return None; }
+        let pdpt = (e & ADDR_MASK) as usize;
+        let e = entry(pdpt, pdpt_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 { return None; }
+        let pd = (e & ADDR_MASK) as usize;
+        let e = entry(pd, pd_index(vaddr));
+        if e & flags::PRESENT == 0 || e & flags::HUGE != 0 { return None; }
+        let pt = (e & ADDR_MASK) as usize;
+        Some(entry(pt, pt_index(vaddr)))
+    }
+}
+
+/// 直接写叶子页表项原值（可以是 PRESENT=0 的 SWAPPED/RESERVED 项）。
+/// 中间表按需创建；普通映射请走 [`map_page`]。
+///
+/// # Safety
+/// 同 [`map_page`]。
+pub unsafe fn set_leaf_entry(pml4: usize, vaddr: usize, val: u64) -> bool {
+    let user = val & flags::USER != 0;
+    // SAFETY: 契约同 map_page；中间级由 next_level 建表。
+    unsafe {
+        let Some(pdpt) = next_level(pml4, pml4_index(vaddr), user) else { return false };
+        let Some(pd) = next_level(pdpt, pdpt_index(vaddr), user) else { return false };
+        let Some(pt) = next_level(pd, pd_index(vaddr), user) else { return false };
+        set_entry(pt, pt_index(vaddr), val);
     }
     invalidate_page(vaddr);
     true
@@ -392,6 +434,13 @@ pub unsafe fn unmap_page(pml4: usize, vaddr: usize) -> Option<usize> {
         let pt = (e & ADDR_MASK) as usize;
         let e = entry(pt, pt_index(vaddr));
         if e & flags::PRESENT == 0 {
+            if e & flags::RESERVED != 0 {
+                // RESERVED（惰性分配）叶子：munmap/错误回滚也要摘掉，
+                // 否则区间内残留的保留项会让之后的访问误解析成匿名页。
+                // 无物理页可还，返回 None。
+                set_entry(pt, pt_index(vaddr), 0);
+                invalidate_page(vaddr);
+            }
             return None;
         }
         set_entry(pt, pt_index(vaddr), 0);
@@ -634,6 +683,17 @@ pub unsafe fn cow_copy_page_table(src_pml4: usize, dst_pml4: usize) -> bool {
                             | (pd_i << 21) | (pt_i << 12);
                         let prot = pte & (flags::RW | flags::USER | flags::NO_EXEC);
                         if !unsafe { map_reserved(dst_pml4, vaddr, prot) } {
+                            return false;
+                        }
+                        continue;
+                    }
+                    // 已换出页（PRESENT=0 + SWAPPED）：父子共享同一 swap 槽，
+                    // 槽位引用计数 +1（原版 swap_duplicate()）。
+                    if pte & flags::SWAPPED != 0 {
+                        let vaddr = (pml4_i << 39) | (pdpt_i << 30)
+                            | (pd_i << 21) | (pt_i << 12);
+                        crate::mm::swap::slot_ref_inc((pte >> 12) as u32);
+                        if !unsafe { set_leaf_entry(dst_pml4, vaddr, pte) } {
                             return false;
                         }
                         continue;

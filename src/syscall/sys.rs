@@ -311,6 +311,8 @@ pub fn execve(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         (*me).tss.cr3 = 0;
         old
     };
+    // 旧地址空间的 file-backed mmap VMA 记账全部作废（新程序重新 mmap）。
+    crate::mm::mmap_vma::clear(sched::current_index());
 
     // 5. 分配新 PML4
     let new_pml4 = paging::alloc_pml4();
@@ -1499,7 +1501,19 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         let mut pg_flags = paging::flags::USER | paging::flags::PRESENT;
         if prot & PROT_WRITE != 0 { pg_flags |= paging::flags::RW; }
 
-        // File-backed MAP_PRIVATE: read file content into pages
+        // MAP_FIXED（addr != 0）：Linux 语义是先清掉目标区间的旧映射
+        // 再覆盖。glibc 动态链接器对共享库就是「整文件先 map 一次再逐段
+        // MAP_FIXED 重 map」，不清旧 VMA 会被 VMA 重叠检查拒绝成 ENOMEM。
+        if addr != 0 {
+            let task = sched::current_index();
+            crate::mm::mmap_vma::remove_range(
+                task, map_addr, map_addr + npages * crate::mm::PAGE_SIZE,
+            );
+        }
+        // File-backed MAP_PRIVATE: 惰性映射——只建 RESERVED 叶子 + 记 VMA，
+        // 文件内容等第一次访问时由 page fault 路径按 (sb, ino, offset) 读入。
+        // 旧实现 eager 逐页 read：glibc 动态链接器 map libc 数 MB 文本，
+        // 进程实际只触碰一小部分，eager 既慢又白占物理页。
         if flags & MAP_ANONYMOUS == 0 && flags & MAP_PRIVATE != 0 {
             let fd = fd as i64;
             if fd < 0 { return -(EBADF as i64); }
@@ -1507,62 +1521,41 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             if f == crate::fs::inode::NIL { return -(EBADF as i64); }
             let ino = unsafe { crate::fs::file_table::filp(f).f_inode };
             if ino == crate::fs::inode::NIL { return -(EBADF as i64); }
-            let fsize = unsafe { crate::fs::inode::inode(ino).i_size as u64 };
+            let (i_ino, i_sb) = unsafe {
+                let i = crate::fs::inode::inode(ino);
+                (i.i_ino, i.i_sb)
+            };
+            if i_sb == crate::fs::inode::NIL { return -(EBADF as i64); }
 
-            let mut mapped = 0usize;
             for i in 0..npages {
-                let pg = get_free_page();
-                if pg == 0 {
-                    // ENOMEM 时回滚已映射的页，别泄漏（旧实现直接 return 漏掉）。
-                    for k in 0..mapped {
-                        let va = map_addr + k * crate::mm::PAGE_SIZE;
-                        if let Some(phys) = paging::translate(pml4, va) {
-                            paging::unmap_page(pml4, va);
-                            free_page(phys);
-                        }
-                    }
-                    return -(ENOMEM as i64);
-                }
                 let va = map_addr + i * crate::mm::PAGE_SIZE;
-                if !paging::map_page(pml4, va, pg, pg_flags) {
-                    free_page(pg);
-                    for k in 0..mapped {
-                        let va = map_addr + k * crate::mm::PAGE_SIZE;
-                        if let Some(phys) = paging::translate(pml4, va) {
-                            paging::unmap_page(pml4, va);
-                            free_page(phys);
-                        }
-                    }
+                if !unsafe { paging::map_reserved(pml4, va, pg_flags) } {
+                    crate::pr_warn!("mmap: map_reserved fail va={:#x} len={}", va, len);
                     return -(ENOMEM as i64);
                 }
-                mapped += 1;
-                // 从文件读取本页内容。
-                // 关键 bug 修复：mmap 的 `offset` 语义是「从文件的 offset 处开始
-                // 映射」，与 fd 的 f_pos 无关。旧实现直接 read(fd,..) 靠 f_pos 推进，
-                // 只对 offset==0 且逐页连续的情况碰巧正确；动态链接器按段文件偏移
-                // mmap libc 的每个 LOAD 段（offset 常非 0），靠 f_pos 会读到错页，
-                // 把 libc 的代码装成别的数据。这里 lseek 到 file_off 再读。
-                //
-                // 同时允许映射越过文件末尾（POSIX 语义：越界字节读作 0）：glibc
-                // 的段映射 memsz>=filesz（BSS 在文件末尾之外），旧代码 `map_end>fsize
-                // → EINVAL` 会误拒这种合法映射。
-                let file_off = offset + (i * crate::mm::PAGE_SIZE) as u64;
-                let map_bytes = core::cmp::min(crate::mm::PAGE_SIZE as u64, len - (i * crate::mm::PAGE_SIZE) as u64);
-                let avail = if file_off < fsize { fsize - file_off } else { 0 };
-                let read_len = core::cmp::min(map_bytes, avail) as usize;
-                if read_len > 0 {
-                    let buf = unsafe { core::slice::from_raw_parts_mut((crate::mm::paging::PHYS_MAP_BASE + pg) as *mut u8, read_len) };
-                    unsafe {
-                        crate::fs::read_write::lseek(fd as usize, file_off as i64, crate::fs::SEEK_SET);
-                        let mut filled = 0usize;
-                        while filled < read_len {
-                            let n = crate::fs::read_write::read(fd as usize, &mut buf[filled..]);
-                            if n <= 0 { break; }
-                            filled += n as usize;
-                        }
-                    }
+            }
+            let task = sched::current_index();
+            let vma = crate::mm::mmap_vma::MmapVma {
+                start: map_addr,
+                end: map_addr + npages * crate::mm::PAGE_SIZE,
+                prot: pg_flags,
+                kind: crate::mm::mmap_vma::VmaKind::File {
+                    sb: i_sb,
+                    ino: i_ino,
+                    offset,
+                },
+            };
+            if !crate::mm::mmap_vma::add(task, vma) {
+                // 记账失败（表满/重叠）：回滚保留页，别让 VMA 缺失的
+                // reserved 页留在页表里——缺页时会落成匿名零页，mmap
+                // 语义悄悄错了比 ENOMEM 更难查。
+                for i in 0..npages {
+                    let va = map_addr + i * crate::mm::PAGE_SIZE;
+                    unsafe { paging::unmap_page(pml4, va) };
                 }
-                // 剩余部分（BSS / 越过文件末尾）保持 0（get_free_page 已清零）。
+                crate::pr_warn!("mmap: vma add fail va={:#x} npages={} task={} nrvma={}",
+                    map_addr, npages, task, crate::mm::mmap_vma::count(task));
+                return -(ENOMEM as i64);
             }
             return map_addr as i64;
         }
@@ -1600,8 +1593,13 @@ pub fn munmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             if let Some(phys) = paging::translate(pml4, va) {
                 paging::unmap_page(pml4, va);
                 free_page(phys);
+            } else {
+                // RESERVED（惰性）页 translate 不到物理地址，也要把叶子摘掉
+                paging::unmap_page(pml4, va);
             }
         }
+        // 摘掉覆盖区间的 file-backed VMA 记账
+        crate::mm::mmap_vma::remove_range(nr, addr, addr + npages * crate::mm::PAGE_SIZE);
         0
     }
 }
@@ -1635,9 +1633,27 @@ pub fn mprotect(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         if pml4 == 0 { return 0; }
         let mut va = start;
         while va < end {
-            paging::set_page_flags(pml4, va, new_flags);
+            if !paging::set_page_flags(pml4, va, new_flags) {
+                // 非 PRESENT 叶子：惰性保留页（RESERVED）/已换出页
+                // （SWAPPED）也要更新权限位，否则 glibc 对还没触碰过的
+                // RELRO 段 mprotect(PROT_READ) 会静默丢失，之后缺页
+                // 落实时又按旧 prot 落回可写。物理地址/槽号位原样保留。
+                if let Some(leaf) = paging::leaf_entry(pml4, va) {
+                    if leaf & (paging::flags::RESERVED | paging::flags::SWAPPED) != 0 {
+                        let keep = leaf & !(paging::flags::RW | paging::flags::USER
+                            | paging::flags::NO_EXEC);
+                        paging::set_leaf_entry(pml4, va, keep | new_flags);
+                    }
+                }
+            }
             va += PAGE_SIZE;
         }
+        // 同步更新被整段覆盖的 file-backed VMA 的 prot（部分覆盖的
+        // 不拆 VMA——叶子权限已经改对，VMA prot 只影响尚未触碰的
+        // 惰性页，少见，按保守处理跳过）。
+        let prot_bits = new_flags & (paging::flags::RW | paging::flags::USER
+            | paging::flags::NO_EXEC);
+        crate::mm::mmap_vma::set_prot(sched::current_index(), start, end, prot_bits);
     }
     0
 }
@@ -2368,15 +2384,13 @@ pub fn poll(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             if fd < 0 { continue; }
             let fd = fd as usize;
 
-            // Pipe fds
+            // Pipe fds：真实就绪状态（有数据/EOF 可读，未满可写，
+            // 对端全关报 POLLHUP）。
             if crate::fs::pipe::fd_is_pipe(fd) {
-                if pfd.events & 1 != 0 { // POLLIN
-                    // Check if pipe has data - simplified: always ready
-                    pfd.revents |= 1;
-                }
-                if pfd.events & 4 != 0 { // POLLOUT
-                    pfd.revents |= 4;
-                }
+                let (rd, wr, hup) = crate::fs::pipe::fd_poll_status(fd);
+                if rd && pfd.events & 1 != 0 { pfd.revents |= 1; }  // POLLIN
+                if wr && pfd.events & 4 != 0 { pfd.revents |= 4; }  // POLLOUT
+                if hup { pfd.revents |= 0x10; }                     // POLLHUP
                 if pfd.revents != 0 { ready += 1; }
                 continue;
             }
@@ -2404,10 +2418,16 @@ pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
     if nfds > 1024 { return -(EINVAL as i64); }
     let nwords = (nfds + 63) / 64;
-    let mut total_ready = 0i64;
 
-    // Clear output sets
+    // 先快照输入掩码（输出要原地清空，直接改会把「用户关心哪些 fd」弄丢；
+    // 旧实现不管用户有没有把 fd 放进 readfds/writefds 都两边置位）。
+    let mut rin = [0u64; 16];
+    let mut win = [0u64; 16];
     unsafe {
+        for w in 0..nwords {
+            if !readfds.is_null() { rin[w] = core::ptr::read_volatile(readfds.add(w)); }
+            if !writefds.is_null() { win[w] = core::ptr::read_volatile(writefds.add(w)); }
+        }
         if !readfds.is_null() {
             for w in 0..nwords { core::ptr::write_volatile(readfds.add(w), 0); }
         }
@@ -2419,32 +2439,36 @@ pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         }
     }
 
+    let mut total_ready = 0i64;
     for fd in 0..nfds {
-        let mut is_ready = false;
-        // Check if fd is a pipe
+        let word = fd / 64;
+        let bit = fd % 64;
+        let want_r = rin[word] & (1u64 << bit) != 0;
+        let want_w = win[word] & (1u64 << bit) != 0;
+        if !want_r && !want_w { continue; }
+
+        let (mut rd, mut wr) = (false, false);
         if crate::fs::pipe::fd_is_pipe(fd) {
-            is_ready = true; // Pipes always report ready for simplicity
+            // 管道真实就绪：读端有数据/EOF 可读；写端未满可写。
+            let (r, w, hup) = crate::fs::pipe::fd_poll_status(fd);
+            rd = r || hup;
+            wr = w || hup;
         } else {
-            // Check if fd is in VFS
+            // 普通文件/字符设备总是就绪（同原版 file_select 的默认返回）。
             let filp = unsafe { crate::fs::open::fd_to_filp(fd) };
-            if filp != crate::fs::inode::NIL {
-                is_ready = true;
-            }
+            if filp != crate::fs::inode::NIL { rd = true; wr = true; }
         }
-        if is_ready {
-            let word = fd / 64;
-            let bit = fd % 64;
-            unsafe {
-                if !readfds.is_null() {
-                    core::ptr::write_volatile(readfds.add(word),
-                        core::ptr::read_volatile(readfds.add(word)) | (1u64 << bit));
-                }
-                if !writefds.is_null() {
-                    core::ptr::write_volatile(writefds.add(word),
-                        core::ptr::read_volatile(writefds.add(word)) | (1u64 << bit));
-                }
+        unsafe {
+            if rd && want_r {
+                core::ptr::write_volatile(readfds.add(word),
+                    core::ptr::read_volatile(readfds.add(word)) | (1u64 << bit));
+                total_ready += 1;
             }
-            total_ready += 1;
+            if wr && want_w {
+                core::ptr::write_volatile(writefds.add(word),
+                    core::ptr::read_volatile(writefds.add(word)) | (1u64 << bit));
+                total_ready += 1;
+            }
         }
     }
     total_ready
@@ -2697,8 +2721,10 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
                 }
                 (*child).pml4 = child_pml4;
                 (*child).tss.cr3 = child_pml4 as u64;
+                // file-backed mmap 的 VMA 记账也要随地址空间克隆，
+                // 否则子进程对 reserved 文件页的缺页会落成匿名零页。
+                crate::mm::mmap_vma::clone_table(parent_nr, child_nr);
             }
-
             // sigaction 表随 PCB 一起继承（原版是内联数组，我们在旁路数组里）。
             // CLONE_SIGHAND: share signal handler table
         if flags & CLONE_SIGHAND != 0 {
@@ -2853,7 +2879,108 @@ pub fn mlock(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn munlock(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn mlockall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn munlockall(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn mremap(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 重映射/搬移一段虚拟内存。对应现代内核 `mm/mremap.c`（1.0.9 无）。
+/// 支持 MREMAP_MAYMOVE（找不到原地空间就整体搬走）与 MREMAP_FIXED。
+/// 物理页不拷贝——只搬叶子页表项（PRESENT 页连物理页一起过户，
+/// RESERVED/SWAPPED 叶子原样搬），glibc 大 arena 的 realloc 靠它。
+pub fn mremap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::{EINVAL, ENOMEM};
+    use crate::mm::{page, paging};
+
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+
+    let old_addr = args.a0 as usize;
+    let old_len = args.a1 as usize;
+    let new_len = args.a2 as usize;
+    let mflags = args.a3;
+    let new_addr_arg = args.a4 as usize;
+
+    if old_addr & (page::PAGE_SIZE - 1) != 0 || new_len == 0 {
+        return -(EINVAL as i64);
+    }
+    if mflags & MREMAP_FIXED != 0 && mflags & MREMAP_MAYMOVE == 0 {
+        return -(EINVAL as i64);
+    }
+    let old_npages = (old_len + page::PAGE_SIZE - 1) / page::PAGE_SIZE;
+    let new_npages = (new_len + page::PAGE_SIZE - 1) / page::PAGE_SIZE;
+
+    unsafe {
+        let nr = sched::current_index();
+        let t = sched::task_ptr(nr);
+        let pml4 = (*t).pml4;
+        let pml4 = if pml4 == 0 { 0x4000usize } else { pml4 };
+
+        // 缩小：原地截断，尾部按 munmap 处理。
+        if new_npages <= old_npages {
+            let tail = old_addr + new_npages * page::PAGE_SIZE;
+            for i in new_npages..old_npages {
+                let va = old_addr + i * page::PAGE_SIZE;
+                paging::unmap_page(pml4, va);
+            }
+            crate::mm::mmap_vma::remove_range(
+                nr, tail, old_addr + old_npages * page::PAGE_SIZE,
+            );
+            return old_addr as i64;
+        }
+
+        // 扩大：简化实现——不在原地探测增长空间，有 MAYMOVE 就整体搬到
+        // mmap_base 向下新分的区间（或 MREMAP_FIXED 指定的地址）。
+        if mflags & MREMAP_MAYMOVE == 0 {
+            return -(ENOMEM as i64);
+        }
+        let span = new_npages * page::PAGE_SIZE;
+        let new_addr = if mflags & MREMAP_FIXED != 0 {
+            if new_addr_arg & (page::PAGE_SIZE - 1) != 0 {
+                return -(EINVAL as i64);
+            }
+            crate::mm::mmap_vma::remove_range(nr, new_addr_arg, new_addr_arg + span);
+            new_addr_arg
+        } else {
+            let base = (*t).mmap_base;
+            if base < span as u64 {
+                return -(ENOMEM as i64);
+            }
+            let alloc_end = ((base - span as u64) as usize) & !0xFFF;
+            if alloc_end == 0 {
+                return -(ENOMEM as i64);
+            }
+            (*t).mmap_base = alloc_end as u64;
+            alloc_end
+        };
+
+        // 逐页搬叶子项：新位置写入旧叶子的原值（含物理页/槽号/标志），
+        // 旧位置清零。页引用计数不变——所有权随叶子一起过户。
+        for i in 0..old_npages {
+            let old_va = old_addr + i * page::PAGE_SIZE;
+            let new_va = new_addr + i * page::PAGE_SIZE;
+            if let Some(leaf) = paging::leaf_entry(pml4, old_va) {
+                if !paging::set_leaf_entry(pml4, new_va, leaf) {
+                    return -(ENOMEM as i64);
+                }
+                if !paging::set_leaf_entry(pml4, old_va, 0) {
+                    return -(ENOMEM as i64);
+                }
+            }
+        }
+
+        // VMA 记账跟着搬：摘旧区间，按偏移平移后重挂。
+        let mut vma_buf = [crate::mm::mmap_vma::EMPTY; crate::mm::mmap_vma::MAX_VMAS];
+        let nvmas = crate::mm::mmap_vma::drain_range(
+            nr, old_addr, old_addr + old_npages * page::PAGE_SIZE, &mut vma_buf,
+        );
+        for v in vma_buf[..nvmas].iter() {
+            let shift = new_addr as isize - old_addr as isize;
+            let mut nv = *v;
+            nv.start = (nv.start as isize + shift) as usize;
+            nv.end = (nv.end as isize + shift) as usize;
+            if !crate::mm::mmap_vma::add(nr, nv) {
+                crate::pr_warn!("mremap: vma move dropped [{:#x},{:#x})", v.start, v.end);
+            }
+        }
+        new_addr as i64
+    }
+}
 pub fn msync(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 
 // IPC syscalls
@@ -4054,8 +4181,35 @@ pub fn link(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 
 /// 建议内核的页面使用方式。建议性调用，忽略即合法（原版无）。
 pub fn madvise(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 查询页面是否驻留。没有换页，全部驻留 → 直接返回成功。
-pub fn mincore(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
+/// 查询页面是否驻留。惰性分配/换页之后「全驻留」不再成立：RESERVED
+/// 和 SWAPPED 叶子都算非驻留。vec 每页一个字节，bit0=驻留。
+pub fn mincore(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::mm::{page, paging};
+    let addr = args.a0 as usize;
+    let len = args.a1 as usize;
+    let vec = args.a2 as usize;
+    // Linux 要求 addr 页对齐。
+    if addr & (page::PAGE_SIZE - 1) != 0 {
+        return -(EINVAL as i64);
+    }
+    let npages = (len + page::PAGE_SIZE - 1) / page::PAGE_SIZE;
+    // SAFETY: vec 指针只来自用户传参，user_ok 只做范围检查。
+    if !unsafe { user_ok(vec as u64, npages as u64, crate::mm::area::AccessMode::Write) } {
+        return -(EFAULT as i64);
+    }
+    unsafe {
+        let pml4 = paging::current_pml4();
+        for i in 0..npages {
+            let resident = match paging::leaf_entry(pml4, addr + i * page::PAGE_SIZE) {
+                Some(e) => e & paging::flags::PRESENT != 0,
+                None => false,
+            };
+            // SAFETY: vec 已校验用户可写。
+            unsafe { core::ptr::write_volatile((vec + i) as *mut u8, resident as u8) };
+        }
+    }
+    0
+}
 /// 预读提示。无预读机制，忽略。
 pub fn readahead(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 文件访问模式提示。同 [`madvise`]，忽略。
@@ -4548,6 +4702,11 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
                 (*child).tss.cr3 = child_pml4 as u64;
             }
         }
+        // file-backed mmap 的 VMA 记账随地址空间克隆（CLONE_VM 共享页表的
+        // 线程也复制一份，保证两边的缺页解析行为一致）。
+        if (*child).pml4 != 0 {
+            crate::mm::mmap_vma::clone_table(parent_nr, child_nr);
+        }
 
         // CLONE_THREAD: threads get unique PID, share address space via CLONE_VM
         if flags & CLONE_THREAD != 0 {
@@ -5037,10 +5196,52 @@ pub fn chroot(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 pub fn acct(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 设置系统时间。没有 RTC，接受但忽略。
 pub fn settimeofday(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 启用交换分区。没有换页子系统。
-pub fn swapon(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 关闭交换分区。同 [`swapon`]。
-pub fn swapoff(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 启用交换分区/设备。对应原版 `sys_swapon()`：只接受块设备
+/// （`S_IFBLK`），容量按设备驱动报告的块数算；第 0 页写签名头。
+pub fn swapon(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::fs::mode::S_IFMT;
+    // SAFETY: user_path 已校验范围。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 进程上下文；namei 可能睡（契约允许）。
+    let ino = match unsafe { crate::fs::namei::namei(path) } {
+        Ok(i) => i,
+        Err(e) => return e as i64,
+    };
+    // SAFETY: ino 有效。
+    let inode = unsafe { crate::fs::inode::inode(ino) };
+    if inode.i_mode & S_IFMT != crate::fs::mode::S_IFBLK {
+        unsafe { crate::fs::inode::iput(ino) };
+        return -(EINVAL as i64);
+    }
+    let dev = inode.i_rdev;
+    unsafe { crate::fs::inode::iput(ino) };
+
+    // 设备总块数（1024 字节块）。
+    let major = (dev >> 8) & 0xFF;
+    let minor = (dev & 0xFF) as usize;
+    let blocks: u32 = if major == 1 {
+        crate::drivers::block::ramdisk::RD_BLOCKS as u32
+    } else if major == 3 {
+        #[cfg(feature = "extra-drivers")]
+        {
+            (crate::drivers::block::hd::drive_size(minor) / 2) as u32
+        }
+        #[cfg(not(feature = "extra-drivers"))]
+        {
+            return -(EINVAL as i64);
+        }
+    } else {
+        return -(EINVAL as i64);
+    };
+    crate::mm::swap::swapon_dev(dev, blocks)
+}
+/// 关闭交换分区。对应原版 `sys_swapoff()`。
+pub fn swapoff(_args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::mm::swap::swapoff_dev()
+}
 /// 改 IOPL。会放开用户态端口访问，等有真用户态进程再说。
 pub fn iopl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 改 I/O 端口位图。需要 TSS 里的 I/O 位图。

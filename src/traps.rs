@@ -258,10 +258,32 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
                 // 等只会被触碰一小部分，剩下的保留页永远不分配，内存就不会被
                 // 一次吃光。
                 if pml4 != 0 && !is_present && is_user {
+                    // swap 换入：叶子是 SWAPPED 项（PRESENT=0 但非 RESERVED），
+                    // 从交换区把页读回来。
+                    if let Some(true) = unsafe {
+                        crate::mm::swap::try_swap_in(pml4, fault_addr as usize)
+                    } {
+                        crate::pr_debug!("swapin resolved at {:#x}", fault_addr);
+                        return;
+                    }
                     if crate::mm::paging::is_reserved(pml4, fault_addr as usize) {
-                        if unsafe { crate::mm::paging::resolve_reserved(pml4, fault_addr as usize) } {
-                            crate::pr_debug!("lazy page fault resolved at {:#x}", fault_addr);
-                            return;
+                        // file-backed VMA 的页：按 VMA 记的文件偏移读入内容。
+                        let task = sched::current_index();
+                        match unsafe {
+                            crate::mm::mmap_vma::resolve_file_fault(task, pml4, fault_addr as usize)
+                        } {
+                            Some(true) => {
+                                crate::pr_debug!("lazy file page fault resolved at {:#x}", fault_addr);
+                                return;
+                            }
+                            Some(false) => { /* 在 VMA 里但解析失败：落 SIGSEGV */ }
+                            None => {
+                                // 匿名保留页：分配零页。
+                                if unsafe { crate::mm::paging::resolve_reserved(pml4, fault_addr as usize) } {
+                                    crate::pr_debug!("lazy page fault resolved at {:#x}", fault_addr);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -288,11 +310,30 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
             if pml4 != 0 {
                 // 内核对用户惰性分配页（mmap/brk 的 RESERVED、PRESENT=0）的读写：
                 // copy_from_user/copy_to_user 会直接访问还没落实物理页的保留页。
-                // 这里先 resolve_reserved 落实，再重试访问（与用户态惰性缺页同路）。
+                // 这里先落实，再重试访问（与用户态惰性缺页同路）；file-backed
+                // VMA 的页要按文件偏移读入内容。
+                // swap 换入：SWAPPED 叶子（PRESENT=0 且非 RESERVED）。
+                if !is_present {
+                    if let Some(true) = unsafe {
+                        crate::mm::swap::try_swap_in(pml4, fault_addr as usize)
+                    } {
+                        crate::pr_debug!("supervisor swapin resolved at {:#x}", fault_addr);
+                        return;
+                    }
+                }
                 if !is_present
                     && crate::mm::paging::is_reserved(pml4, fault_addr as usize)
                 {
-                    if unsafe { crate::mm::paging::resolve_reserved(pml4, fault_addr as usize) } {
+                    let task = sched::current_index();
+                    let resolved = match unsafe {
+                        crate::mm::mmap_vma::resolve_file_fault(task, pml4, fault_addr as usize)
+                    } {
+                        Some(ok) => ok,
+                        None => unsafe {
+                            crate::mm::paging::resolve_reserved(pml4, fault_addr as usize)
+                        },
+                    };
+                    if resolved {
                         crate::pr_debug!("lazy supervisor fault resolved at {:#x}", fault_addr);
                         return;
                     }

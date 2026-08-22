@@ -387,3 +387,37 @@ LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接
   （oid sha256=45b91886…, 64MB）。真镜像备份在 /tmp/lfs3.img。
 - hd_identify 选盘后补了 ide_settle()（ATA 400ns），与读/写路径一致。
 - 串口喂 shell 命令要先 sleep 6 等 shell 起来，否则开头字符被吃掉。
+
+### VM/swap 批次（2026-08-22，分支 feat/vm-swap-mm）
+
+- **pipe 的 select/poll 真就绪**：pipe 带环形缓冲状态，select/poll 走
+  pipe_poll 查可读/可写，不再「fd 存在即就绪」。
+- **vmalloc**：`src/mm/vmalloc.rs`，高半区 vmalloc 区按页映射 + vfree，
+  自检 `vmalloc: selftest -> ok`。
+- **惰性 file-backed mmap + VMA 记账**（`src/mm/mmap_vma.rs`）：
+  mmap(file,PRIVATE) 只建 RESERVED 叶子 + 记 VMA(sb,ino,offset)，首次
+  缺页 `resolve_file_fault` 按偏移读文件内容。fork 时 `clone_table`
+  复制 VMA 表，exec/exit 清空。每任务 MAX_VMAS=32。
+  **坑：glibc ld.so 先整文件 map 一次再逐段 MAP_FIXED 重 map**——
+  MAP_FIXED（addr!=0）必须先 `remove_range` 清旧 VMA 再 add，否则
+  重叠检查拒成 ENOMEM（"failed to map segment from shared object"）。
+- **swap**（`src/mm/swap.rs`）：叶子 PTE PRESENT=0 + SWAPPED(bit10)、
+  bits12+ 存槽号；swapon/swapoff 真实现（只接块设备，容量按驱动块数，
+  槽位图 + 引用计数，对应原版 swap_duplicate/swap_free）；
+  `get_free_page` OOM 时 `reclaim_once` 从当前任务线性扫页表换一个
+  干净 RW 用户页出去（重入保护 SWAP_RECLAIMING）；缺页路径
+  （traps.rs 用户态+supervisor 两条）先试 `try_swap_in`；fork 的
+  cow_copy_page_table 复制 SWAPPED 项并 slot_ref_inc；do_exit
+  free_task_swap 归还槽位。自检 `swap: swapon/swapout/swapin/swapoff -> ok`。
+- **mprotect 覆盖惰性页**：旧 set_page_flags 对非 PRESENT 叶子直接
+  返回 false，glibc 对未触碰 RELRO 段的 mprotect 静默丢失；现在
+  RESERVED/SWAPPED 叶子走 leaf_entry/set_leaf_entry 只改 prot 位，
+  整段覆盖的 VMA 同步 set_prot。
+- **mincore 真实现**（原来不写 vec 直接返回 0）；**mremap 真实现**
+  （MAYMOVE 整体搬叶子项不拷物理页，VMA drain_range 平移重挂）。
+- 页表新接口：`paging::leaf_entry`/`set_leaf_entry`（读写非 PRESENT
+  叶子原值），flags 新增 `RESERVED=1<<9`/`SWAPPED=1<<10`。
+- 调试教训：build 脚本输出重定向到 /dev/null 后编译错误不可见，
+  会拿旧镜像空跑——仪器化排查时务必先确认镜像时间戳。
+- 验证：debug selftest 全过（SHITIX_BOOT_OK）；glibc bash（gnu-full.img）
+  echo/ls -la/cat 全通；busybox lfs3 无回归（喂命令要先 sleep 等提示符）。

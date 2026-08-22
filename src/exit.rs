@@ -58,6 +58,13 @@ pub fn do_exit(code: ExitCode) -> ! {
         // 进程退出时才真正有意义——等 filp[] 进 Task 后语义就对了。
         crate::fs::open::close_all();
 
+        // 清掉 file-backed mmap 的 VMA 记账（地址空间随进程消亡）。
+        crate::mm::mmap_vma::clear(nr);
+
+        // 归还该进程还留在交换区里的槽位（原版 free_page_tables 里的
+        // swap_free(entry)）。
+        crate::mm::swap::free_task_swap((*sched::task_ptr(nr)).pml4);
+
         // 把子进程托付出去。原版遍历 p_cptr 链把孩子挂到 init 名下，
         // 我们的亲子关系是 `parent` 下标，所以扫一遍任务表。
         reparent_children(nr);

@@ -18,6 +18,33 @@ use crate::fs::open::fd_to_filp;
 use crate::fs::{Dirent, SEEK_CUR, SEEK_END, SEEK_SET, mode, oflags};
 use crate::klib::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENOTDIR, ENXIO, EROFS, ESPIPE};
 
+/// 按 (sb, ino, pos) 直接读文件内容，不经过 fd 表。
+///
+/// 供惰性 file-backed mmap 的缺页解析用：映射建立后 fd 可能已被关闭，
+/// 缺页时只能凭 VMA 里记的 (sb, ino, offset) 重新 iget 来读。
+/// 越过文件末尾的请求返回实际读到的字节数（可能为 0，即 EOF）。
+///
+/// # Safety
+/// 只能在进程上下文调用（iget/bread 会睡）。
+pub unsafe fn read_inode_at(sb_nr: usize, ino: u32, pos: u64, buf: &mut [u8]) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let ip = inode::iget(sb_nr, ino);
+        if ip == NIL {
+            return -(EINVAL as i64);
+        }
+        let r = match inode::inode(ip).i_op {
+            FsType::Minix => super::minix::file::read(ip, pos, buf),
+            #[cfg(feature = "extra-drivers")]
+            FsType::Ext2 => super::ext4::ops::full::ext4_file_read(ip, pos, buf),
+            FsType::Tmpfs => super::tmpfs::read(ip, pos, buf),
+            _ => -(EINVAL as i64),
+        };
+        inode::iput(ip);
+        r
+    }
+}
+
 /// 读。对应原版 `sys_read()`。
 ///
 /// # Safety
