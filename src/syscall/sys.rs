@@ -1450,6 +1450,20 @@ pub fn read(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
 /// - a0: 文件路径
 /// - a1: 标志 (O_RDONLY, O_WRONLY, etc.)
 /// - a2: 模式
+/// inotify 钩子：广播「path 最后一级发生了 mask 事件」。
+/// 目录取最后一个 '/' 之前（无前缀视作 "."、根视作 "/"）。
+fn notify_path_event(path: &[u8], mask: u32) {
+    let n = path.len().min(255);
+    if n == 0 { return; }
+    let full = &path[..n];
+    let (dir, name): (&[u8], &[u8]) = match full.iter().rposition(|&c| c == b'/') {
+        None => (b".", full),
+        Some(0) => (b"/", &full[1..]),
+        Some(s) => (&full[..s], &full[s + 1..]),
+    };
+    crate::fs::event::inotify_notify(dir, mask, name, 0);
+}
+
 pub fn open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // SAFETY: user_path 已校验范围；fs 层自己处理不存在/权限。
     let path = match unsafe { user_path(args.a0) } {
@@ -1463,6 +1477,10 @@ pub fn open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // SAFETY: 系统调用上下文，fs 层会睡（getblk/wait_on_buffer），
     // 所以只能在有 current 的任务里调——系统调用天然满足。
     let fd = unsafe { crate::fs::open::sys_open(path, flags & !crate::fs::oflags::O_CLOEXEC, args.a2 as u16) };
+    if fd >= 0 && flags & crate::fs::oflags::O_CREAT != 0 {
+        // 近似：无法区分「新建」与「打开已存在」，O_CREAT 成功即报 IN_CREATE
+        notify_path_event(path, crate::fs::event::IN_CREATE);
+    }
     if fd >= 0 && cloexec {
         let nr = sched::current_index();
         unsafe { (*sched::task_ptr(nr)).close_on_exec |= 1u64 << (fd as usize & 63) };
@@ -1885,7 +1903,12 @@ pub fn rename(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     unsafe {
         let r = crate::fs::namei::do_link(old_path, new_path);
         if r < 0 { return r; }
-        crate::fs::namei::do_unlink(old_path)
+        let r = crate::fs::namei::do_unlink(old_path);
+        if r == 0 {
+            notify_path_event(old_path, crate::fs::event::IN_MOVED_FROM);
+            notify_path_event(new_path, crate::fs::event::IN_MOVED_TO);
+        }
+        r
     }
 }
 
@@ -1897,7 +1920,11 @@ pub fn unlink(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         Err(e) => return e,
     };
     // SAFETY: 同 [`open`]。
-    unsafe { crate::fs::namei::do_unlink(path) }
+    let r = unsafe { crate::fs::namei::do_unlink(path) };
+    if r == 0 {
+        notify_path_event(path, crate::fs::event::IN_DELETE);
+    }
+    r
 }
 
 /// 创建目录。对应原版 `fs/namei.c:sys_mkdir()`。
@@ -1908,7 +1935,11 @@ pub fn mkdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         Err(e) => return e,
     };
     // SAFETY: 同 [`open`]。
-    unsafe { crate::fs::namei::do_mkdir(path, args.a1 as u16) }
+    let r = unsafe { crate::fs::namei::do_mkdir(path, args.a1 as u16) };
+    if r == 0 {
+        notify_path_event(path, crate::fs::event::IN_CREATE | crate::fs::event::IN_ISDIR);
+    }
+    r
 }
 
 /// 删除目录。对应原版 `fs/namei.c:sys_rmdir()`。
@@ -1919,7 +1950,11 @@ pub fn rmdir(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         Err(e) => return e,
     };
     // SAFETY: 同 [`open`]。
-    unsafe { crate::fs::namei::do_rmdir(path) }
+    let r = unsafe { crate::fs::namei::do_rmdir(path) };
+    if r == 0 {
+        notify_path_event(path, crate::fs::event::IN_DELETE | crate::fs::event::IN_ISDIR);
+    }
+    r
 }
 
 /// 创建符号链接。对应原版 `fs/namei.c:sys_symlink()`。
@@ -5985,7 +6020,7 @@ pub fn signalfd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         crate::fs::event::signalfd_set_mask(fd_in as usize, m);
         return fd_in as i64;
     }
-    let idx = crate::fs::event::signalfd_alloc(0);
+    let idx = crate::fs::event::signalfd_alloc(args.a2 as u32);
     if idx < 0 { return idx; }
     let fd = alloc_event_fd(idx as usize);
     if fd >= 0 && mask != 0 {

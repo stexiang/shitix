@@ -20,34 +20,40 @@ use crate::klib::errno::{EACCES, EBADF, EINVAL, EMFILE, ENFILE, ENOTDIR, EPERM, 
 use crate::pr_info;
 
 /// 每任务 FD 表（旁路数组，不在 Task 里省 BSS）。
+/// 0 = 空槽（存 filp 下标 + 1）。全 0 初始化让 32KB 的表落在 BSS 而非
+/// 镜像里；NIL 编码把整张表烧成 0xFF 会白白占掉珍贵的镜像空间。
 static mut TASK_FILP: [[usize; NR_OPEN]; crate::sched::NR_TASKS] =
-    [[NIL; NR_OPEN]; crate::sched::NR_TASKS];
+    [[0; NR_OPEN]; crate::sched::NR_TASKS];
 
 /// 取当前任务某个 fd 对应的打开文件表下标，无效返回 [`NIL`]。
 pub fn fd_to_filp(fd: usize) -> usize {
     if fd >= NR_OPEN { return NIL; }
     // SAFETY: 进程上下文，单核。
-    unsafe { TASK_FILP[crate::sched::current_index()][fd] }
+    let v = unsafe { TASK_FILP[crate::sched::current_index()][fd] };
+    if v == 0 { NIL } else { v - 1 }
 }
 
-/// 设当前任务的 fd → filp 映射。
+/// 设当前任务的 fd → filp 映射。传 [`NIL`] 表示清空。
 fn set_fd_to_filp(fd: usize, filp_idx: usize) {
     if fd < NR_OPEN {
-        unsafe { TASK_FILP[crate::sched::current_index()][fd] = filp_idx }
+        let v = if filp_idx == NIL { 0 } else { filp_idx + 1 };
+        unsafe { TASK_FILP[crate::sched::current_index()][fd] = v }
     }
 }
 
-/// 设指定任务的 fd → filp 映射（供 fork 用）。
+/// 设指定任务的 fd → filp 映射（供 fork 用）。传 [`NIL`] 表示清空。
 pub fn set_task_fd(task_idx: usize, fd: usize, filp_idx: usize) {
     if fd < NR_OPEN && task_idx < crate::sched::NR_TASKS {
-        unsafe { TASK_FILP[task_idx][fd] = filp_idx }
+        let v = if filp_idx == NIL { 0 } else { filp_idx + 1 };
+        unsafe { TASK_FILP[task_idx][fd] = v }
     }
 }
 
 /// 取指定任务的 fd。
 pub fn task_fd(task_idx: usize, fd: usize) -> usize {
     if fd >= NR_OPEN || task_idx >= crate::sched::NR_TASKS { return NIL; }
-    unsafe { TASK_FILP[task_idx][fd] }
+    let v = unsafe { TASK_FILP[task_idx][fd] };
+    if v == 0 { NIL } else { v - 1 }
 }
 
 /// fork 时复制 fd 表。
@@ -71,7 +77,7 @@ pub fn get_unused_fd() -> usize {
             // 覆盖管道读端（GNU bash 管道：cat exec 后 ld.so open ld.so.cache
             // 拿到 fd0，把管道读端顶掉，cat 再 read(0) 读到的是 ld.so.cache 的
             // EOF，整个管道断掉）。
-            if TASK_FILP[nr][fd] == NIL
+            if TASK_FILP[nr][fd] == 0
                 && !crate::fs::pipe::fd_is_pipe(fd)
                 && !crate::net::socket::fd_is_socket(fd)
             {

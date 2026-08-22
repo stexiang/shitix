@@ -6,9 +6,9 @@
 //! **per-task** 的旁路数组（`FD_MAP`），不进 BSS 大户、也不走 VFS inode。
 //!
 //! # 与原版的差异
-//! 1. **不阻塞**。读/写在「会阻塞」时返回 `-EAGAIN`（无论 O_NONBLOCK），
-//!    不挂等待队列。这与本树 `select`/`poll` 的「fd 存在即就绪」简化一致；
-//!    真正的 waitqueue 就绪语义要等 VFS poll 机制到位。
+//! 1. **阻塞靠让出循环**。读/写在「会阻塞」且非 O_NONBLOCK 时
+//!    `schedule()` 让出重试（合作式调度的 waitqueue 等价物）；
+//!    O_NONBLOCK 时返回 `-EAGAIN`。
 //! 2. timerfd 的时钟是 jiffies(100Hz)，不支持 interval 以外的精度。
 
 use crate::klib::errno::{EAGAIN, EBADF, EINVAL};
@@ -65,9 +65,10 @@ impl EvObj {
 }
 
 static mut OBJS: [EvObj; MAX_OBJS] = [const { EvObj::empty() }; MAX_OBJS];
-/// 每任务 fd 映射：`FD_MAP[task][fd]` = 对象下标；NIL = 非事件 fd。
+/// 每任务 fd 映射：`FD_MAP[task][fd]` = 对象下标 + 1；0 = 非事件 fd
+/// （全 0 初始化落在 BSS；NIL=0xFF.. 编码会把 16KB 烧进镜像）。
 static mut FD_MAP: [[usize; MAX_EV_FD]; crate::sched::NR_TASKS] =
-    [[NIL; MAX_EV_FD]; crate::sched::NR_TASKS];
+    [[0; MAX_EV_FD]; crate::sched::NR_TASKS];
 
 fn cur() -> usize {
     crate::sched::current_index()
@@ -99,7 +100,7 @@ fn slot_used(idx: usize) -> bool {
     unsafe {
         for t in 0..crate::sched::NR_TASKS {
             for fd in 0..MAX_EV_FD {
-                if FD_MAP[t][fd] == idx {
+                if FD_MAP[t][fd] == idx + 1 {
                     return true;
                 }
             }
@@ -120,7 +121,7 @@ fn free_obj(idx: usize) {
 pub fn register_fd(fd: usize, obj_idx: usize) {
     if fd < MAX_EV_FD {
         // SAFETY: 系统调用上下文，单核。
-        unsafe { FD_MAP[cur()][fd] = obj_idx; }
+        unsafe { FD_MAP[cur()][fd] = obj_idx + 1; }
     }
 }
 
@@ -128,22 +129,22 @@ pub fn register_fd(fd: usize, obj_idx: usize) {
 pub fn unregister_fd(fd: usize) {
     if fd < MAX_EV_FD {
         // SAFETY: 系统调用上下文。
-        unsafe { FD_MAP[cur()][fd] = NIL; }
+        unsafe { FD_MAP[cur()][fd] = 0; }
     }
 }
 
 /// 该 fd 是否匿名事件 fd。
 pub fn fd_is_event(fd: usize) -> bool {
     // SAFETY: 只读；系统调用上下文。
-    unsafe { fd < MAX_EV_FD && FD_MAP[cur()][fd] != NIL }
+    unsafe { fd < MAX_EV_FD && FD_MAP[cur()][fd] != 0 }
 }
 
 /// 取 fd 对应的对象下标。
 pub fn fd_to_obj(fd: usize) -> Option<usize> {
     // SAFETY: 只读；系统调用上下文。
     unsafe {
-        if fd < MAX_EV_FD && FD_MAP[cur()][fd] != NIL {
-            Some(FD_MAP[cur()][fd])
+        if fd < MAX_EV_FD && FD_MAP[cur()][fd] != 0 {
+            Some(FD_MAP[cur()][fd] - 1)
         } else {
             None
         }
@@ -503,20 +504,201 @@ pub fn epoll_create(flags: u32) -> i64 {
     }
 }
 
-/// epoll_ctl：add/mod/del。本树无真实就绪跟踪，仅记录操作并返回成功。
-pub fn epoll_ctl(_epfd: usize, _op: u32, _fd: usize, _ev_ptr: u64) -> i64 {
-    // 校验 fd 范围与 ev 指针，避免坏指针。
-    if _op > 3 {
-        return -(EINVAL as i64);
-    }
-    0
+/// 每个 epoll 对象最多监听的 fd 数。
+const MAX_EPOLL_INTEREST: usize = 16;
+
+/// 一条 epoll 监听项。
+#[derive(Clone, Copy)]
+struct EpollInterest {
+    used: bool,
+    fd: usize,
+    events: u32,
+    data: u64,
 }
 
-/// epoll_wait：与 select/poll 一致——已注册 fd 一律「就绪」。
-/// 本树无真实就绪跟踪，返回 0（无事件）或写回一个全就绪的假事件。
-pub fn epoll_wait(_epfd: usize, ev_ptr: u64, _maxevents: u32, _timeout: i32) -> i64 {
-    let _ = ev_ptr;
-    0
+const EMPTY_INTEREST: EpollInterest = EpollInterest { used: false, fd: 0, events: 0, data: 0 };
+
+/// epoll 兴趣表（按下标挂在对应对象槽位上）。
+static mut EPOLL_TAB: [[EpollInterest; MAX_EPOLL_INTEREST]; MAX_OBJS] =
+    [[EMPTY_INTEREST; MAX_EPOLL_INTEREST]; MAX_OBJS];
+
+/// EPOLL_CTL_ADD/MOD/DEL
+const EPOLL_CTL_ADD: u32 = 1;
+const EPOLL_CTL_MOD: u32 = 3;
+const EPOLL_CTL_DEL: u32 = 2;
+/// 事件位
+const EPOLLIN: u32 = 0x1;
+const EPOLLOUT: u32 = 0x4;
+const EPOLLERR: u32 = 0x8;
+const EPOLLHUP: u32 = 0x10;
+
+/// epoll_ctl：add/mod/del。真实维护兴趣表（原版 eventpoll.c 的红黑树
+/// 这里摊平成定长数组）。
+pub fn epoll_ctl(epfd: usize, op: u32, fd: usize, ev_ptr: u64) -> i64 {
+    let idx = match fd_to_obj(epfd) {
+        Some(i) => i,
+        None => return -(EBADF as i64),
+    };
+    // SAFETY: idx 有效。
+    if unsafe { (*obj(idx)).kind } != EvKind::Epoll {
+        return -(EINVAL as i64);
+    }
+    if fd >= MAX_EV_FD {
+        return -(EBADF as i64);
+    }
+    // SAFETY: 系统调用上下文独占兴趣表。
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(EPOLL_TAB[idx]) };
+    let pos = tab.iter().position(|e| e.used && e.fd == fd);
+    match op {
+        EPOLL_CTL_ADD => {
+            if pos.is_some() {
+                return -(crate::klib::errno::EEXIST as i64);
+            }
+            if ev_ptr == 0 {
+                return -(EINVAL as i64);
+            }
+            // SAFETY: 用户指针读 epoll_event。
+            let (events, data) = unsafe {
+                (core::ptr::read_volatile(ev_ptr as *const u32),
+                 core::ptr::read_volatile((ev_ptr + 8) as *const u64))
+            };
+            match tab.iter().position(|e| !e.used) {
+                None => -(crate::klib::errno::ENOSPC as i64),
+                Some(slot) => {
+                    tab[slot] = EpollInterest { used: true, fd, events, data };
+                    0
+                }
+            }
+        }
+        EPOLL_CTL_MOD => {
+            let slot = match pos {
+                None => return -(crate::klib::errno::ENOENT as i64),
+                Some(s) => s,
+            };
+            if ev_ptr == 0 {
+                return -(EINVAL as i64);
+            }
+            // SAFETY: 用户指针读 epoll_event。
+            unsafe {
+                tab[slot].events = core::ptr::read_volatile(ev_ptr as *const u32);
+                tab[slot].data = core::ptr::read_volatile((ev_ptr + 8) as *const u64);
+            }
+            0
+        }
+        EPOLL_CTL_DEL => {
+            match pos {
+                None => -(crate::klib::errno::ENOENT as i64),
+                Some(slot) => {
+                    tab[slot] = EMPTY_INTEREST;
+                    0
+                }
+            }
+        }
+        _ => -(EINVAL as i64),
+    }
+}
+
+/// 查一个 fd 当前的 (readable, writable, hangup)。
+fn fd_ready(fd: usize) -> (bool, bool, bool) {
+    if crate::fs::pipe::fd_is_pipe(fd) {
+        return crate::fs::pipe::fd_poll_status(fd);
+    }
+    if fd_is_event(fd) {
+        // 事件 fd：eventfd 计数>0、timerfd 已到期、signalfd 有待处理信号
+        // SAFETY: fd_to_obj 已确认映射存在。
+        if let Some(i) = fd_to_obj(fd) {
+            let now = crate::sched::jiffies();
+            // SAFETY: i 有效。
+            unsafe {
+                let p = obj(i);
+                let readable = match (*p).kind {
+                    EvKind::Event => (*p).val > 0,
+                    EvKind::Timer => (*p).deadline != 0 && (*p).deadline <= now,
+                    EvKind::Signal => {
+                        let t = crate::sched::task_ptr(crate::sched::current_index());
+                        (*t).signal & (*p).sigmask != 0
+                    }
+                    EvKind::Inotify => inotify_has_events(i),
+                    EvKind::Epoll => false,
+                };
+                return (readable, true, false);
+            }
+        }
+        return (false, false, false);
+    }
+    if crate::net::socket::fd_is_socket(fd) {
+        // socket 层没有就绪查询；保守报可写
+        return (false, true, false);
+    }
+    // 普通文件/字符设备：同 select/poll 的「存在即就绪」
+    if unsafe { crate::fs::open::fd_to_filp(fd) } != crate::fs::inode::NIL {
+        return (true, true, false);
+    }
+    (false, false, false)
+}
+
+/// 收集一轮就绪事件，返回写入的事件数。
+fn epoll_collect(idx: usize, ev_ptr: u64, maxevents: u32) -> usize {
+    // SAFETY: 系统调用上下文读兴趣表。
+    let tab = unsafe { &*core::ptr::addr_of!(EPOLL_TAB[idx]) };
+    let mut n = 0usize;
+    for e in tab.iter() {
+        if !e.used || n >= maxevents as usize {
+            continue;
+        }
+        let (r, w, hup) = fd_ready(e.fd);
+        let mut revents = 0u32;
+        if r { revents |= EPOLLIN; }
+        if w { revents |= EPOLLOUT; }
+        if hup { revents |= EPOLLHUP; }
+        // ERR/HUP 无条件上报，其余按兴趣掩码过滤
+        revents &= e.events | EPOLLERR | EPOLLHUP;
+        if revents == 0 {
+            continue;
+        }
+        // SAFETY: 用户指针写 epoll_event（events@0 u32，data@8 u64）。
+        unsafe {
+            let dst = ev_ptr as usize + n * 16;
+            core::ptr::write_volatile(dst as *mut u32, revents);
+            core::ptr::write_volatile((dst + 8) as *mut u64, e.data);
+        }
+        n += 1;
+    }
+    n
+}
+
+/// epoll_wait：收集真实就绪事件；无事件且 timeout!=0 时睡到超时或
+/// 出现就绪（合作式让出循环，同 read 的阻塞语义）。
+pub fn epoll_wait(epfd: usize, ev_ptr: u64, maxevents: u32, timeout: i32) -> i64 {
+    let idx = match fd_to_obj(epfd) {
+        Some(i) => i,
+        None => return -(EBADF as i64),
+    };
+    // SAFETY: idx 有效。
+    if unsafe { (*obj(idx)).kind } != EvKind::Epoll {
+        return -(EINVAL as i64);
+    }
+    if maxevents == 0 || ev_ptr == 0 {
+        return -(EINVAL as i64);
+    }
+    let hz = crate::sched::task::HZ;
+    let deadline = if timeout < 0 {
+        u64::MAX
+    } else {
+        crate::sched::jiffies()
+            + (timeout as u64 * hz + 999) / 1000
+    };
+    loop {
+        let n = epoll_collect(idx, ev_ptr, maxevents);
+        if n > 0 {
+            return n as i64;
+        }
+        if crate::sched::jiffies() >= deadline {
+            return 0;
+        }
+        // SAFETY: 系统调用上下文让出。
+        unsafe { crate::sched::schedule() };
+    }
 }
 
 // =============================================================================
@@ -532,19 +714,215 @@ pub fn inotify_init(flags: u32) -> i64 {
     }
 }
 
-/// inotify_add_watch：本树无文件系统事件钩子，仅记录并返回一个假 watch 描述符。
-pub fn inotify_add_watch(_fd: usize, _path: u64, _mask: u32) -> i64 {
-    1
+/// 每个 inotify 对象最多 watch 数。
+const MAX_WATCHES: usize = 8;
+/// watch 路径最大长度（含 NUL）。
+const MAX_WATCH_PATH: usize = 128;
+/// 事件名最大长度（含 NUL）。
+const MAX_EV_NAME: usize = 64;
+/// 每对象事件环容量。
+const MAX_INOTIFY_EVENTS: usize = 16;
+
+/// inotify 事件位（inotify.h）
+pub const IN_ACCESS: u32 = 0x1;
+pub const IN_MODIFY: u32 = 0x2;
+pub const IN_CREATE: u32 = 0x100;
+pub const IN_DELETE: u32 = 0x200;
+pub const IN_MOVED_FROM: u32 = 0x40;
+pub const IN_MOVED_TO: u32 = 0x80;
+pub const IN_ISDIR: u32 = 0x4000_0000;
+
+/// 一条 watch。
+#[derive(Clone, Copy)]
+struct Watch {
+    used: bool,
+    wd: u32,
+    mask: u32,
+    path: [u8; MAX_WATCH_PATH],
 }
 
-/// inotify_rm_watch：无真实 watch，返回成功。
-pub fn inotify_rm_watch(_fd: usize, _wd: u32) -> i64 {
-    0
+const EMPTY_WATCH: Watch = Watch { used: false, wd: 0, mask: 0, path: [0; MAX_WATCH_PATH] };
+
+/// 一条事件（对应用户态 struct inotify_event 的可变长 name）。
+#[derive(Clone, Copy)]
+struct InotifyEvent {
+    used: bool,
+    wd: u32,
+    mask: u32,
+    cookie: u32,
+    /// 文件名（目录内事件），无名字事件为空串
+    name: [u8; MAX_EV_NAME],
 }
 
-/// inotify 读：无事件 → 0（EOF）。
-pub fn inotify_read(_fd: usize, _buf_ptr: u64, _len: u64) -> i64 {
-    0
+const EMPTY_EVENT: InotifyEvent = InotifyEvent {
+    used: false, wd: 0, mask: 0, cookie: 0, name: [0; MAX_EV_NAME],
+};
+
+/// watch 表与事件环，按对象下标挂。
+static mut INOTIFY_WATCHES: [[Watch; MAX_WATCHES]; MAX_OBJS] =
+    [[EMPTY_WATCH; MAX_WATCHES]; MAX_OBJS];
+static mut INOTIFY_EVENTS: [[InotifyEvent; MAX_INOTIFY_EVENTS]; MAX_OBJS] =
+    [[EMPTY_EVENT; MAX_INOTIFY_EVENTS]; MAX_OBJS];
+static mut NEXT_WD: u32 = 1;
+
+/// inotify_add_watch：真实登记（路径字符串匹配，原版是 inode 挂 watcher）。
+/// 同一对象重复 watch 同一路径 → 更新掩码返回原 wd（原版语义）。
+pub fn inotify_add_watch(fd: usize, path_ptr: u64, mask: u32) -> i64 {
+    let idx = match fd_to_obj(fd) {
+        Some(i) => i,
+        None => return -(EBADF as i64),
+    };
+    // SAFETY: idx 有效。
+    if unsafe { (*obj(idx)).kind } != EvKind::Inotify {
+        return -(EINVAL as i64);
+    }
+    if path_ptr == 0 || mask == 0 {
+        return -(EINVAL as i64);
+    }
+    // 读路径（NUL 结尾）
+    let mut path = [0u8; MAX_WATCH_PATH];
+    let mut ok = false;
+    for i in 0..MAX_WATCH_PATH {
+        // SAFETY: 用户指针逐字节读到 NUL。
+        let c = unsafe { core::ptr::read_volatile((path_ptr as *const u8).add(i)) };
+        path[i] = c;
+        if c == 0 { ok = true; break; }
+    }
+    if !ok {
+        return -(crate::klib::errno::ENAMETOOLONG as i64);
+    }
+    // SAFETY: 系统调用上下文独占 watch 表。
+    unsafe {
+        let watches = &mut (*core::ptr::addr_of_mut!(INOTIFY_WATCHES))[idx];
+        if let Some(w) = watches.iter_mut().find(|w| w.used && w.path == path) {
+            w.mask = mask;
+            return w.wd as i64;
+        }
+        match watches.iter_mut().find(|w| !w.used) {
+            None => -(crate::klib::errno::ENOSPC as i64),
+            Some(w) => {
+                let wd = *core::ptr::addr_of!(NEXT_WD);
+                *core::ptr::addr_of_mut!(NEXT_WD) = wd + 1;
+                *w = Watch { used: true, wd, mask, path };
+                wd as i64
+            }
+        }
+    }
+}
+
+/// inotify_rm_watch。
+pub fn inotify_rm_watch(fd: usize, wd: u32) -> i64 {
+    let idx = match fd_to_obj(fd) {
+        Some(i) => i,
+        None => return -(EBADF as i64),
+    };
+    // SAFETY: 系统调用上下文。
+    unsafe {
+        let watches = &mut (*core::ptr::addr_of_mut!(INOTIFY_WATCHES))[idx];
+        match watches.iter_mut().find(|w| w.used && w.wd == wd) {
+            None => -(EINVAL as i64),
+            Some(w) => {
+                *w = EMPTY_WATCH;
+                0
+            }
+        }
+    }
+}
+
+/// 文件系统事件钩子：VFS/namei 层在 create/delete/rename 时调用。
+/// `dir` 是事件所在目录的绝对路径（NUL 结尾），`name` 是事件涉及的
+/// 最后一级名字（可为空）。所有 watch 了 `dir` 且掩码覆盖 `mask` 的
+/// inotify 对象都会收到一条事件。
+pub fn inotify_notify(dir: &[u8], mask: u32, name: &[u8], cookie: u32) {
+    // SAFETY: 系统调用上下文（VFS 路径），独占两张表。
+    unsafe {
+        for idx in 0..MAX_OBJS {
+            let watches = &(*core::ptr::addr_of!(INOTIFY_WATCHES))[idx];
+            let mut hit_wd = None;
+            for w in watches.iter() {
+                if !w.used || w.mask & mask == 0 {
+                    continue;
+                }
+                // 目录路径全等比较（含 NUL 的前缀）
+                let wlen = w.path.iter().position(|&c| c == 0).unwrap_or(MAX_WATCH_PATH);
+                if dir.len() == wlen && &w.path[..wlen] == dir {
+                    hit_wd = Some(w.wd);
+                    break;
+                }
+            }
+            let wd = match hit_wd {
+                Some(w) => w,
+                None => continue,
+            };
+            let events = &mut (*core::ptr::addr_of_mut!(INOTIFY_EVENTS))[idx];
+            // 找空槽；满了就丢最老的（环形语义：覆盖 slot 0 方向）
+            let slot = match events.iter().position(|e| !e.used) {
+                Some(s) => s,
+                None => 0,
+            };
+            let mut ev = EMPTY_EVENT;
+            ev.used = true;
+            ev.wd = wd;
+            ev.mask = mask;
+            ev.cookie = cookie;
+            let n = name.len().min(MAX_EV_NAME - 1);
+            ev.name[..n].copy_from_slice(&name[..n]);
+            ev.name[n] = 0;
+            events[slot] = ev;
+        }
+    }
+}
+
+/// 该 inotify 对象是否有积压事件（epoll 就绪查询用）。
+pub fn inotify_has_events(idx: usize) -> bool {
+    if idx >= MAX_OBJS { return false; }
+    // SAFETY: 只读。
+    unsafe {
+        (*core::ptr::addr_of!(INOTIFY_EVENTS))[idx].iter().any(|e| e.used)
+    }
+}
+
+/// inotify 读：把积压事件按 `struct inotify_event` 变长记录拷到用户缓冲。
+/// 无事件返回 -EAGAIN（阻塞语义由 read 分发层处理）。
+pub fn inotify_read(fd: usize, buf_ptr: u64, len: u64) -> i64 {
+    let idx = match fd_to_obj(fd) {
+        Some(i) => i,
+        None => return -(EBADF as i64),
+    };
+    // SAFETY: 系统调用上下文。
+    unsafe {
+        let events = &mut (*core::ptr::addr_of_mut!(INOTIFY_EVENTS))[idx];
+        let mut off = 0usize;
+        let buf = buf_ptr as usize;
+        let cap = len as usize;
+        for e in events.iter_mut() {
+            if !e.used { continue; }
+            let nlen = e.name.iter().position(|&c| c == 0).unwrap_or(0) + 1;
+            // 记录头 16 字节 + 名字（向上对齐到 16 的倍数以利解析）
+            let rec = 16 + ((nlen + 15) & !15);
+            if off + rec > cap {
+                if off == 0 {
+                    return -(EINVAL as i64); // 缓冲连一条都放不下
+                }
+                break;
+            }
+            // SAFETY: 用户指针恒等映射可写；写 struct inotify_event
+            // {wd i32, mask u32, cookie u32, len u32} + name。
+            let base = buf + off;
+            core::ptr::write_volatile(base as *mut i32, e.wd as i32);
+            core::ptr::write_volatile((base + 4) as *mut u32, e.mask);
+            core::ptr::write_volatile((base + 8) as *mut u32, e.cookie);
+            core::ptr::write_volatile((base + 12) as *mut u32, nlen as u32);
+            core::ptr::copy_nonoverlapping(e.name.as_ptr(), (base + 16) as *mut u8, nlen);
+            off += rec;
+            *e = EMPTY_EVENT;
+        }
+        if off == 0 {
+            -(EAGAIN as i64)
+        } else {
+            off as i64
+        }
+    }
 }
 
 // =============================================================================
@@ -552,30 +930,52 @@ pub fn inotify_read(_fd: usize, _buf_ptr: u64, _len: u64) -> i64 {
 // =============================================================================
 
 /// 读一个匿名事件 fd。按对象类型分发。
+///
+/// 阻塞语义（原版 eventfd_read/timerfd_read/signalfd_read 的 wait queue
+/// 等价物）：结果 -EAGAIN 且对象不带 O_NONBLOCK 时，schedule() 让出后
+/// 重试。合作式调度下让出会给定时器中断/其他任务制造推进条件的机会：
+/// timerfd 等到期、eventfd 等别人写、signalfd 等信号投递。
 pub fn read(fd: usize, buf_ptr: u64, len: u64) -> i64 {
     let idx = match fd_to_obj(fd) {
         Some(i) => i,
         None => return -(EBADF as i64),
     };
     // SAFETY: idx 有效。
-    match unsafe { (*obj(idx)).kind } {
-        EvKind::Event => eventfd_read(fd, buf_ptr, len),
-        EvKind::Timer => timerfd_read(fd, buf_ptr, len),
-        EvKind::Signal => signalfd_read(fd, buf_ptr, len),
-        EvKind::Inotify => inotify_read(fd, buf_ptr, len),
-        EvKind::Epoll => -(EINVAL as i64), // epoll 不直接读
+    let (kind, nonblock) = unsafe { ((*obj(idx)).kind, (*obj(idx)).nonblock) };
+    loop {
+        let r = match kind {
+            EvKind::Event => eventfd_read(fd, buf_ptr, len),
+            EvKind::Timer => timerfd_read(fd, buf_ptr, len),
+            EvKind::Signal => signalfd_read(fd, buf_ptr, len),
+            EvKind::Inotify => inotify_read(fd, buf_ptr, len),
+            EvKind::Epoll => -(EINVAL as i64), // epoll 不直接读
+        };
+        if r != -(EAGAIN as i64) || nonblock {
+            return r;
+        }
+        // SAFETY: 系统调用上下文让出，同 rt_sigsuspend 的等待路径。
+        unsafe { crate::sched::schedule() };
     }
 }
 
-/// 写一个匿名事件 fd。只有 eventfd 支持写。
+/// 写一个匿名事件 fd。只有 eventfd 支持写。阻塞语义同 [`read`]：
+/// 计数将溢出且非 O_NONBLOCK 时睡到有人读走。
 pub fn write(fd: usize, buf_ptr: u64, len: u64) -> i64 {
     let idx = match fd_to_obj(fd) {
         Some(i) => i,
         None => return -(EBADF as i64),
     };
     // SAFETY: idx 有效。
-    match unsafe { (*obj(idx)).kind } {
-        EvKind::Event => eventfd_write(fd, buf_ptr, len),
-        _ => -(EINVAL as i64),
+    let (kind, nonblock) = unsafe { ((*obj(idx)).kind, (*obj(idx)).nonblock) };
+    if kind != EvKind::Event {
+        return -(EINVAL as i64);
+    }
+    loop {
+        let r = eventfd_write(fd, buf_ptr, len);
+        if r != -(EAGAIN as i64) || nonblock {
+            return r;
+        }
+        // SAFETY: 系统调用上下文让出。
+        unsafe { crate::sched::schedule() };
     }
 }

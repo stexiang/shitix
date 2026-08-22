@@ -1292,6 +1292,26 @@ pub unsafe fn syscall3(number: usize, a0: u64, a1: u64, a2: u64) -> i64 {
     ret
 }
 
+/// 4 参数版本（epoll_ctl/epoll_wait 等需要 r10 传第 4 参的用）。
+///
+/// # Safety
+/// 同 [`syscall3`]。
+pub unsafe fn syscall4(number: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: 同 syscall3；a3 走 r10（x86_64 系统调用第 4 参约定）。
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") number as u64 => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+        );
+    }
+    ret
+}
+
 /// 无参数版本。
 ///
 /// # Safety

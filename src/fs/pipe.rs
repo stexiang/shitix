@@ -25,10 +25,11 @@ struct PipeMeta {
 }
 
 static mut PIPE_PAGES: [usize; MAX_PIPES] = [0; MAX_PIPES];
-/// 每任务管道 fd 表：fd → 管道下标。NIL = 不是管道 fd。
+/// 每任务管道 fd 表：fd → 管道下标 + 1。0 = 不是管道 fd（全 0 初始化
+/// 落在 BSS；NIL=0xFF.. 编码会把 16KB 烧进镜像）。
 /// 和普通 fd 表（TASK_FILP）一样是 per-task 的，否则 fork/exec 会互相踩。
 static mut PIPE_FD_MAP: [[usize; MAX_PIPE_FD]; crate::sched::NR_TASKS] =
-    [[NIL; MAX_PIPE_FD]; crate::sched::NR_TASKS];
+    [[0; MAX_PIPE_FD]; crate::sched::NR_TASKS];
 /// 每个管道 fd 的方向：0 = 读端，1 = 写端。
 static mut PIPE_FD_DIR: [[u8; MAX_PIPE_FD]; crate::sched::NR_TASKS] =
     [[0; MAX_PIPE_FD]; crate::sched::NR_TASKS];
@@ -70,7 +71,7 @@ pub fn register_fd(fd: usize, pipe_idx: usize, dir: u8) {
     unsafe {
         if fd < MAX_PIPE_FD {
             let c = cur();
-            PIPE_FD_MAP[c][fd] = pipe_idx;
+            PIPE_FD_MAP[c][fd] = pipe_idx + 1;
             PIPE_FD_DIR[c][fd] = dir;
         }
     }
@@ -78,18 +79,18 @@ pub fn register_fd(fd: usize, pipe_idx: usize, dir: u8) {
 
 pub fn unregister_fd(fd: usize) {
     unsafe {
-        if fd < MAX_PIPE_FD { PIPE_FD_MAP[cur()][fd] = NIL; }
+        if fd < MAX_PIPE_FD { PIPE_FD_MAP[cur()][fd] = 0; }
     }
 }
 
 pub fn fd_is_pipe(fd: usize) -> bool {
-    unsafe { fd < MAX_PIPE_FD && PIPE_FD_MAP[cur()][fd] != NIL }
+    unsafe { fd < MAX_PIPE_FD && PIPE_FD_MAP[cur()][fd] != 0 }
 }
 
 pub fn fd_to_pipe(fd: usize) -> Option<usize> {
     unsafe {
-        if fd < MAX_PIPE_FD && PIPE_FD_MAP[cur()][fd] != NIL {
-            Some(PIPE_FD_MAP[cur()][fd])
+        if fd < MAX_PIPE_FD && PIPE_FD_MAP[cur()][fd] != 0 {
+            Some(PIPE_FD_MAP[cur()][fd] - 1)
         } else { None }
     }
 }
@@ -186,8 +187,8 @@ pub fn clone_pipe_fds(from: usize, to: usize) {
         core::ptr::copy_nonoverlapping(&raw const PIPE_FD_DIR[from], &raw mut PIPE_FD_DIR[to], 1);
         // 每个被复制的 fd 给对应端加一次引用计数。
         for fd in 0..MAX_PIPE_FD {
-            let idx = PIPE_FD_MAP[to][fd];
-            if idx == NIL { continue; }
+            if PIPE_FD_MAP[to][fd] == 0 { continue; }
+            let idx = PIPE_FD_MAP[to][fd] - 1;
             let dir = PIPE_FD_DIR[to][fd];
             let page = PIPE_PAGES[idx];
             if page != 0 {

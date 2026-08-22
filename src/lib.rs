@@ -775,10 +775,12 @@ fn syscall_selftest() {
     kprintln!("syscall: uid/gid -> {}", if uid_ok { "ok" } else { "FAIL" });
 
     // ---- 匿名事件 fd（Phase B）：eventfd 往返 ----
-    // eventfd2(0,0) 建一个计数 0 的 eventfd；write 42 → read 得 42 且清零，
-    // 再 read 得 -EAGAIN；close 返回 0。
+    // eventfd2(0, EFD_NONBLOCK) 建一个计数 0 的 eventfd；write 42 →
+    // read 得 42 且清零，再 read 得 -EAGAIN；close 返回 0。
+    // 注意：不带 NONBLOCK 的空读在真实阻塞语义下会挂死（等待写者），
+    // 所以这里全程走 NONBLOCK。
     let ev_ok = unsafe {
-        let fd = syscall::syscall3(nr::EVENTFD2, 0, 0, 0);
+        let fd = syscall::syscall3(nr::EVENTFD2, 0, 0x800, 0);
         if fd < 3 {
             false
         } else {
@@ -795,12 +797,46 @@ fn syscall_selftest() {
     };
     kprintln!("syscall: eventfd -> {}", if ev_ok { "ok" } else { "FAIL" });
 
+    // ---- epoll 真实就绪（Batch F）----
+    // eventfd 计数为 0 时 epoll_wait(timeout=0) 必须返回 0；
+    // 写入计数后必须上报 EPOLLIN。验证 epoll_ctl 兴趣表 + fd_ready 路径。
+    let ep_ok = unsafe {
+        let efd = syscall::syscall3(nr::EVENTFD2, 0, 0x800, 0);
+        let epfd = syscall::syscall3(nr::EPOLL_CREATE1, 0, 0, 0);
+        if efd < 3 || epfd < 3 {
+            false
+        } else {
+            // struct epoll_event { events u32, pad u32, data u64 }
+            let mut ev = [0u64; 2];
+            ev[0] = 1; // EPOLLIN
+            ev[1] = 0xAB;
+            let ctl = syscall::syscall4(
+                nr::EPOLL_CTL, epfd as u64, 1 /* ADD */, efd as u64,
+                ev.as_ptr() as u64);
+            let mut out = [0u64; 2];
+            // 未写计数 → timeout=0 返回 0
+            let n0 = syscall::syscall4(
+                nr::EPOLL_WAIT, epfd as u64, out.as_mut_ptr() as u64, 1, 0);
+            let val = 7u64;
+            syscall::syscall3(nr::WRITE, efd as u64, &val as *const _ as u64, 8);
+            let n1 = syscall::syscall4(
+                nr::EPOLL_WAIT, epfd as u64, out.as_mut_ptr() as u64, 1, 0);
+            syscall::syscall3(nr::CLOSE, efd as u64, 0, 0);
+            syscall::syscall3(nr::CLOSE, epfd as u64, 0, 0);
+            ctl == 0 && n0 == 0 && n1 == 1
+                && out[0] & 1 != 0 && out[1] == 0xAB
+        }
+    };
+    kprintln!("syscall: epoll -> {}", if ep_ok { "ok" } else { "FAIL" });
+
     // ---- timerfd / signalfd 基本往返（Phase B）----
     // timerfd：create → settime（立即）→ gettime → close 全成功。
     // signalfd：create → read 无待处理信号得 -EAGAIN → close。
     let ts_ok = unsafe {
         let tfd = syscall::syscall3(nr::TIMERFD_CREATE, 1 /* CLOCK_MONOTONIC */, 0, 0);
-        let sfd = syscall::syscall3(nr::SIGNALFD, -1i64 as u64, 0, 0);
+        // SFD_NONBLOCK：signalfd 的空读必须立刻返回（否则真实阻塞语义挂死）。
+        // signalfd(fd, mask*, flags)：mask=NULL、flags=0x800 在第 3 参。
+        let sfd = syscall::syscall3(nr::SIGNALFD, -1i64 as u64, 0, 0x800);
         if tfd < 3 || sfd < 3 {
             false
         } else {
