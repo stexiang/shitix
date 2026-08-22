@@ -79,7 +79,7 @@ impl Level {
 }
 
 /// 原版 `LOG_BUF_LEN`。
-const LOG_BUF_LEN: usize = 4096;
+pub const LOG_BUF_LEN: usize = 4096;
 /// 原版 `DEFAULT_CONSOLE_LOGLEVEL`。
 const DEFAULT_CONSOLE_LOGLEVEL: u8 = 7;
 /// 原版 `DEFAULT_MESSAGE_LOGLEVEL`：没写 `<N>` 前缀时的默认级别。
@@ -146,6 +146,14 @@ pub fn logged_chars() -> usize {
 /// 缓冲里当前还留着的日志字节数，最多 [`LOG_BUF_LEN`]。
 pub fn log_size() -> usize {
     logged_chars().min(LOG_BUF_LEN)
+}
+
+/// 清空日志环。对应原版 `sys_syslog` 的 type 5 / type 4 的清空语义。
+pub fn clear_log() {
+    // SAFETY: 单核无抢占路径；调用者保证进程上下文
+    let lb = unsafe { log() };
+    lb.head = 0;
+    lb.total = 0;
 }
 
 /// 把缓冲里现存的日志按时间顺序拷进 `out`，返回拷贝的字节数。

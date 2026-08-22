@@ -346,3 +346,44 @@ LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接
 #### 限制
 - minix 符号链接未移植：read_symlink_target 对 minix 链接返回 None -> -EIO。
 - O_NOFOLLOW 未移植：open_namei 对已存在的末尾链接统一跟随（同原版 1.0.9）。
+
+### 本次会话（2026-08-22，第二批 syscall + 镜像布局/ext4 修复）
+
+#### 第二批 syscall（src/syscall/sys.rs，均已接线 nr 表）
+- `close_range`(436)、`chroot`(161，魔法数/per-task root)、`reboot`(169，魔法数校验+
+  键盘控制器复位/HALT/POWER_OFF)、`capget`/`capset`(125/126，单用户 uid0 模型，v3/v1
+  布局)、`syslog`(103，type 2/3/4/10，依赖 printk 日志环；printk.rs 新增 `clear_log()`、
+  `LOG_BUF_LEN` 改 pub)、`rt_sigpending`(127)、`rt_sigsuspend`(130)、
+  `rt_sigqueueinfo`/`rt_tgsigqueueinfo`(129/297，共用 sigqueue_common)、
+  `sched_setattr`/`sched_getattr`(314/315，SCHED_OTHER 单策略)、
+  `recvmmsg`/`sendmmsg`(299/307，逐条走 recvmsg/sendmsg)。
+- chroot 配套：`Task.root` per-task 根 inode；namei.rs 5 处根解析点改走
+  `super_block::task_root_inode()`（范本：`pwd_inode()`）；close 抽出 `close_one_fd()`。
+- 验证：syscall_selftest 第二批全过（注意 task[0] pid=0，rt_sigqueueinfo 拒 pid<=0
+  属正确行为，测试里改用 kill(0,SIGUSR1) 投递）；busybox `chroot / /bin/echo`、
+  `chroot /nonexistent`（ENOENT）、`chroot /tmp/jail`（换根后 exec ENOENT）全对。
+
+#### kernel 镜像布局修复（boot/kernel.ld）
+- `_kernel_end`（含 BSS）超过 0x9F000 ASSERT：SMP 提交后 release+extra-drivers
+  和 debug 全都链不上。**BSS 挪到 1MB**（objcopy -R .bss 本就不进装载镜像，
+  head.S 上电清零）：装载镜像（text/rodata/data）ASSERT ≤ 0x90000（bootsect
+  线性加载到 0x10000，0x90200 是 setup），BSS ASSERT ≤ 0x200000
+  （后面是 mem_map/引用计数表/内核栈池）。
+- dev profile 改 `opt-level="z"` + 关 debug-assertions/overflow-checks，
+  debug 镜像才塞回 512KB 装载窗口（约 0x83EA0）。
+- 注意：BSS 旧位置 0x83000+ 本来就盖 0x90000 参数区（head.S 先存寄存器再清
+  再恢复）；挪走以后这段保护变成多余但无害。
+
+#### ext4 read_inode：extent 判定看 magic 不看 flag
+- 症状：lfs3.img 挂载成功但整盘 ENOENT（/init、/bin、/sbin 全 -2）。
+- 根因：仓库构建脚本生成的镜像 inode 带 EXT4_EXTENTS_FL 但 i_block 区是
+  经典块指针（无 0xF30A 头）。read_inode 按 flag 走 extent 分支 → i.data 全 0
+  → 根目录不可读。改成 `uses_extent() && magic==0xF30A` 才算 extent
+  （bmap_phys 本来就按 magic 判，两处口径现在一致）。
+
+#### 环境/工具备忘
+- 仓库里 `*.img` 是 Git LFS 指针（133 字节）；`git checkout` 会把真镜像换回指针。
+  没有 git-lfs 时用：curl -L https://media.githubusercontent.com/media/stexiang/shitix/main/lfs3.img
+  （oid sha256=45b91886…, 64MB）。真镜像备份在 /tmp/lfs3.img。
+- hd_identify 选盘后补了 ide_settle()（ATA 400ns），与读/写路径一致。
+- 串口喂 shell 命令要先 sleep 6 等 shell 起来，否则开头字符被吃掉。

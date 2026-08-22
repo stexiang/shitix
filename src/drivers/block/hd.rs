@@ -300,8 +300,9 @@ unsafe fn hd_identify(dev: usize) -> Option<u64> {
             if !ide_wait_ready() { continue; }
 
             ide_select_device(dev, 0);
-            // Delay after select
-            for _ in 0..100 { core::hint::spin_loop(); }
+            // ATA 规范：写完 Drive/Head 后读几次状态（~400ns）让选盘生效，
+            // 否则紧接的状态/数据可能还属于上一个选中的设备。
+            ide_settle();
             ide_setup_lba(0, 0);
 
             ide_write_cmd(CMD_IDENTIFY);

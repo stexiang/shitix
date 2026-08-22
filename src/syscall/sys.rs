@@ -5,7 +5,7 @@
 //! 其余在分发表里指向 [`ni_syscall`]。每个函数的文档注明原版位置。
 
 use super::{SysArgs, nr};
-use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP};
+use crate::klib::errno::{EFAULT, EINVAL, ENOSYS, EBADF, EPERM, ERANGE, EINTR, ENOENT, ENODEV, EOPNOTSUPP, ESRCH};
 use crate::klib::printk::Level;
 use crate::sched;
 use crate::traps::PtRegs;
@@ -1377,7 +1377,13 @@ pub fn close(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     if fd < 0 {
         return -(EBADF as i64);
     }
-    let fd = fd as usize;
+    close_one_fd(fd as usize)
+}
+
+/// 关闭单个 fd 的全部类型分支（管道/socket/event/普通文件）。
+/// 给 [`close`] 与 [`close_range`] 共用；未打开的 fd 静默返回 0（close_range 语义），
+/// 单发 close() 需要的 EBADF 由 open::sys_close 自己返回。
+fn close_one_fd(fd: usize) -> i64 {
     let mut closed = false;
     // Pipe cleanup（按方向递减计数，两端归零才释放）
     if crate::fs::pipe::fd_is_pipe(fd) {
@@ -2485,8 +2491,56 @@ pub fn prlimit64(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
     0
 }
-/// 重新引导。
-pub fn reboot(args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 重新引导。对应原版 `kernel/sys.c:sys_reboot()`。
+/// 魔法数校验后按 cmd 走：RESTART 用键盘控制器复位线，HALT/POWER_OFF 停机。
+pub fn reboot(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    const LINUX_REBOOT_MAGIC1: i32 = 0xfee1dead_u32 as i32;
+    const LINUX_REBOOT_MAGIC2: i32 = 672274793; // Linus 的生日
+    const LINUX_REBOOT_MAGIC2B: i32 = 85072278;
+    const LINUX_REBOOT_MAGIC2C: i32 = 369367448;
+    const LINUX_REBOOT_MAGIC2D: i32 = 537993216;
+    const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
+    const LINUX_REBOOT_CMD_HALT: u32 = 0xCDEF0123;
+    const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
+
+    let magic1 = args.a0 as i32;
+    let magic2 = args.a1 as i32;
+    let cmd = args.a2 as u32;
+    if magic1 != LINUX_REBOOT_MAGIC1
+        || (magic2 != LINUX_REBOOT_MAGIC2 && magic2 != LINUX_REBOOT_MAGIC2B
+            && magic2 != LINUX_REBOOT_MAGIC2C && magic2 != LINUX_REBOOT_MAGIC2D)
+    {
+        return -(EINVAL as i64);
+    }
+    match cmd {
+        LINUX_REBOOT_CMD_RESTART => {
+            crate::sprintln!("reboot: restarting");
+            // 键盘控制器脉冲复位线（8042 的 pulse output 0xFE）
+            // SAFETY: CPL=0，写 8042 命令端口是标准复位序列
+            unsafe {
+                core::arch::asm!("outb %al, %dx", in("dx") 0x64u16, in("al") 0xFEu8,
+                                 options(nomem, nostack, preserves_flags, att_syntax));
+            }
+            // 8042 没复位（无控制器）→ 三重故障兜底
+            // SAFETY: lidt 一个空 IDT 后 int3，必三重故障
+            unsafe {
+                let zero: [u8; 10] = [0; 10];
+                core::arch::asm!("lidt ({0}); int3", in(reg) &zero,
+                                 options(nostack, att_syntax));
+            }
+            loop { core::hint::spin_loop(); }
+        }
+        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
+            crate::sprintln!("reboot: halt/poweroff");
+            // SAFETY: 关机路径，关中断停机
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
+            }
+            loop { core::hint::spin_loop(); }
+        }
+        _ => -(EINVAL as i64),
+    }
+}
 /// 资源使用情况。
 
 // Socket syscalls
@@ -3815,8 +3869,51 @@ pub fn io_uring_register(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS 
 pub fn kexec_load(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn init_module(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn delete_module(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn sched_setattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn sched_getattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 设置调度属性。只有 SCHED_OTHER 一种策略，校验后接受（nice/priority
+/// 映射到 task.priority 的语义见 setpriority）。
+pub fn sched_setattr(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pid = args.a0 as i32;
+    let attr = args.a1 as *const u64;
+    let flags = args.a3;
+    if attr.is_null() || flags != 0 { return -(EINVAL as i64); }
+    // sched_attr: size(0) policy(4) flags(8) nice(12) priority(16) ...
+    // SAFETY: 用户指针恒等映射
+    let size = unsafe { core::ptr::read_volatile(attr as *const u32) } as usize;
+    if size < 32 { return -(EINVAL as i64); }
+    let policy = unsafe { core::ptr::read_volatile((attr as *const u32).add(1)) };
+    if policy != 0 { return -(EINVAL as i64); } // 只支持 SCHED_OTHER
+    if pid != 0 {
+        // 只支持自己
+        let me_pid = unsafe { (*sched::task_ptr(sched::current_index())).pid };
+        if pid != me_pid { return -(ESRCH as i64); }
+    }
+    0
+}
+/// 取调度属性。报告 SCHED_OTHER + 默认参数，attr.size 回写用户给的 size。
+pub fn sched_getattr(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pid = args.a0 as i32;
+    let attr = args.a1 as *mut u64;
+    let size = args.a2 as usize;
+    let flags = args.a3;
+    if attr.is_null() || flags != 0 || size < 32 { return -(EINVAL as i64); }
+    if pid != 0 {
+        let me_pid = unsafe { (*sched::task_ptr(sched::current_index())).pid };
+        if pid != me_pid { return -(ESRCH as i64); }
+    }
+    // SAFETY: 用户指针恒等映射
+    unsafe {
+        let p = attr as *mut u32;
+        core::ptr::write_volatile(p, size as u32);      // size
+        core::ptr::write_volatile(p.add(1), 0);         // policy = SCHED_OTHER
+        core::ptr::write_volatile(p.add(2), 0);         // flags(lo 部分)
+        core::ptr::write_volatile(p.add(3), 0);         // nice = 0
+        core::ptr::write_volatile(p.add(4), 0);         // priority = 0
+        core::ptr::write_volatile(attr.add(3), 0);      // runtime
+        core::ptr::write_volatile(attr.add(4), 0);      // deadline
+        core::ptr::write_volatile(attr.add(5), 0);      // period
+    }
+    0
+}
 pub fn seccomp(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn memfd_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn userfaultfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -4583,20 +4680,150 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
 }
 /// 进程跟踪。需要 `arch_ptrace` 与调试寄存器支持，未实现 → -EPERM。
 pub fn ptrace(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(EPERM as i64) }
-/// 读内核日志环。`klib::printk::read_log()` 已有，缺用户地址校验才好接。
-pub fn syslog(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 取进程能力集。没有 capability 机制。
-pub fn capget(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 设进程能力集。同 [`capget`]。
-pub fn capset(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 读内核日志环。对应原版 `kernel/printk.c:sys_syslog()`。
+/// 实现 type 2/3（读全部）、4（读并清）、10（环大小）；其余需要
+/// console_loglevel 管理，返回 EINVAL。
+pub fn syslog(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let ty = args.a0 as i32;
+    let buf = args.a1 as *mut u8;
+    let len = args.a2 as usize;
+    match ty {
+        3 | 4 | 2 => {
+            if buf.is_null() {
+                return -(EFAULT as i64);
+            }
+            let slice = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+            let n = crate::klib::printk::read_log(slice);
+            if ty == 4 {
+                crate::klib::printk::clear_log();
+            }
+            n as i64
+        }
+        10 => crate::klib::printk::LOG_BUF_LEN as i64,
+        _ => -(EINVAL as i64),
+    }
+}
+/// 取进程能力集。本内核是单用户（uid 0）模型，相当于持有全部 capability。
+/// 支持 v3（两组 32 位）与 v1（一组）布局；只查自己或已存在的进程。
+pub fn capget(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    const CAP_V1: u32 = 0x1998_0330;
+    const CAP_V3: u32 = 0x2008_0522;
+    let hdr = args.a0 as *const u32;
+    let datap = args.a1 as *mut u32;
+    if hdr.is_null() {
+        return -(EINVAL as i64);
+    }
+    // SAFETY: 系统调用上下文，用户指针恒等映射
+    let (version, pid) = unsafe { (*hdr, *(hdr.add(1)) as i32) };
+    if version != CAP_V1 && version != CAP_V3 {
+        // 同 Linux：不识别的 version 也要回写 kernel 偏好版本号
+        unsafe { *(args.a0 as *mut u32) = CAP_V3 };
+        return -(EINVAL as i64);
+    }
+    // 校验目标进程存在（0 == 自己）
+    if pid != 0 {
+        let me = sched::current_index();
+        let found = unsafe {
+            (0..sched::NR_TASKS).any(|i| {
+                let t = sched::task_ptr(i);
+                (*t).state != crate::sched::task::TaskState::Unused
+                    && (*t).pid as i32 == pid
+            })
+        };
+        let _ = me;
+        if !found {
+            return -(ESRCH as i64);
+        }
+    }
+    if !datap.is_null() {
+        // {effective, permitted, inheritable} × 2（v3 覆盖 64 位能力）
+        // SAFETY: 同上
+        unsafe {
+            *datap = u32::MAX;          // effective lo
+            *datap.add(1) = u32::MAX;   // permitted lo
+            *datap.add(2) = 0;          // inheritable lo
+            if version == CAP_V3 {
+                *datap.add(3) = u32::MAX; // effective hi
+                *datap.add(4) = u32::MAX; // permitted hi
+                *datap.add(5) = 0;        // inheritable hi
+            }
+        }
+    }
+    0
+}
+/// 设进程能力集。单用户模型下能力恒为全集，校验合法后空操作成功。
+pub fn capset(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    if args.a0 == 0 || args.a1 == 0 {
+        return -(EINVAL as i64);
+    }
+    0
+}
 /// 取待处理信号集（rt 版）。
-pub fn rt_sigpending(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn rt_sigpending(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let set = args.a0 as *mut u64;
+    let sigsetsize = args.a1;
+    if sigsetsize != 8 { return -(EINVAL as i64); }
+    if set.is_null() { return -(EFAULT as i64); }
+    // SAFETY: 系统调用上下文，读当前任务的待处理位图
+    let pending = unsafe { (*sched::task_ptr(sched::current_index())).signal };
+    // SAFETY: 用户指针恒等映射
+    unsafe { core::ptr::write_volatile(set, pending) };
+    0
+}
 /// 带超时地等信号（rt 版）。
 pub fn rt_sigtimedwait(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 带 siginfo 发信号。
-pub fn rt_sigqueueinfo(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 临时换屏蔽字并挂起。
-pub fn rt_sigsuspend(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 带 siginfo 发信号。本内核不传递 siginfo 内容（setup_frame 里 si 全 0），
+/// 但按 POSIX 语义校验：用户态只允许 si_code <= 0，然后按 kill 投递。
+pub fn rt_sigqueueinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    sigqueue_common(args.a0 as i32, args.a1 as i32, args.a2)
+}
+/// rt_sigqueueinfo / rt_tgsigqueueinfo 的公共部分。
+/// 线程组语义缺位，tgsigqueueinfo 的 tgid 参数按 pid 处理。
+fn sigqueue_common(pid: i32, sig: i32, info: u64) -> i64 {
+    if sig < 1 || sig > 31 { return -(EINVAL as i64); }
+    if pid <= 0 { return -(EINVAL as i64); }
+    // siginfo_t: si_signo(0) si_errno(4) si_code(8)；用户态 si_code 必须 <= 0
+    if info != 0 {
+        let si_code = unsafe { core::ptr::read_volatile((info as *const i32).add(2)) };
+        if si_code > 0 { return -(EPERM as i64); }
+    }
+    let mut sent = false;
+    unsafe {
+        for i in 0..sched::NR_TASKS {
+            let t = sched::task_ptr(i);
+            if (*t).state == crate::sched::task::TaskState::Unused { continue; }
+            if (*t).pid as i32 == pid {
+                crate::signal::send_sig(sig as u32, i, 0);
+                sent = true;
+                break;
+            }
+        }
+    }
+    if sent { 0 } else { -(ESRCH as i64) }
+}
+/// 临时换屏蔽字并挂起，直到有未屏蔽的待处理信号。信号处理函数会在
+/// 返回用户态前执行（setup_frame 路径），之后本调用总是返回 -EINTR（POSIX 语义）。
+pub fn rt_sigsuspend(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let newset = args.a0 as *const u64;
+    let sigsetsize = args.a1;
+    if sigsetsize != 8 { return -(EINVAL as i64); }
+    if newset.is_null() { return -(EFAULT as i64); }
+    // SAFETY: 用户指针恒等映射
+    let newmask = unsafe { core::ptr::read_volatile(newset) };
+    let old = crate::signal::setsigmask(newmask);
+    // 睡到有未屏蔽的待处理信号为止。合作式调度器下 schedule() 会把时间
+    // 让给其他任务/中断路径，信号到达后置位 signal 即醒。
+    loop {
+        let pending = unsafe {
+            (*sched::task_ptr(sched::current_index())).has_pending_signal()
+        };
+        if pending { break; }
+        // SAFETY: 系统调用上下文让出 CPU，调度器契约同 vfork 等待路径
+        unsafe { sched::schedule() };
+    }
+    crate::signal::setsigmask(old);
+    -(EINTR as i64)
+}
 /// 设置备用信号栈。
 /// sigaltstack：设置/获取备选信号栈。接受所有参数，返回 0。
 pub fn sigaltstack(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
@@ -4797,7 +5024,15 @@ pub fn rt_sigreturn(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
 /// 调整系统时钟。没有 RTC 与 NTP 环路，接受但忽略。
 pub fn adjtimex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 换根目录。需要 per-task 的 root inode。
-pub fn chroot(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+pub fn chroot(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 同 [`open`]。
+    let path = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 同 [`chdir`]。
+    unsafe { crate::fs::open::sys_chroot(path) }
+}
 /// 开启进程记账。没有记账后台，接受但忽略。
 pub fn acct(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 设置系统时间。没有 RTC，接受但忽略。
@@ -5114,16 +5349,58 @@ pub fn pwritev(args: &SysArgs, regs: &mut PtRegs) -> i64 {
     unsafe { crate::fs::read_write::lseek(fd as usize, old_pos, crate::fs::SEEK_SET); }
     r
 }
-/// 按 tgid 带 siginfo 发信号。
-pub fn rt_tgsigqueueinfo(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 批量收包。`net/` 层还没有 msghdr 批处理。
-pub fn recvmmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 按 tgid/tid 带 siginfo 发信号。无线程组语义，tid 按 pid 投递。
+pub fn rt_tgsigqueueinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let _tgid = args.a0 as i32;
+    sigqueue_common(args.a1 as i32, args.a2 as i32, args.a3)
+}
+/// 批量收包。对 mmsghdr 数组逐个走 [`recvmsg`]，msg_len 回写每次的字节数；
+/// 中途出错时返回已成功条数（一条没收成则返回错误码），同 Linux 语义。
+pub fn recvmmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as usize;
+    let mmsg = args.a1 as *mut u8;
+    let vlen = args.a2 as u32;
+    let flags = args.a3 as i32;
+    // struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }（自然对齐 64B msghdr）
+    const MMSGHDR_SIZE: usize = 64;
+    if mmsg.is_null() { return -(EFAULT as i64); }
+    let mut done = 0i64;
+    for i in 0..vlen as usize {
+        let hdr = unsafe { mmsg.add(i * MMSGHDR_SIZE) };
+        let r = crate::net::socket::sys_recvmsg(fd, hdr, flags);
+        if r < 0 {
+            return if done > 0 { done } else { r };
+        }
+        // msg_len 在 msghdr 之后（对齐到 8）
+        unsafe { core::ptr::write_volatile(hdr.add(56) as *mut u32, r as u32) };
+        done += 1;
+    }
+    done
+}
 /// 取文件句柄。minix 层没有导出句柄的概念。
 pub fn name_to_handle_at(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 按句柄打开。同 [`name_to_handle_at`]。
 pub fn open_by_handle_at(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-/// 批量发包。同 [`recvmmsg`]。
-pub fn sendmmsg(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 批量发包。对 mmsghdr 数组逐个走 [`sendmsg`]，语义同 [`recvmmsg`]。
+pub fn sendmmsg(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let fd = args.a0 as usize;
+    let mmsg = args.a1 as *const u8;
+    let vlen = args.a2 as u32;
+    let flags = args.a3 as i32;
+    const MMSGHDR_SIZE: usize = 64;
+    if mmsg.is_null() { return -(EFAULT as i64); }
+    let mut done = 0i64;
+    for i in 0..vlen as usize {
+        let hdr = unsafe { mmsg.add(i * MMSGHDR_SIZE) };
+        let r = crate::net::socket::sys_sendmsg(fd, hdr, flags);
+        if r < 0 {
+            return if done > 0 { done } else { r };
+        }
+        unsafe { core::ptr::write_volatile(hdr.add(56) as *mut u32 as *mut u32, r as u32) };
+        done += 1;
+    }
+    done
+}
 /// 比较两个进程的内核资源。
 pub fn kcmp(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 从 fd 装载模块。同 [`create_module`]。
@@ -5132,8 +5409,27 @@ pub fn finit_module(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i6
 pub fn kexec_file_load(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// BPF 系统调用。没有 BPF 虚拟机。
 pub fn bpf(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 按 dirfd 执行。`execve` 已有，缺 dirfd 相对解析。
-pub fn execveat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 按 dirfd 执行。支持 AT_FDCWD 与绝对路径（等价 execve）；
+/// dirfd 相对解析需要 fd→路径回溯，暂不支持（ENOSYS 让 glibc 回退 execve）。
+pub fn execveat(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    let dirfd = args.a0 as i64;
+    let flags = args.a4;
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return -(EINVAL as i64);
+    }
+    // 路径为空：只有 AT_EMPTY_PATH + 真 dirfd 才有意义，我们不支持
+    if flags & AT_EMPTY_PATH != 0 { return -(ENOSYS as i64); }
+    // 绝对路径或 AT_FDCWD：与 execve 完全等价
+    let first = unsafe { core::ptr::read_volatile(args.a1 as *const u8) };
+    if dirfd == AT_FDCWD || first == b'/' {
+        let sub = SysArgs { a0: args.a1, a1: args.a2, a2: args.a3, a3: 0, a4: 0, a5: 0 };
+        return execve(&sub, regs);
+    }
+    -(ENOSYS as i64)
+}
 /// 取进程的 pidfd。没有 pidfd 类型。
 pub fn pidfd_open(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// [`clone`] 的结构体参数版本。
@@ -5162,8 +5458,25 @@ pub fn fsconfig(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn fsmount(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 新式挂载 API：由已有挂载点取上下文。同 [`fsopen`]。
 pub fn fspick(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 批量关闭 fd 区间。`fs/open.rs` 的 fd 表是每进程 16 项，加这个要先决定 EBADF 语义。
-pub fn close_range(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 批量关闭 fd 区间 [first, last]。对应 Linux 5.9 的 `close_range(2)`。
+/// 区间内未打开的 fd 静默跳过（语义就是「保证这段全关」），flags 暂未支持。
+pub fn close_range(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let first = args.a0 as u32;
+    let last = args.a1 as u32;
+    let flags = args.a2 as u32;
+    if first > last {
+        return -(EINVAL as i64);
+    }
+    if flags != 0 {
+        // CLOEXEC/UNSHARE/CLOSERANGE 语义都建立在 fd 表独立拷贝之上，暂不支持
+        return -(EINVAL as i64);
+    }
+    let last = (last as usize).min(crate::fs::NR_OPEN - 1);
+    for fd in first as usize..=last {
+        close_one_fd(fd);
+    }
+    0
+}
 /// 带 `open_how` 结构的 openat。需要 RESOLVE_* 解析约束。
 pub fn openat2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // openat2(dirfd, pathname, open_how*, size)

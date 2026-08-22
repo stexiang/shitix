@@ -606,6 +606,16 @@ pub fn pwd_inode() -> usize {
     }
 }
 
+/// 路径解析的根 inode 下标。返回 per-task root（chroot 设置过），否则全局根。
+/// 对应原版 `current->root`。
+pub fn task_root_inode() -> usize {
+    unsafe {
+        let t = crate::sched::task_ptr(crate::sched::current_index());
+        if (*t).root != NIL { return (*t).root; }
+        root_inode()
+    }
+}
+
 /// 换工作目录。同时写入全局和 per-task。
 pub unsafe fn set_pwd(n: usize) {
     unsafe {

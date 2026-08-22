@@ -473,22 +473,26 @@ pub mod full {
                     i.i_ctime = ei.ctime();
                     i.i_blksize = info.block_size as u32;
                     i.data = [0; 15];
-                    if ei.uses_extent() {
-                        let ib = ei.i_block_raw();
-                        if u16::from_le_bytes([ib[0],ib[1]]) == 0xF30A {
-                            let n_entries = ib[2] as usize;
-                            // 按文件系统块粒度填充 i.data[k]：k 是文件系统逻辑块
-                            // 号，值是文件系统物理块号（与 on-disk i_block 同单位）。
-                            for e in 0..n_entries {
-                                let off = 12 + e * 12; // header(12) + entry(12)
-                                let ee_block = u32::from_le_bytes([ib[off],ib[off+1],ib[off+2],ib[off+3]]);
-                                let ee_len = u16::from_le_bytes([ib[off+4],ib[off+5]]) as u32;
-                                let ee_start_lo = u32::from_le_bytes([ib[off+8],ib[off+9],ib[off+10],ib[off+11]]);
-                                for blk in 0..ee_len {
-                                    let idx = (ee_block + blk) as usize;
-                                    if idx < 12 {
-                                        i.data[idx] = (ee_start_lo + blk) as u32;
-                                    }
+                    // extent 与否看 i_block 区头的 magic（0xF30A），不能只看
+                    // EXT4_EXTENTS_FL：本仓库构建脚本生成的镜像 flag 置位但
+                    // i_block 区是经典块指针，按 flag 走 extent 分支会把 i.data
+                    // 全留 0，根目录直接不可读（整盘 ENOENT）。
+                    let ib = ei.i_block_raw();
+                    let is_ext = ei.uses_extent()
+                        && u16::from_le_bytes([ib[0], ib[1]]) == 0xF30A;
+                    if is_ext {
+                        let n_entries = ib[2] as usize;
+                        // 按文件系统块粒度填充 i.data[k]：k 是文件系统逻辑块
+                        // 号，值是文件系统物理块号（与 on-disk i_block 同单位）。
+                        for e in 0..n_entries {
+                            let off = 12 + e * 12; // header(12) + entry(12)
+                            let ee_block = u32::from_le_bytes([ib[off],ib[off+1],ib[off+2],ib[off+3]]);
+                            let ee_len = u16::from_le_bytes([ib[off+4],ib[off+5]]) as u32;
+                            let ee_start_lo = u32::from_le_bytes([ib[off+8],ib[off+9],ib[off+10],ib[off+11]]);
+                            for blk in 0..ee_len {
+                                let idx = (ee_block + blk) as usize;
+                                if idx < 12 {
+                                    i.data[idx] = (ee_start_lo + blk) as u32;
                                 }
                             }
                         }

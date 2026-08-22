@@ -310,6 +310,38 @@ pub unsafe fn sys_chdir(path: &[u8]) -> i64 {
     }
 }
 
+/// 换根目录。对应原版 `fs/open.c:sys_chroot()`。只影响**当前进程**的
+/// 路径解析起点（`current->root`），namei 里的绝对路径与 `..` 封顶都以它为准。
+///
+/// # Safety
+/// 只能在进程上下文调用。
+pub unsafe fn sys_chroot(path: &[u8]) -> i64 {
+    // SAFETY: 契约转交。
+    unsafe {
+        let n = match namei::namei(path) {
+            Ok(n) => n,
+            Err(e) => return -(e as i64),
+        };
+        let i_mode = core::ptr::addr_of!((*inode::inode_ptr(n)).i_mode).read_volatile();
+        if !mode::is_dir(i_mode) {
+            inode::iput(n);
+            return -(ENOTDIR as i64);
+        }
+        if !namei::permission(n, super::MAY_EXEC) {
+            inode::iput(n);
+            return -(EINVAL as i64);
+        }
+        // 旧 root 的引用还掉（同 chdir 对 pwd 的处理），新引用留在 task 上
+        let t = crate::sched::task_ptr(crate::sched::current_index());
+        let old = (*t).root;
+        (*t).root = n;
+        if old != NIL && old != super_block::root_inode() {
+            inode::iput(old);
+        }
+        0
+    }
+}
+
 /// 按 fd 切换当前工作目录。对应原版 `fs/open.c:sys_fchdir()`。
 ///
 /// # Safety

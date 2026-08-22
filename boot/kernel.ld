@@ -20,6 +20,17 @@ SECTIONS
         *(.got .got.plt)
     }
 
+    _image_end = .;
+
+    /*
+     * BSS 不放装载镜像里（objcopy -R .bss），由 head.S 上电清零，
+     * 所以它可以待在装载区之外。挪到 1MB：装载镜像（text/rodata/data）
+     * 从 0x10000 线性铺开，必须止于 0x90000 的参数区之前；而 BSS 若跟在
+     * 后面，体积一大就会盖掉 0x90000 机器参数 / 0x90200 setup / 0x9E000
+     * E820 表。1MB 之上是恒等映射的干净 RAM，mm::init 又把
+     * mem_map/引用计数表/内核栈池排在 _kernel_end 之后，不会冲突。
+     */
+    . = 0x100000;
     .bss : ALIGN(16) {
         __bss_start = .;
         *(.bss .bss.*)
@@ -30,16 +41,12 @@ SECTIONS
 
     _kernel_end = .;
 
-    /*
-     * 内核镜像（含 BSS）不能长到 0x90000：setup.S 把机器参数留在
-     * 0x90000、E820 表留在 0x9E000，start_kernel 还要读它们。
-     *
-     * setup 代码在 0x90200-0x90A00（4 sectors），启动后不再使用。
-     * E820 条目在 0x9E000。BSS 可以使用 0x90C00-0x9DFFF 的空间。
-     * 此处留 4KB 安全余量到 E820 表。
-     */
-    ASSERT(_kernel_end <= 0x9F000,
-           "kernel image (incl. BSS) extends past safe area at 0x9F000")
+    /* 装载镜像（objcopy 出来的 system.bin）加载到 0x10000，不能碰 0x90000 */
+    ASSERT(_image_end <= 0x90000,
+           "kernel image (text/rodata/data) extends past safe area at 0x90000")
+    /* BSS 顶到 2MB 之前要停下，给 mem_map/引用计数表/内核栈池留地方 */
+    ASSERT(_kernel_end <= 0x200000,
+           "kernel BSS extends past 0x200000")
 
     /DISCARD/ : {
         *(.note*)

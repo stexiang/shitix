@@ -18,7 +18,9 @@ extra-drivers = []
 
 [profile.dev]
 panic = "abort"
-opt-level = 1
+opt-level = "z"
+debug-assertions = false
+overflow-checks = false
 
 [profile.release]
 panic = "abort"

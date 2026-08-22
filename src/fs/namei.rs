@@ -142,7 +142,7 @@ unsafe fn follow_link(dir: usize, inode: usize) -> Result<usize, i32> {
         // 原版 open_namei(link,...,dir) 里 dir 作为相对解析的 base。
         let base = if target.first() == Some(&b'/') {
             inode::iput(dir);
-            super_block::root_inode()
+            super_block::task_root_inode()
         } else {
             dir
         };
@@ -206,7 +206,7 @@ pub unsafe fn dir_namei(path: &[u8]) -> Result<(usize, &[u8]), i32> {
     // SAFETY: 契约转交。
     unsafe {
         let start = if path.first() == Some(&b'/') {
-            super_block::root_inode()
+            super_block::task_root_inode()
         } else {
             super_block::pwd_inode()
         };
@@ -300,7 +300,7 @@ pub unsafe fn lookup_one(dir: usize, name: &[u8]) -> Result<usize, i32> {
         }
         if name == b".." {
             // 特例 1：根目录的 ..
-            if dir == super_block::root_inode() {
+            if dir == super_block::task_root_inode() {
                 (*inode::inode_ptr(dir)).i_count += 1;
                 return Ok(dir);
             }
@@ -353,7 +353,7 @@ pub unsafe fn namei(path: &[u8]) -> Result<usize, i32> {
     // SAFETY: 契约转交。
     unsafe {
         let start = if path.first() == Some(&b'/') {
-            super_block::root_inode()
+            super_block::task_root_inode()
         } else {
             super_block::pwd_inode()
         };
@@ -374,7 +374,7 @@ pub unsafe fn lnamei(path: &[u8]) -> Result<usize, i32> {
     // SAFETY: 契约转交。
     unsafe {
         let start = if path.first() == Some(&b'/') {
-            super_block::root_inode()
+            super_block::task_root_inode()
         } else {
             super_block::pwd_inode()
         };

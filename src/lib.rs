@@ -737,6 +737,71 @@ fn syscall_selftest() {
     };
     kprintln!("syscall: splice/tee -> {}", if sp_ok { "ok" } else { "FAIL" });
 
+    // ---- 第二批补齐的 syscall：rt_sigpending/capget/sched_getattr/syslog/
+    //      close_range/execveat。都是内核态直接调 int 0x80 链路。----
+    let batch_ok = unsafe {
+        // rt_sigpending：自检进程此刻可能已带 boot 阶段残留的待处理位，
+        // 只校验调用本身成功（位图被覆写）。
+        let mut pend: u64 = u64::MAX;
+        let rp = syscall::syscall3(nr::RT_SIGPENDING,
+                                   &mut pend as *mut u64 as u64, 8, 0);
+        // rt_sigqueueinfo：给自己发一个被屏蔽的 SIGUSR1，再查 pending
+        let mut info = [0i32; 32];
+        info[0] = 10; // si_signo = SIGUSR1
+        info[2] = 0;  // si_code = SI_USER
+        let pid = syscall::syscall0(nr::GETPID);
+        // 先屏蔽 SIGUSR1(10) 防止它在 return-to-user 路径被立刻投递
+        let mask: u64 = 1u64 << 10;
+        syscall::syscall6(nr::RT_SIGPROCMASK, 0 /* SIG_BLOCK */,
+                          &mask as *const u64 as u64, 0, 8, 0, 0);
+        // task[0] 的 pid=0，rt_sigqueueinfo 拒 pid<=0（-EINVAL，校验路径本身也是测试点）；
+        // 投递走 kill(0, SIGUSR1)（pid==0 → 同进程组，含自己）
+        let rq = syscall::syscall3(nr::RT_SIGQUEUEINFO,
+                                   pid as u64, 10, info.as_ptr() as u64);
+        let kl = syscall::syscall3(nr::KILL, 0, 10, 0);
+        let mut pend2: u64 = 0;
+        syscall::syscall3(nr::RT_SIGPENDING, &mut pend2 as *mut u64 as u64, 8, 0);
+        // 解除屏蔽并出队，别给 task[0] 留待处理位
+        syscall::syscall6(nr::RT_SIGPROCMASK, 1 /* SIG_UNBLOCK */,
+                          &mask as *const u64 as u64, 0, 8, 0, 0);
+        let _ = crate::signal::dequeue_signal();
+
+        // capget v3
+        let mut cap_hdr = [0x20080522u32, 0]; // version=v3, pid=0(self)
+        let mut cap_data = [0u32; 6];
+        let cg = syscall::syscall3(nr::CAPGET,
+                                   cap_hdr.as_mut_ptr() as u64,
+                                   cap_data.as_mut_ptr() as u64, 0);
+
+        // sched_getattr
+        let mut attr = [0u64; 8];
+        let sg = syscall::syscall6(nr::SCHED_GETATTR, 0,
+                                   attr.as_mut_ptr() as u64, 64, 0, 0, 0);
+
+        // syslog type 10 = 环大小
+        let sl = syscall::syscall3(nr::SYSLOG, 10, 0, 0);
+
+        // close_range：关掉一个没打开的高位 fd 区间，应静默成功
+        let cr = syscall::syscall3(nr::CLOSE_RANGE, 60, 63, 0);
+
+        // execveat：AT_FDCWD + 不存在的路径 → -ENOENT（证明走了 execve 路径）
+        let badpath = b"/nonexistent-xyz\0";
+        let ea = syscall::syscall6(nr::EXECVEAT, (-100i64) as u64,
+                                   badpath.as_ptr() as u64, 0, 0, 0, 0);
+        let _ = &mut pend;
+
+        rp == 0
+            && rq == -(klib::errno::EINVAL as i64)
+            && kl == 0 && (pend2 & (1u64 << 10)) != 0
+            && cg == 0 && cap_data[0] == u32::MAX
+            && sg == 0 && (attr[0] as u32) == 64
+            && sl == 4096
+            && cr == 0
+            && ea == -(klib::errno::ENOENT as i64)
+    };
+    kprintln!("syscall: sigpending/sigqueueinfo/capget/sched_getattr/syslog/close_range/execveat -> {}",
+              if batch_ok { "ok" } else { "FAIL" });
+
     syscall::dump();
     serial::print("syscall: selftest done\n");
 }
