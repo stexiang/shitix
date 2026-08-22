@@ -6225,8 +6225,43 @@ pub fn pidfd_open(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         Some(_) => PIDFD_MAGIC | pid as i64,
     }
 }
-/// [`clone`] 的结构体参数版本。
-pub fn clone3(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// [`clone`] 的结构体参数版本（`struct clone_args`，Linux 5.3+）。
+/// 把 clone_args 的关键字段映射回 clone 的五参形式：exit_signal 合入
+/// flags 低字节，child stack = stack + stack_size（向下生长）。
+pub fn clone3(args: &SysArgs, regs: &mut PtRegs) -> i64 {
+    // clone_args { flags, pidfd, child_tid, parent_tid, exit_signal,
+    //              stack, stack_size, tls, ... } —— 每字段 u64。
+    let p = args.a0 as *const u64;
+    let size = args.a1 as usize;
+    if p.is_null() || size < 64 {
+        return -(EINVAL as i64);
+    }
+    // SAFETY: 用户指针已按 clone_args 布局读取前 8 个 u64。
+    let (flags, child_tid, parent_tid, exit_signal, stack, stack_size, tls) = unsafe {
+        (
+            core::ptr::read_volatile(p),
+            core::ptr::read_volatile(p.add(2)),
+            core::ptr::read_volatile(p.add(3)),
+            core::ptr::read_volatile(p.add(4)),
+            core::ptr::read_volatile(p.add(5)),
+            core::ptr::read_volatile(p.add(6)),
+            core::ptr::read_volatile(p.add(7)),
+        )
+    };
+    if exit_signal >= 64 {
+        return -(EINVAL as i64);
+    }
+    let child_stack = if stack != 0 { stack + stack_size } else { 0 };
+    let inner = SysArgs {
+        a0: flags | (exit_signal & 0xFF),
+        a1: child_stack,
+        a2: parent_tid,
+        a3: child_tid,
+        a4: tls,
+        a5: 0,
+    };
+    clone(&inner, regs)
+}
 /// [`faccessat`] 的带 flags 版本。
 pub fn faccessat2(args: &SysArgs, regs: &mut PtRegs) -> i64 { faccessat(args, regs) }
 /// [`epoll_pwait`] 的 ns 超时版本。
