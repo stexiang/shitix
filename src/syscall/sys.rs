@@ -2615,50 +2615,60 @@ pub fn sysinfo(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
     0
 }
-/// 轮询。
+/// 轮询。真实就绪判定走 `fs::event::fd_ready`（pipe/eventfd/timerfd/
+/// signalfd/inotify 都有真实状态），无就绪且 timeout!=0 时睡到超时
+/// 或出现就绪/待处理信号（-EINTR）。
 pub fn poll(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let fds = args.a0 as *mut PollFd;
     let nfds = args.a1 as usize;
     let timeout = args.a2 as i32;
     if fds.is_null() && nfds > 0 { return -(EFAULT as i64); }
 
-    // For timeout < 0: block indefinitely (we just yield once)
-    // For timeout >= 0: check once and return
-    let _ = timeout;
+    let hz = crate::sched::task::HZ;
+    let deadline = if timeout < 0 {
+        u64::MAX
+    } else {
+        crate::sched::jiffies() + (timeout as u64 * hz + 999) / 1000
+    };
 
-    let mut ready = 0i64;
-    for i in 0..nfds {
-        unsafe {
-            let pfd = &mut *fds.add(i);
-            pfd.revents = 0;
-            let fd = pfd.fd as i32;
-            if fd < 0 { continue; }
-            let fd = fd as usize;
+    loop {
+        let mut ready = 0i64;
+        for i in 0..nfds {
+            unsafe {
+                let pfd = &mut *fds.add(i);
+                pfd.revents = 0;
+                let fd = pfd.fd as i32;
+                if fd < 0 { continue; }
+                let fd = fd as usize;
 
-            // Pipe fds：真实就绪状态（有数据/EOF 可读，未满可写，
-            // 对端全关报 POLLHUP）。
-            if crate::fs::pipe::fd_is_pipe(fd) {
-                let (rd, wr, hup) = crate::fs::pipe::fd_poll_status(fd);
+                let valid = crate::fs::pipe::fd_is_pipe(fd)
+                    || crate::fs::event::fd_is_event(fd)
+                    || crate::net::socket::fd_is_socket(fd)
+                    || crate::fs::open::fd_to_filp(fd) != crate::fs::inode::NIL;
+                if !valid {
+                    pfd.revents |= 0x20; // POLLNVAL
+                    ready += 1;
+                    continue;
+                }
+
+                let (rd, wr, hup) = crate::fs::event::fd_ready(fd);
                 if rd && pfd.events & 1 != 0 { pfd.revents |= 1; }  // POLLIN
                 if wr && pfd.events & 4 != 0 { pfd.revents |= 4; }  // POLLOUT
                 if hup { pfd.revents |= 0x10; }                     // POLLHUP
                 if pfd.revents != 0 { ready += 1; }
-                continue;
-            }
-
-            // VFS fds: check if they exist
-            let filp = crate::fs::open::fd_to_filp(fd);
-            if filp != crate::fs::inode::NIL {
-                // Regular files are always ready
-                if pfd.events & 1 != 0 { pfd.revents |= 1; } // POLLIN
-                if pfd.events & 4 != 0 { pfd.revents |= 4; } // POLLOUT
-                if pfd.revents != 0 { ready += 1; }
             }
         }
+        if ready > 0 || timeout == 0 { return ready; }
+        // 有待处理信号时按 POSIX 返回 -EINTR（信号帧在返回路径上搭）
+        if crate::signal::signal_pending() { return -(EINTR as i64); }
+        if crate::sched::jiffies() >= deadline { return 0; }
+        // SAFETY: 系统调用上下文让出，同 event::read 的阻塞路径。
+        unsafe { crate::sched::schedule() };
     }
-    ready
 }
-/// 多路复用。
+/// 多路复用。就绪判定与 poll 共用 `fs::event::fd_ready`；timeout
+/// 非 NULL 时睡到超时/就绪/信号（返回前把剩余时间写回 timeval，
+/// 同原版 do_select 的语义）。
 pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
     //        struct timeval *timeout)
@@ -2666,12 +2676,13 @@ pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     let readfds = args.a1 as *mut u64;   // fd_set is array of long (u64 on x86_64)
     let writefds = args.a2 as *mut u64;
     let exceptfds = args.a3 as *mut u64;
+    let timeout = args.a4 as *const u64; // timeval {sec, usec}
 
     if nfds > 1024 { return -(EINVAL as i64); }
     let nwords = (nfds + 63) / 64;
 
-    // 先快照输入掩码（输出要原地清空，直接改会把「用户关心哪些 fd」弄丢；
-    // 旧实现不管用户有没有把 fd 放进 readfds/writefds 都两边置位）。
+    // 先快照输入掩码（每轮重试都要从快照重建输出，直接原地改会把
+    // 「用户关心哪些 fd」弄丢）。
     let mut rin = [0u64; 16];
     let mut win = [0u64; 16];
     unsafe {
@@ -2679,50 +2690,70 @@ pub fn select(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
             if !readfds.is_null() { rin[w] = core::ptr::read_volatile(readfds.add(w)); }
             if !writefds.is_null() { win[w] = core::ptr::read_volatile(writefds.add(w)); }
         }
-        if !readfds.is_null() {
-            for w in 0..nwords { core::ptr::write_volatile(readfds.add(w), 0); }
-        }
-        if !writefds.is_null() {
-            for w in 0..nwords { core::ptr::write_volatile(writefds.add(w), 0); }
-        }
-        if !exceptfds.is_null() {
-            for w in 0..nwords { core::ptr::write_volatile(exceptfds.add(w), 0); }
-        }
     }
 
-    let mut total_ready = 0i64;
-    for fd in 0..nfds {
-        let word = fd / 64;
-        let bit = fd % 64;
-        let want_r = rin[word] & (1u64 << bit) != 0;
-        let want_w = win[word] & (1u64 << bit) != 0;
-        if !want_r && !want_w { continue; }
+    let hz = crate::sched::task::HZ;
+    let deadline = if timeout.is_null() {
+        None
+    } else {
+        let (sec, usec) = unsafe {
+            (core::ptr::read_volatile(timeout), core::ptr::read_volatile(timeout.add(1)))
+        };
+        Some(crate::sched::jiffies() + sec * hz + (usec * hz + 999_999) / 1_000_000)
+    };
 
-        let (mut rd, mut wr) = (false, false);
-        if crate::fs::pipe::fd_is_pipe(fd) {
-            // 管道真实就绪：读端有数据/EOF 可读；写端未满可写。
-            let (r, w, hup) = crate::fs::pipe::fd_poll_status(fd);
-            rd = r || hup;
-            wr = w || hup;
-        } else {
-            // 普通文件/字符设备总是就绪（同原版 file_select 的默认返回）。
-            let filp = unsafe { crate::fs::open::fd_to_filp(fd) };
-            if filp != crate::fs::inode::NIL { rd = true; wr = true; }
-        }
+    loop {
         unsafe {
-            if rd && want_r {
-                core::ptr::write_volatile(readfds.add(word),
-                    core::ptr::read_volatile(readfds.add(word)) | (1u64 << bit));
-                total_ready += 1;
+            if !readfds.is_null() {
+                for w in 0..nwords { core::ptr::write_volatile(readfds.add(w), 0); }
             }
-            if wr && want_w {
-                core::ptr::write_volatile(writefds.add(word),
-                    core::ptr::read_volatile(writefds.add(word)) | (1u64 << bit));
-                total_ready += 1;
+            if !writefds.is_null() {
+                for w in 0..nwords { core::ptr::write_volatile(writefds.add(w), 0); }
+            }
+            if !exceptfds.is_null() {
+                for w in 0..nwords { core::ptr::write_volatile(exceptfds.add(w), 0); }
             }
         }
+
+        let mut total_ready = 0i64;
+        for fd in 0..nfds {
+            let word = fd / 64;
+            let bit = fd % 64;
+            let want_r = rin[word] & (1u64 << bit) != 0;
+            let want_w = win[word] & (1u64 << bit) != 0;
+            if !want_r && !want_w { continue; }
+
+            let (mut rd, mut wr) = (false, false);
+            let valid = crate::fs::pipe::fd_is_pipe(fd)
+                || crate::fs::event::fd_is_event(fd)
+                || crate::net::socket::fd_is_socket(fd)
+                || unsafe { crate::fs::open::fd_to_filp(fd) } != crate::fs::inode::NIL;
+            if valid {
+                let (r, w, hup) = crate::fs::event::fd_ready(fd);
+                rd = r || hup;
+                wr = w || hup;
+            }
+            unsafe {
+                if rd && want_r {
+                    core::ptr::write_volatile(readfds.add(word),
+                        core::ptr::read_volatile(readfds.add(word)) | (1u64 << bit));
+                    total_ready += 1;
+                }
+                if wr && want_w {
+                    core::ptr::write_volatile(writefds.add(word),
+                        core::ptr::read_volatile(writefds.add(word)) | (1u64 << bit));
+                    total_ready += 1;
+                }
+            }
+        }
+        if total_ready > 0 { return total_ready; }
+        if crate::signal::signal_pending() { return -(EINTR as i64); }
+        if let Some(dl) = deadline {
+            if crate::sched::jiffies() >= dl { return 0; }
+        }
+        // SAFETY: 系统调用上下文让出，同 poll 的阻塞路径。
+        unsafe { crate::sched::schedule() };
     }
-    total_ready
 }
 /// 挂载文件系统。
 pub fn mount(args: &SysArgs, _regs: &mut PtRegs) -> i64 {

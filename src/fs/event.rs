@@ -599,7 +599,8 @@ pub fn epoll_ctl(epfd: usize, op: u32, fd: usize, ev_ptr: u64) -> i64 {
 }
 
 /// 查一个 fd 当前的 (readable, writable, hangup)。
-fn fd_ready(fd: usize) -> (bool, bool, bool) {
+/// 也给 sys.rs 的 poll/select 用（统一的就绪判定入口）。
+pub fn fd_ready(fd: usize) -> (bool, bool, bool) {
     if crate::fs::pipe::fd_is_pipe(fd) {
         return crate::fs::pipe::fd_poll_status(fd);
     }
