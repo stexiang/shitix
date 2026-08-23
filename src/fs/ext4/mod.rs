@@ -48,6 +48,7 @@ pub mod dir;
 pub mod selftest;
 pub mod bitmap;
 pub mod ops;
+pub mod journal;
 pub mod mkfs;
 #[cfg(feature = "extra-drivers")]
 pub mod namei;

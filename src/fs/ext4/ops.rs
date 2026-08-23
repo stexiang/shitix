@@ -1164,6 +1164,17 @@ pub mod full {
         info.group_count = if inodes_pg > 0 { (total_inodes + inodes_pg - 1) / inodes_pg } else { 0 };
         info.valid = true;
 
+        // JBD2 日志重放：若上次卸载不干净（RECOVER 标志），先把 journal
+        // 里已提交的事务写回文件系统，再挂载。失败不致命（继续只读语义
+        // 由上层决定），但标志必须清掉，否则每次挂载都重复重放。
+        {
+            let gd_inode_table = info.ext4_gd.inode_table;
+            // SAFETY: 挂载期单线程，dev/sb 数据有效。
+            let _ = unsafe {
+                crate::fs::ext4::journal::recover(dev, data, gd_inode_table, inode_size, fs_block_size, inodes_pg)
+            };
+        }
+
         unsafe {
             let s = super_block::sb_ptr(n);
             // Always use 1024-byte blocks for buffer cache compatibility.
