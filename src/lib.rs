@@ -1715,6 +1715,12 @@ fn fs_selftest() {
 /// 那句 `for(;;) idle();`。
 fn idle_loop() -> ! {
     loop {
+        // USB HID 键盘轮询（extra-drivers）。在 idle 上下文跑：USB 传输的
+        // 超时靠 jiffies 推进，不能放在时钟中断里（ISR 内 jiffies 冻结）。
+        // idle 每次被时钟唤醒都轮一次 ≈ 100Hz。
+        #[cfg(feature = "extra-drivers")]
+        usb::uhci::poll_keyboard();
+
         // SAFETY: 只读一个 i32。
         if unsafe { *core::ptr::addr_of!(sched::need_resched) } != 0 {
             // SAFETY: 我们在 task[0] 的正常上下文里，不是中断上下文。

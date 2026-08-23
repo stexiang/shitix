@@ -41,6 +41,8 @@ pub unsafe fn init() {
         #[cfg(feature = "extra-drivers")]
         {
             sound::init();
+            // USB：UHCI + HID 键盘枚举。PS/2 键盘仍可用，USB 是增量。
+            crate::usb::uhci::init();
         }
     }
 }
