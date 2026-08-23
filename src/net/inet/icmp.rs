@@ -94,6 +94,34 @@ pub unsafe fn icmp_rcv(skb: *mut SkBuff) -> i32 {
 pub unsafe fn icmp_send(skb: *mut SkBuff, type_: u8, code: u8) {
     // SAFETY: 调用者保证 `skb` 有效。
     unsafe {
-        // TODO: 构建并发送 ICMP 错误消息
+        let ip = (*skb).ip_header();
+        let src = u32::from_be(ip.daddr); // 原包的目的地 = 我们（回包源）
+        let dst = u32::from_be(ip.saddr); // 回包目的 = 原发送者
+        // RFC 792：ICMP 错误载荷 = 8 字节头 + 原 IP 头 + 原数据前 8 字节
+        let base = (*skb).data_ptr();
+        let off = (ip as *const _ as usize).saturating_sub(base as usize);
+        let mut pkt = [0u8; 8 + 20 + 8];
+        pkt[0] = type_;
+        pkt[1] = code;
+        pkt[2..4].copy_from_slice(&[0, 0]); // 校验和占位
+        pkt[4..8].copy_from_slice(&[0, 0, 0, 0]); // unused
+        let ip_hlen = ((ip.ver_len & 0x0F) as usize) * 4;
+        let quote = core::cmp::min(ip_hlen + 8, 20 + 8);
+        core::ptr::copy_nonoverlapping(base.add(off), pkt.as_mut_ptr().add(8), quote);
+        // ICMP 校验和（一个 HEADER+载荷 的 one-pass）
+        let total = 8 + quote;
+        let mut sum: u32 = 0;
+        for i in (0..total).step_by(2) {
+            let hi = pkt[i] as u32;
+            let lo = if i + 1 < total { pkt[i + 1] as u32 } else { 0 };
+            sum += (hi << 8) | lo;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let csum = !(sum as u16);
+        pkt[2..4].copy_from_slice(&csum.to_be_bytes());
+        crate::net::inet::netif::send_ip_packet(dst, 1, &pkt[..total]);
+        let _ = src;
     }
 }

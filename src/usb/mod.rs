@@ -470,10 +470,14 @@ pub fn free_device(addr: u8) {
     unsafe { USB_DEVICES[addr as usize] = None; }
 }
 
-/// 扫描 USB 主机控制器上的端口
-pub fn scan_ports(_hc_index: usize) {
+/// 扫描 USB 主机控制器上的端口。目前唯一的控制器是 UHCI（索引 0），
+/// 委托给它重扫两个根端口（已枚举到 HID 键盘时是 no-op）。
+pub fn scan_ports(hc_index: usize) {
     crate::pr_debug!("USB: Scanning ports...");
-    // TODO: 实现端口扫描
+    match hc_index {
+        0 => uhci::rescan_ports(),
+        _ => crate::pr_debug!("USB: hc{} not present", hc_index),
+    }
 }
 
 /// EHCI 寄存器偏移

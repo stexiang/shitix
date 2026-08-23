@@ -720,6 +720,22 @@ pub fn init() {
     selftest();
 }
 
+/// 重新扫描两个根端口。已经枚举到 HID 键盘时不动（重复枚举会换设备
+/// 地址，把正在用的键盘状态打掉）；还没枚举到时补扫一次——供
+/// `usb::scan_ports` 在热插/延迟接入场景调用。
+pub fn rescan_ports() {
+    if keyboard_present() {
+        return;
+    }
+    if let Some(hc) = get() {
+        for port in [PORTSC1, PORTSC2] {
+            if enumerate_port(hc, port) {
+                break;
+            }
+        }
+    }
+}
+
 /// 周期轮询 HID 键盘（由 idle 循环每次唤醒调一次，≈100Hz）。无键盘/无
 /// 数据时立即返回，成本是一次端口 I/O 级判空。
 pub fn poll_keyboard() {

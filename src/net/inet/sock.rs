@@ -181,29 +181,90 @@ pub enum SocketFlags {
     Nonagle = 1 << 13,        // Nagle 算法禁用
 }
 
+const MAX_SOCK_POOL: usize = 8;
+static mut SOCK_POOL: [core::mem::MaybeUninit<Socket>; MAX_SOCK_POOL] =
+    [const { core::mem::MaybeUninit::uninit() }; MAX_SOCK_POOL];
+static mut SOCK_POOL_USED: [bool; MAX_SOCK_POOL] = [false; MAX_SOCK_POOL];
+
 impl Socket {
     /// 创建新 socket。参考 C 的 `struct sock *sk_alloc()`。
     ///
+    /// 内核没有全局堆，用 8 槽静态池充当 slab（地址稳定、free 只翻位）。
+    ///
     /// # Safety
     ///
-    /// - 返回的 socket 必须在不再需要时通过 `sk_free()` 释放
-    /// - 内存必须由调用者分配和管理
+    /// - 返回的 socket 必须在不再需要时通过 [`Socket::free`] 释放
+    /// - 池满返回 null
     pub unsafe fn new(protocol: u8, type_: u8) -> *mut Self {
-        // SAFETY: 调用者负责内存管理。在单核内核中，无并发创建竞争。
-        // TODO: 实现真正的 slab 分配器
-        let _ = (protocol, type_);
-        core::ptr::null_mut() // 占位，返回 null
+        for i in 0..MAX_SOCK_POOL {
+            // SAFETY: 池只在协议创建/销毁路径动；socket 层不并发创建。
+            unsafe {
+                if !SOCK_POOL_USED[i] {
+                    SOCK_POOL_USED[i] = true;
+                    let sk = SOCK_POOL[i].as_mut_ptr();
+                    sk.write(Socket::blank(protocol, type_));
+                    return sk;
+                }
+            }
+        }
+        core::ptr::null_mut()
+    }
+
+    fn blank(protocol: u8, type_: u8) -> Self {
+        Socket {
+            wmem_alloc: 0,
+            rmem_alloc: 0,
+            write_seq: 0,
+            sent_seq: 0,
+            rcv_ack_seq: 0,
+            state: SocketState::Closed,
+            flags: SocketFlags::None,
+            write_queue: SkBuffQueue::new(),
+            receive_queue: SkBuffQueue::new(),
+            back_log: None,
+            saddr: 0,
+            daddr: 0,
+            sport: 0,
+            dport: 0,
+            window: 0,
+            mss: 0,
+            sleep: WaitQueue::new(),
+            protocol,
+            type_,
+            ttl: 64,
+            tos: 0,
+        }
     }
 
     /// 释放 socket。参考 C 的 `void sk_free(struct sock *sk)`。
     ///
     /// # Safety
     ///
-    /// - `sk` 必须是有效分配的 socket
-    /// - 调用后 `sk` 不能再使用
-    /// - socket 必须已关闭且队列为空
-    pub fn free(_sk: *mut Self) {
-        // TODO: 实现真正的内存释放（需要 slab 分配器）
+    /// - `sk` 必须是 [`Socket::new`] 返回的池内指针
+    /// - 调用后 `sk` 不能再使用（池外指针/重复释放都是 no-op）
+    pub fn free(sk: *mut Self) {
+        if sk.is_null() {
+            return;
+        }
+        for i in 0..MAX_SOCK_POOL {
+            // SAFETY: 槽位地址固定，比对不触碰内容。
+            unsafe {
+                if SOCK_POOL[i].as_mut_ptr() == sk {
+                    SOCK_POOL_USED[i] = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 源 IP（C 的 `saddr`）。
+    pub fn saddr(&self) -> u32 {
+        self.saddr
+    }
+
+    /// 设置源 IP。
+    pub fn set_saddr(&mut self, addr: u32) {
+        self.saddr = addr;
     }
 
     /// 检查 socket 是否正在使用。

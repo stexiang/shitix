@@ -125,14 +125,16 @@ pub fn init() {
 ///
 /// - `skb` 必须有效
 pub unsafe fn arp_rcv(skb: *mut crate::net::inet::skbuff::SkBuff) -> i32 {
-    // SAFETY: 调用者保证 `skb` 有效。
+    // SAFETY: 调用者保证 `skb` 有效。完整解析在 netif::handle_arp
+    // （更新缓存 + REQUEST 回答），这里做长度门槛后转过去。
     unsafe {
-        // TODO: 解析 ARP 包
-        // - 提取操作码 (REQUEST/REPLY)
-        // - 提取源/目的 IP 和 MAC
-        // - REQUEST: 发送响应
-        // - REPLY: 更新 ARP 缓存
-        0
+        let base = (*skb).data_ptr();
+        let len = (*skb).data_len();
+        if len < 14 + 28 {
+            return -1;
+        }
+        let frame = core::slice::from_raw_parts(base, len);
+        if crate::net::inet::netif::handle_arp(frame) { 0 } else { -1 }
     }
 }
 
@@ -142,8 +144,10 @@ pub unsafe fn arp_rcv(skb: *mut crate::net::inet::skbuff::SkBuff) -> i32 {
 ///
 /// - `dev` 必须有效
 pub unsafe fn arp_send_query(dev: *mut crate::net::inet::dev::Device, target_ip: u32) {
-    // SAFETY: 调用者保证 `dev` 有效。
+    // SAFETY: 调用者保证 `dev` 有效。netif::arp_request 拼广播帧经
+    // e1000 发出；`dev` 仅参与 C 原型对称（单网卡，暗指唯一设备）。
     unsafe {
-        // TODO: 构建并发送 ARP 请求
+        let _ = dev;
+        crate::net::inet::netif::arp_request(target_ip);
     }
 }

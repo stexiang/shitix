@@ -1215,6 +1215,9 @@ fn fs_init_thread(_arg: u64) {
     if drivers::net::e1000::E1000::probe().is_some() {
         net::inet::netif::init();
         drivers::net::e1000::E1000::selftest();
+        // TCP client 自检：slirp 主机端 10.0.2.2:12777 的 echo。
+        // 没有对端时 connect 超时，走 skipped 不算 FAIL。
+        net::socket::tcp_echo_test(0x0A000202, 12777);
     }
     if LFS_BOOT {
         sprintln!("LFS: === LFS boot mode ===");

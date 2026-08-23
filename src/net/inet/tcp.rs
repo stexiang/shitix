@@ -2,20 +2,15 @@
 //!
 //! ## 功能
 //!
-//! - 面向连接可靠字节流
-//! - 流量控制（滑动窗口）
-//! - 拥塞控制
-//! - 保活机制
+//! 主动端（client）的最小可靠字节流：
 //!
-//! ## TCP 状态机
+//! - 三次握手（SYN → SYN-ACK → ACK）
+//! - stop-and-wait 数据发送（一个未确认段在飞，超时重传）
+//! - 按序接收（乱序/重复段只回 ACK 丢弃，等对端重传）
+//! - 被动关闭（对端 FIN → CloseWait，recv 返回 0）与主动 FIN
 //!
-//! ```text
-//! CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED
-//!                ↓                    ↓
-//!            SYN_RECV ←←←←←←←←←←←←←←←←←←
-//!                ↓
-//!           CLOSE_WAIT → LAST_ACK → CLOSED
-//! ```
+//! 状态机用的是 [`TcpState`] 全集，但服务端路径（Listen/SynReceived）
+//! 尚未接 socket——listen/accept 还是 AF_UNIX 的近似。
 //!
 //! ## C 源码对照
 //!
@@ -23,17 +18,6 @@
 //! |--------|------|
 //! | `tcp.c` | TCP 协议实现 |
 //! | `tcp.h` | TCP 头结构 |
-//!
-//! ## SAFETY
-//!
-//! TCP 是最复杂的协议，需要大量 `unsafe`：
-//!
-//! - 定时器操作（`timer.c`）
-//! - 序列号运算（u32 溢出处理）
-//! - 内存分配/释放
-//! - 锁操作
-
-use crate::net::inet::skbuff::{self, SkBuff, TcpHeader, SkBuffQueue};
 
 /// TCP 状态。参考 C 的 `volatile unsigned char state`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,74 +36,100 @@ pub enum TcpState {
     TimeWait = 10,
 }
 
-/// TCP 选项。
-pub const TCP_NODELAY: u8 = 1;
-pub const TCP_MAXSEG: u8 = 2;
-
-/// 初始化 TCP 层。参考 C 的 `tcp_init()`。
-pub fn init() {
-    // 初始化 TCP 哈希表、定时器等
+/// 段头标志位（`tcphdr` 的 flags 字节）。
+pub mod flag {
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const PSH: u8 = 0x08;
+    pub const ACK: u8 = 0x10;
+    pub const URG: u8 = 0x20;
 }
 
-/// 处理输入的 TCP 包。参考 C 的 `tcp_rcv()`。
-///
-/// # Safety
-///
-/// - `skb` 必须有效
-/// - 可能从中断上下文调用
-pub unsafe fn tcp_rcv(skb: *mut SkBuff) -> i32 {
-    // SAFETY: 调用者保证 `skb` 有效。
-    unsafe {
-        let hdr = (*skb).tcp_header();
-        
-        // 解析 TCP 头
-        let sport = u16::from_be(hdr.source);
-        let dport = u16::from_be(hdr.dest);
-        let seq = u32::from_be(hdr.seq);
-        let ack = u32::from_be(hdr.ack_seq);
-        let flags = hdr.doff_flags >> 8;
-        
-        // TODO: 完整的状态机处理
-        
-        0
+/// 解析输入段。返回 (sport, dport, seq, ack, flags, hdr_len)。
+pub fn parse(data: &[u8]) -> Option<(u16, u16, u32, u32, u8, usize)> {
+    if data.len() < 20 {
+        return None;
     }
-}
-
-/// TCP 发送。参考 C 的 `tcp_write()`。
-///
-/// # Safety
-///
-/// - socket 必须有效且处于可写状态
-pub unsafe fn tcp_send(sk: *mut crate::net::inet::sock::Socket, data: &[u8]) -> i32 {
-    // SAFETY: 调用者保证 `sk` 有效。
-    unsafe {
-        // TODO: 实现
-        0
-    }
-}
-
-/// 处理收到的 TCP 段（从 IP 层调用）
-pub fn tcp_input(src_ip: u32, data: &[u8]) {
-    if data.len() < 20 { return; }
     let sport = u16::from_be_bytes([data[0], data[1]]);
     let dport = u16::from_be_bytes([data[2], data[3]]);
-    let _seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let _ack = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-    let flags = data[13];
+    let seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let ack = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
     let hdr_len = ((data[12] >> 4) * 4) as usize;
-    let payload = &data[hdr_len..];
-
-    // SYN-ACK → the server side is acknowledging our connect request
-    // For our simple TCP, we just log and let socket layer poll
-    let _syn = flags & 0x02 != 0;
-    let _ack_flag = flags & 0x10 != 0;
-    let _fin = flags & 0x01 != 0;
-    let _rst = flags & 0x04 != 0;
-
-    // Deliver payload to socket receive queue
-    if !payload.is_empty() {
-        let b = src_ip.to_be_bytes();
-        crate::sprintln!("tcp: rx {} bytes from {}.{}.{}.{}:{} flags={:02x}",
-            payload.len(), b[0], b[1], b[2], b[3], sport, flags);
+    if hdr_len < 20 || hdr_len > data.len() {
+        return None;
     }
+    let flags = data[13];
+    Some((sport, dport, seq, ack, flags, hdr_len))
 }
+
+/// TCP 校验和（含 12 字节伪头部，参考 RFC 793 §3.1）。
+fn checksum(src_ip: u32, dst_ip: u32, seg: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut acc = |b: &[u8]| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            sum = sum.wrapping_add(u16::from_be_bytes([b[i], b[i + 1]]) as u32);
+            i += 2;
+        }
+        if i < b.len() {
+            sum = sum.wrapping_add((b[i] as u32) << 8);
+        }
+    };
+    acc(&src_ip.to_be_bytes());
+    acc(&dst_ip.to_be_bytes());
+    acc(&[0u8, 6u8]);
+    acc(&(seg.len() as u16).to_be_bytes());
+    acc(seg);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// 组装一个 TCP 段（含校验和），写入 `buf`，返回段长。固定 20 字节头（无选项）。
+#[allow(clippy::too_many_arguments)]
+pub fn build_segment(
+    buf: &mut [u8],
+    src_ip: u32,
+    dst_ip: u32,
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> usize {
+    let total = 20 + payload.len();
+    if buf.len() < total {
+        return 0;
+    }
+    buf[0..2].copy_from_slice(&sport.to_be_bytes());
+    buf[2..4].copy_from_slice(&dport.to_be_bytes());
+    buf[4..8].copy_from_slice(&seq.to_be_bytes());
+    buf[8..12].copy_from_slice(&ack.to_be_bytes());
+    buf[12] = 5 << 4; // data offset = 5×4 字节
+    buf[13] = flags;
+    buf[14..16].copy_from_slice(&window.to_be_bytes());
+    buf[16] = 0; // checksum 占位
+    buf[17] = 0;
+    buf[18] = 0; // urg ptr
+    buf[19] = 0;
+    buf[20..total].copy_from_slice(payload);
+    let csum = checksum(src_ip, dst_ip, &buf[..total]);
+    buf[16..18].copy_from_slice(&csum.to_be_bytes());
+    total
+}
+
+/// 处理收到的 TCP 段（netif 从 IP 层调上来）。解析后路由到 socket 层
+/// 的连接表（状态迁移/序号推进都在 `net::socket` 的连接条目里做）。
+pub fn tcp_input(src_ip: u32, data: &[u8]) {
+    let Some((sport, dport, seq, ack, flags, hdr_len)) = parse(data) else {
+        return;
+    };
+    crate::net::socket::tcp_input(src_ip, sport, dport, seq, ack, flags, &data[hdr_len..]);
+}
+
+/// 初始化 TCP 层。参考 C 的 `tcp_init()`。
+pub fn init() {}

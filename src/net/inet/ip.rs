@@ -97,7 +97,8 @@ pub unsafe fn fast_csum(iph: *const u8, ihl: usize) -> u16 {
     // SAFETY: 调用者保证指针有效且长度正确。
     unsafe {
         for i in (0..len).step_by(2) {
-            sum += (*iph.add(i) as u32) | ((*iph.add(i + 1) as u32) << 8);
+            // 网络字节序：每个 16 位词是 (b[i]<<8) | b[i+1]
+            sum += ((*iph.add(i) as u32) << 8) | (*iph.add(i + 1) as u32);
         }
         // 32-bit fold
         while sum >> 16 != 0 {

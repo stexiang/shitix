@@ -8,11 +8,16 @@ use crate::net::inet::ip;
 
 const ARP_CACHE_SIZE: usize = 16;
 static mut ARP_CACHE: [(u32, [u8; 6], bool); ARP_CACHE_SIZE] = [(0, [0; 6], false); ARP_CACHE_SIZE];
-static mut OUR_IP: u32 = 0xC0A80101;
+// slirp(QEMU user net) 的 /24：网关 10.0.2.2，我们拿 .15。
+static mut OUR_IP: u32 = 0x0A00020F;
+const GATEWAY_IP: u32 = 0x0A000202;
 static mut OUR_MAC: [u8; 6] = [0; 6];
 
 fn our_mac_ptr() -> *const u8 { unsafe { &raw const OUR_MAC as *const u8 } }
 fn our_ip_val() -> u32 { unsafe { core::ptr::read_volatile(&raw const OUR_IP) } }
+
+/// 本机 IP（主机序）。供 TCP 组伪头部校验和。
+pub fn our_ip() -> u32 { our_ip_val() }
 fn arp_cache_get(i: usize) -> (u32, [u8; 6], bool) {
     unsafe { core::ptr::read_volatile(&raw const ARP_CACHE[i]) }
 }
@@ -130,7 +135,13 @@ pub fn arp_resolve(ip: u32) -> Option<[u8; 6]> {
 }
 
 pub fn send_ip_packet(dst_ip: u32, proto: u8, payload: &[u8]) -> i32 {
-    let dst_mac = arp_resolve(dst_ip).unwrap_or(ETH_BROADCAST);
+    // 本 /24 之外的目标走网关做 ARP（同 subnet 直接 ARP 目标本身）。
+    let arp_target = if (dst_ip ^ our_ip_val()) & 0xFFFF_FF00 != 0 {
+        GATEWAY_IP
+    } else {
+        dst_ip
+    };
+    let dst_mac = arp_resolve(arp_target).unwrap_or(ETH_BROADCAST);
     let ip_hdr_len: usize = 20;
     let total = ip_hdr_len + payload.len();
     let mut pkt = [0u8; 2048];
@@ -165,10 +176,14 @@ pub fn handle_frame(pkt: &[u8]) {
         ETH_P_ARP => { handle_arp(pkt); }
         ETH_P_IP => {
             if pkt.len() >= 34 {
-                let proto = pkt[14+9];
                 let src_ip = u32::from_be_bytes(pkt[14+12..14+16].try_into().unwrap());
                 let ihl = (pkt[14] & 0x0F) as usize * 4;
-                let ip_payload = &pkt[14+ihl..];
+                let total = u16::from_be_bytes([pkt[14+2], pkt[14+3]]) as usize;
+                // 以太网最小帧会零填充；TCP/UDP 载荷必须按 IP total_len 截断，
+                // 否则垫零被当数据（echo 测试的 [0,0,0,0,0,0,...] 就是这么来的）
+                let end = 14 + core::cmp::min(total, pkt.len() - 14);
+                let ip_payload = &pkt[14+ihl..end];
+                let proto = pkt[14+9];
                 if proto == 6 { crate::net::inet::tcp::tcp_input(src_ip, ip_payload); }
                 else if proto == 17 && ip_payload.len() >= 8 {
                     // UDP：解头部后投递到 socket 层的数据报队列

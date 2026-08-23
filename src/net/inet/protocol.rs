@@ -18,74 +18,106 @@ use crate::net::inet::skbuff::SkBuff;
 /// 协议处理函数类型。
 pub type ProtocolHandler = unsafe fn(skb: *mut SkBuff) -> i32;
 
-/// 协议描述符。参考 C 的 `struct inet_protocol`。
-#[derive(Debug)]
-pub struct InetProtocol {
-    /// 协议名。
-    name: &'static str,
-    /// 处理函数。
-    handler: ProtocolHandler,
-    /// 下一协议（链表）。
-    next: Option<*mut InetProtocol>,
-    /// 协议号。
+/// 协议描述符槽（内核无全局堆，用定长槽位表代替 C 的 inet_protocol 链表）。
+#[derive(Clone, Copy, Default)]
+struct ProtoSlot {
+    used: bool,
     protocol: u8,
-    /// 标志。
-    flags: u8,
+    name: &'static str,
+    handler: Option<ProtocolHandler>,
 }
 
-/// 协议表大小。
-const INET_PROTO_HASH_SIZE: usize = 32;
+const MAX_PROTOCOLS: usize = 8;
+static mut PROTO_SLOTS: [ProtoSlot; MAX_PROTOCOLS] = [ProtoSlot {
+    used: false,
+    protocol: 0,
+    name: "",
+    handler: None,
+}; MAX_PROTOCOLS];
 
-/// 全局协议处理函数数组（C 的 `inet_protos[MAX_INET_PROTOS]`）。
-static mut INET_PROTOCOLS: [Option<ProtocolHandler>; 256] = [None; 256];
-
-/// 全局协议描述符链表。
-static mut INET_PROTOCOL_BASE: Option<*mut InetProtocol> = None;
+fn slot(i: usize) -> ProtoSlot {
+    // SAFETY: 槽位表仅在协议层 init/注册路径写，运行期只读。
+    unsafe { core::ptr::read(&raw const PROTO_SLOTS[i]) }
+}
 
 /// 注册协议处理器。
 ///
 /// # Safety
-///
-/// - 必须在系统初始化时调用
-/// - `protocol` 必须是有效的协议号
-pub fn inet_add_protocol(
-    _protocol: u8,
-    _handler: ProtocolHandler,
-    _name: &'static str,
-) -> i32 {
-    // TODO: 实现协议注册表
-    // SAFETY: 调用在初始化上下文中，无竞争。
-    0
+/// 必须在系统初始化上下文调用（UP 启动期，无竞争）。
+pub fn inet_add_protocol(protocol: u8, handler: ProtocolHandler, name: &'static str) -> i32 {
+    unsafe {
+        for i in 0..MAX_PROTOCOLS {
+            let cur = slot(i);
+            if cur.used && cur.protocol == protocol {
+                return -1; // EEXIST
+            }
+            if !cur.used {
+                PROTO_SLOTS[i] = ProtoSlot {
+                    used: true,
+                    protocol,
+                    name,
+                    handler: Some(handler),
+                };
+                return 0;
+            }
+        }
+    }
+    -1 // ENOSPC
 }
 
 /// 移除协议处理器。
-///
-/// # Safety
-///
-/// - 必须在系统关闭时调用
-pub fn inet_del_protocol(_protocol: u8) -> i32 {
-    // TODO: 实现协议注销
-    // SAFETY: 调用在初始化上下文中，无竞争。
-    0
+pub fn inet_del_protocol(protocol: u8) -> i32 {
+    unsafe {
+        for i in 0..MAX_PROTOCOLS {
+            let cur = slot(i);
+            if cur.used && cur.protocol == protocol {
+                *get_slot_mut(i) = ProtoSlot::default();
+                return 0;
+            }
+        }
+    }
+    -1
 }
 
-/// 根据协议号查找处理器。
-///
-/// # Safety
-///
-/// - 调用者保证 `skb` 有效
-pub fn inet_protocol(
-    _protocol: u8,
-    _skb: *mut SkBuff,
-) -> i32 {
-    // TODO: 实现协议查找
-    -1 // 未实现
+fn get_slot_mut(i: usize) -> &'static mut ProtoSlot {
+    // SAFETY: 同 slot()。
+    unsafe { &mut (*get_mut_ptr() )[i] }
+}
+fn get_mut_ptr() -> *mut [ProtoSlot; MAX_PROTOCOLS] {
+    unsafe { &raw mut PROTO_SLOTS }
 }
 
-/// 初始化协议层。参考 C 的 `inet_proto_init()`。
+/// 根据协议号查找处理器并投递。未注册 → -1。
+///
+/// # Safety
+/// 调用者保证 `skb` 有效；handler 的消耗语义由注册方保证。
+pub fn inet_protocol(protocol: u8, skb: *mut SkBuff) -> i32 {
+    for i in 0..MAX_PROTOCOLS {
+        let cur = slot(i);
+        if cur.used && cur.protocol == protocol {
+            if let Some(h) = cur.handler {
+                // SAFETY: 注册方的契约。
+                return unsafe { h(skb) };
+            }
+            return -1;
+        }
+    }
+    -1
+}
+
+/// 初始化协议层。参考 C 的 `inet_proto_init()`。当前数据路径在
+/// netif.rs 里直接分派（proto match），注册表供后续 SkBuff 化收包使用；
+/// 这里把表清空，避免静态残留。
 pub fn init() {
-    // 注册内置协议
-    // - ICMP (1)
-    // - TCP (6)
-    // - UDP (17)
+    // SAFETY: 启动期单线程。
+    unsafe {
+        for i in 0..MAX_PROTOCOLS {
+            *get_slot_mut(i) = ProtoSlot {
+                used: false,
+                protocol: 0,
+                name: "",
+                handler: None,
+            };
+        }
+    }
 }

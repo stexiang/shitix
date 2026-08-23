@@ -78,16 +78,38 @@ pub struct UnixSocket {
     refcnt: usize,
 }
 
+const MAX_UNIX_SOCKS: usize = 8;
+static mut UNIX_POOL: [core::mem::MaybeUninit<UnixSocket>; MAX_UNIX_SOCKS] =
+    [const { core::mem::MaybeUninit::uninit() }; MAX_UNIX_SOCKS];
+static mut UNIX_POOL_USED: [bool; MAX_UNIX_SOCKS] = [false; MAX_UNIX_SOCKS];
+
 impl UnixSocket {
     /// 创建新的 Unix socket。
     ///
+    /// 内核没有全局堆，同样用 8 槽静态池充当 slab（同 `inet::sock`）。
+    ///
     /// # Safety
     ///
-    /// - 返回的 socket 必须在不再需要时释放
+    /// - 返回的 socket 必须在不再需要时经 [`UnixSocket::release`] 释放
+    /// - 池满返回 null
     pub unsafe fn new() -> *mut Self {
-        // TODO: 实现真正的 slab 分配器
-        // SAFETY: 调用者负责内存管理。在单核内核中，无并发创建竞争。
-        core::ptr::null_mut() // 占位
+        for i in 0..MAX_UNIX_SOCKS {
+            // SAFETY: 池只在创建/销毁路径动，socket 层不并发创建。
+            unsafe {
+                if !UNIX_POOL_USED[i] {
+                    UNIX_POOL_USED[i] = true;
+                    let u = UNIX_POOL[i].as_mut_ptr();
+                    u.write(UnixSocket {
+                        addr: None,
+                        state: UnixState::Free,
+                        peer: None,
+                        refcnt: 0,
+                    });
+                    return u;
+                }
+            }
+        }
+        core::ptr::null_mut()
     }
 
     /// 绑定到路径。
@@ -101,13 +123,24 @@ impl UnixSocket {
         0
     }
 
-    /// 释放 socket。
+    /// 释放 socket（槽位归还静态池；池外指针/重复释放是 no-op）。
     ///
     /// # Safety
     ///
     /// - `sock` 必须是通过 `UnixSocket::new()` 创建的
-    pub fn release(_sock: *mut Self) {
-        // TODO: 实现真正的内存释放
+    pub fn release(sock: *mut Self) {
+        if sock.is_null() {
+            return;
+        }
+        for i in 0..MAX_UNIX_SOCKS {
+            // SAFETY: 槽位地址固定，比对不触碰内容。
+            unsafe {
+                if UNIX_POOL[i].as_mut_ptr() == sock {
+                    UNIX_POOL_USED[i] = false;
+                    return;
+                }
+            }
+        }
     }
 }
 

@@ -76,21 +76,22 @@ impl RouteTable {
         dest: u32,
         mask: u32,
         gateway: u32,
-        _dev: *mut crate::net::inet::dev::Device,
+        dev: *mut crate::net::inet::dev::Device,
         flags: RouteFlags,
     ) {
-        // SAFETY: 调用者保证锁定。
-        // TODO: 实现真正的设备分配
+        // SAFETY: 调用者保证锁定。单网卡环境：netif_present 时设备下标
+        // 恒为 0（e1000），null dev 等价于 "还没网卡"。
         unsafe {
+            let dev_idx = if dev.is_null() { usize::MAX } else { 0 };
             for entry in &mut self.entries {
                 if entry.is_none() {
                     *entry = Some(RouteEntry {
                         dest,
                         mask,
                         gateway,
-                        device: usize::MAX, // TODO
+                        device: dev_idx,
                         flags,
-                        refcnt: 0,
+                        refcnt: 1,
                         use_: 0,
                     });
                     return;
@@ -100,9 +101,9 @@ impl RouteTable {
     }
 
     /// 设置默认路由。
-    pub fn set_default(&mut self, gateway: u32, _dev: *mut crate::net::inet::dev::Device) {
+    pub fn set_default(&mut self, gateway: u32, dev: *mut crate::net::inet::dev::Device) {
         self.default_gateway = gateway;
-        self.default_device = usize::MAX; // TODO
+        self.default_device = if dev.is_null() { usize::MAX } else { 0 };
     }
 
     /// 查找路由。
