@@ -50,7 +50,11 @@ pub fn do_exit(code: ExitCode) -> ! {
         let vp = (*sched::task_ptr(nr)).vfork_parent;
         if vp != 0 {
             (*sched::task_ptr(nr)).vfork_parent = 0;
+            let fl = crate::irq::local_irq_save();
+            crate::sched::sched_lock();
             (*sched::task_ptr(vp)).state = TaskState::Running;
+            crate::sched::sched_unlock();
+            crate::irq::restore_flags(fl);
         }
         // 关闭所有打开的文件。对应原版 do_exit 里那个
         // `for (i=0 ; i<NR_OPEN ; i++) if (current->filp[i]) sys_close(i)`。
@@ -74,7 +78,12 @@ pub fn do_exit(code: ExitCode) -> ! {
 
         let task = sched::task_ptr(nr);
         (*task).exit_code = code;
+        let fl = crate::irq::local_irq_save();
+        crate::sched::sched_lock();
         (*task).state = TaskState::Zombie;
+        (*task).on_cpu = -1;
+        crate::sched::sched_unlock();
+        crate::irq::restore_flags(fl);
 
         // 通知父进程：SIGCHLD + 唤醒它的 wait 睡眠。
         // 必须在 state = Zombie 之后，否则父进程醒来时还看不到僵尸。
@@ -128,7 +137,11 @@ unsafe fn wake_up_waiter(task_idx: usize) {
     unsafe {
         let t = sched::task_ptr(task_idx);
         if (*t).state == TaskState::Interruptible {
+            let fl = crate::irq::local_irq_save();
+            crate::sched::sched_lock();
             (*t).state = TaskState::Running;
+            crate::sched::sched_unlock();
+            crate::irq::restore_flags(fl);
         }
     }
 }
@@ -232,7 +245,12 @@ pub fn release(task_idx: usize) -> i32 {
         (*task).root = crate::fs::inode::NIL;
 
         // 重置任务状态
+        let fl = crate::irq::local_irq_save();
+        crate::sched::sched_lock();
         (*task).state = TaskState::Unused;
+        (*task).on_cpu = -1;
+        crate::sched::sched_unlock();
+        crate::irq::restore_flags(fl);
 
         crate::sprintln!("[INFO] released task slot {}", task_idx);
         0
@@ -368,7 +386,11 @@ pub unsafe fn sys_wait4(pid: i64, stat_addr: u64, options: u64) -> i64 {
         // SAFETY: 系统调用上下文，me != 0（task[0] 不会走到这里，见 do_exit 的检查）。
         unsafe {
             let t = sched::task_ptr(me);
+            let fl = crate::irq::local_irq_save();
+            crate::sched::sched_lock();
             (*t).state = TaskState::Interruptible;
+            crate::sched::sched_unlock();
+            crate::irq::restore_flags(fl);
             sched::schedule();
 
             // 醒来先看是不是被信号打断的。原版返回 -ERESTARTSYS，

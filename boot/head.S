@@ -151,11 +151,11 @@ stack_guard:
     .global stack_bottom
 stack_bottom:
     /*
-     * task[0] 的栈。8KB：实测高水位 3832 字节（见 stack_high_water），
-     * 而 task[0] 不碰文件系统（那条深调用链在 fsinit 内核线程里跑），
-     * 所以不需要 16KB。省下的 8KB 留给 .bss 里的静态表——BSS 顶到
-     * 0x90000 就会盖掉 setup 参数区（链接脚本里有 ASSERT 拦住）。
+     * task[0] 的栈。16KB：SMP 调度器（sched_lock/switch_to_task 的
+     * 现场元组 + this_cpu 调用链）把高水位从 3832 顶到 8176 字节，
+     * 8KB 已经撞穿哨兵（高地址溢出会踩进 BUFFERS/静态表，故障离
+     * 原因非常远）。BSS 已挪到 1MB 起步，assert 上限 2MB，放得下。
      */
-    .space  8192
+    .space  16384
     .global stack_top
 stack_top:

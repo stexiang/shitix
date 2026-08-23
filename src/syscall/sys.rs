@@ -3025,8 +3025,12 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             let child = sched::task_ptr(child_nr);
             *child = (*parent).clone();
 
-            // 子进程特有的字段。
-            (*child).state = TaskState::Running;
+            // 子进程特有的字段。on_cpu 不能继承父进程的（它在别的核上
+            // 执行）；置 -1 表示「还没被任何核调度到」。SMP 下先 Stopped，
+            // 全部字段（栈、tss.rsp、调度环）就绪后持调度锁再发布 Running，
+            // 避免 AP 扫到半成品子进程。
+            (*child).on_cpu = -1;
+            (*child).state = TaskState::Stopped;
             (*child).pid = sched::allocate_pid();
             (*child).pgrp = (*parent).pgrp;
             (*child).session = (*parent).session;
@@ -3141,6 +3145,15 @@ pub fn fork(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             (*sched::task_ptr(child_nr)).prev = parent_nr;
             (*sched::task_ptr(parent_nr)).next = child_nr;
             (*sched::task_ptr(old_next)).prev = child_nr;
+
+            // SMP：全部就绪后持锁发布 Running（AP 扫描持同一把锁）。
+            // 调度锁只能在关中断段持有，这里再保一层（fork 外层已关，
+            // save/restore 可嵌套）。
+            let fl = crate::irq::local_irq_save();
+            sched::sched_lock();
+            (*child).state = TaskState::Running;
+            sched::sched_unlock();
+            crate::irq::restore_flags(fl);
 
             let child_pid = (*child).pid;
             crate::pr_info!(
@@ -5198,7 +5211,10 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         // Copy parent task
         *child = (*parent).clone();
 
-        (*child).state = TaskState::Running;
+        // on_cpu 不能继承父进程的（它正在本核执行）；子进程尚未上核。
+        // SMP 下先 Stopped，全部就绪后持调度锁发布 Running（见 fork）。
+        (*child).on_cpu = -1;
+        (*child).state = TaskState::Stopped;
         (*child).start_time = sched::jiffies();
         (*child).utime = 0; (*child).stime = 0;
         (*child).signal = 0;
@@ -5352,6 +5368,14 @@ pub fn clone(args: &SysArgs, regs: &mut PtRegs) -> i64 {
         (*sched::task_ptr(child_nr)).prev = parent_nr;
         (*sched::task_ptr(parent_nr)).next = child_nr;
         (*sched::task_ptr(old_next)).prev = child_nr;
+
+        // SMP：全部就绪后持锁发布 Running（AP 扫描持同一把锁）。
+        // 调度锁只能在关中断段持有。
+        let fl = crate::irq::local_irq_save();
+        sched::sched_lock();
+        (*child).state = TaskState::Running;
+        sched::sched_unlock();
+        crate::irq::restore_flags(fl);
 
         let child_pid = (*child).pid as i64;
         // VFORK：父进程立刻让出 CPU，让子进程先跑（execve/退出会唤醒父进程）。

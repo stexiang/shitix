@@ -46,6 +46,10 @@ pub mod selector {
     pub const USER_DS: u16 = 0x20 | 3;
     /// TSS 描述符（GDT 索引 5，占两项因为 64 位 TSS 描述符是 16 字节）
     pub const TSS: u16 = 0x28;
+    /// AP `cpu`（1 起）的 TSS 选择子：从 GDT 索引 7 起每核占两格。
+    pub const fn ap_tss(cpu: usize) -> u16 {
+        (7 * 8 + (cpu - 1) * 16) as u16
+    }
 }
 
 /// IST 槽位分配。原版没有 IST（32 位不支持）。
@@ -71,6 +75,15 @@ static mut DF_STACK: ExcStack = ExcStack([0; EXC_STACK_SIZE]);
 static mut NMI_STACK: ExcStack = ExcStack([0; EXC_STACK_SIZE]);
 static mut PF_STACK: ExcStack = ExcStack([0; EXC_STACK_SIZE]);
 
+/// AP 的 per-CPU 异常栈：SMP 下两颗核可能同时进异常处理，
+/// 共享一份 IST 栈会互相踩掉现场。
+static mut AP_DF_STACK: [ExcStack; crate::smp::MAX_CPUS] =
+    [const { ExcStack([0; EXC_STACK_SIZE]) }; crate::smp::MAX_CPUS];
+static mut AP_NMI_STACK: [ExcStack; crate::smp::MAX_CPUS] =
+    [const { ExcStack([0; EXC_STACK_SIZE]) }; crate::smp::MAX_CPUS];
+static mut AP_PF_STACK: [ExcStack; crate::smp::MAX_CPUS] =
+    [const { ExcStack([0; EXC_STACK_SIZE]) }; crate::smp::MAX_CPUS];
+
 // ---- GDT ----
 
 /// 64 位 GDT 项。NULL/代码/数据段是 8 字节，TSS 描述符是 16 字节（占两格）。
@@ -78,10 +91,12 @@ static mut PF_STACK: ExcStack = ExcStack([0; EXC_STACK_SIZE]);
 #[repr(transparent)]
 struct GdtEntry(u64);
 
-/// GDT 本体：NULL + 内核 CS/DS + 用户 CS/DS + TSS(2 格) = 7 格。
-/// 原版留了 256 项（`head.S` 的 `.fill 256-6,8,0`）给每任务的 TSS/LDT，
-/// 我们不需要——见模块文档第 1 点。
-const GDT_LEN: usize = 7;
+/// GDT 本体：NULL + 内核 CS/DS + 用户 CS/DS + BSP TSS(2 格) + 每个 AP
+/// 各 2 格 TSS。原版留了 256 项（`head.S` 的 `.fill 256-6,8,0`）给每任务
+/// 的 TSS/LDT，我们不需要——见模块文档第 1 点；AP 的槽位是 SMP 引入的：
+/// IST 门（NMI/#DF/#PF）在异常投递时要经 TR 读 TSS，TR 无效的核上任何
+/// IST 异常都会升级成 #SS。
+const GDT_LEN: usize = 7 + 2 * (crate::smp::MAX_CPUS - 1);
 
 static mut GDT: [GdtEntry; GDT_LEN] = [GdtEntry(0); GDT_LEN];
 
@@ -111,12 +126,45 @@ static mut TSS: Tss = Tss {
     iomap_base: size_of::<Tss>() as u16,
 };
 
+/// 每 AP 一张 TSS（下标 0 闲置，BSP 用上面的 [`TSS`]）：IST 门投递
+/// 异常时 CPU 要经本核 TR 读 IST 栈指针，共享一张 busy TSS 不能 ltr，
+/// 不 ltr 则 AP 上任何 NMI/#PF 都会变成 #SS。AP 不跑用户任务，
+/// rsp0 不会被读，只填 IST 部分。
+static mut AP_TSS: [Tss; crate::smp::MAX_CPUS] = [const {
+    Tss {
+        reserved0: 0,
+        privilege_stack_table: [0; 3],
+        reserved1: 0,
+        interrupt_stack_table: [0; 7],
+        reserved2: 0,
+        reserved3: 0,
+        iomap_base: size_of::<Tss>() as u16,
+    }
+}; crate::smp::MAX_CPUS];
+
 /// `lgdt` / `lidt` 的操作数格式：2 字节 limit + 8 字节基址。
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct DescriptorTablePointer {
     limit: u16,
     base: u64,
+}
+
+/// 把一张 64 位 TSS 描述符（16 字节，占两格）写进 `slot`/`slot+1`。
+/// type=0x9 (available 64-bit TSS), P=1, DPL=0。
+fn write_tss_desc(slot: &mut GdtEntry, tss_addr: u64) {
+    const PRESENT: u64 = 1 << 47;
+    let limit = (size_of::<Tss>() - 1) as u64;
+    let low = limit & 0xFFFF
+        | (tss_addr & 0xFF_FFFF) << 16
+        | 0x9 << 40
+        | PRESENT
+        | ((limit >> 16) & 0xF) << 48
+        | ((tss_addr >> 24) & 0xFF) << 56;
+    let high = tss_addr >> 32;
+    *slot = GdtEntry(low);
+    // SAFETY: 调用方保证 slot+1 在 GDT 内（TSS 描述符本来就占两格）。
+    unsafe { *(slot as *mut GdtEntry).add(1) = GdtEntry(high) };
 }
 
 /// 建立并装载 GDT + TSS。
@@ -167,17 +215,7 @@ pub unsafe fn init_gdt() {
     // 对应原版 `set_tss_desc` 那个 `_set_tssldt_desc` 汇编宏，
     // 只是 64 位下基址扩到 64 位，所以要跨两格。
     let tss_addr = core::ptr::addr_of!(TSS) as u64;
-    let limit = (size_of::<Tss>() - 1) as u64;
-    // type=0x9 (available 64-bit TSS), P=1, DPL=0
-    let low = limit & 0xFFFF
-        | (tss_addr & 0xFF_FFFF) << 16
-        | 0x9 << 40
-        | PRESENT
-        | ((limit >> 16) & 0xF) << 48
-        | ((tss_addr >> 24) & 0xFF) << 56;
-    let high = tss_addr >> 32;
-    gdt[5] = GdtEntry(low);
-    gdt[6] = GdtEntry(high);
+    write_tss_desc(&mut gdt[5], tss_addr);
 
     // 三个 IST 栈的栈顶（向下增长，所以是数组末尾）
     // SAFETY: 三个静态数组独占，取末尾地址不解引用。
@@ -212,9 +250,11 @@ pub unsafe fn init_gdt() {
 }
 
 /// 仅供 AP（应用处理器）启动时调用：装载与 BSP 相同的 GDT 和 IDT，
-/// 但 **不** `ltr` —— TSS 由 BSP 独占（AP 不跑用户任务，没有特权级
-/// 切换要用 rsp0），且 TSS 描述符已被 BSP 的 `ltr` 标成 busy，AP 再
-/// `ltr` 同一张会 #GP。
+/// 并装载**本核自己的 TSS**（`AP_TSS[cpu]`，GDT 槽位见
+/// [`selector::ap_tss`]）。IST 门（NMI/#DF/#PF）投递异常时要经 TR 读
+/// IST 栈指针——不 ltr（TR=0）的核上任何 IST 异常都会升级成 #SS
+/// （实测：AP 收到一颗 NMI 直接 trap 12）。共享的 BSP TSS 已被
+/// `ltr` 标 busy 不能复用，所以每核一张。
 ///
 /// CS 用 retfq 重载到 `KERNEL_CS`：AP 醒来时 CS 是蹦床 GDT 的 0x18，
 /// 恰好等于本表的用户代码段索引，虽然 flat 段下继续执行不会出错，
@@ -223,7 +263,27 @@ pub unsafe fn init_gdt() {
 /// # Safety
 /// 只在 AP 蹦床把执行权交给 Rust 后调用一次。调用者必须保证
 /// [`init_gdt`]/[`init_idt`] 已在 BSP 上完成（表已建好）。
-pub unsafe fn ap_load_tables() {
+/// `cpu` 是逻辑 CPU 号（1..MAX_CPUS）。
+pub unsafe fn ap_load_tables(cpu: usize) {
+    // 先填本核的 TSS 与描述符（只写自己那两格，不碰他核的）。
+    // SAFETY: AP_TSS[cpu] 专属本核；GDT 槽位专属本核，BSP 建表后不再写。
+    unsafe {
+        let tss = &mut (*core::ptr::addr_of_mut!(AP_TSS))[cpu];
+        tss.interrupt_stack_table[(ist::DOUBLE_FAULT - 1) as usize] =
+            core::ptr::addr_of!((*core::ptr::addr_of!(AP_DF_STACK))[cpu]) as u64
+                + EXC_STACK_SIZE as u64;
+        tss.interrupt_stack_table[(ist::NMI - 1) as usize] =
+            core::ptr::addr_of!((*core::ptr::addr_of!(AP_NMI_STACK))[cpu]) as u64
+                + EXC_STACK_SIZE as u64;
+        tss.interrupt_stack_table[(ist::PAGE_FAULT - 1) as usize] =
+            core::ptr::addr_of!((*core::ptr::addr_of!(AP_PF_STACK))[cpu]) as u64
+                + EXC_STACK_SIZE as u64;
+        let tss_addr = tss as *mut Tss as u64;
+        let gdt = &mut *core::ptr::addr_of_mut!(GDT);
+        let slot = (selector::ap_tss(cpu) / 8) as usize;
+        write_tss_desc(&mut gdt[slot], tss_addr);
+    }
+
     let gdt_ptr = DescriptorTablePointer {
         limit: (size_of::<[GdtEntry; GDT_LEN]>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
@@ -232,12 +292,15 @@ pub unsafe fn ap_load_tables() {
         limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,
     };
-    // SAFETY: 两张表都由 BSP 建好后不再改动；lretq 用的新 CS 是合法的
-    // 64 位内核代码段。栈操作是指令语义的一部分，不能声明 nostack。
+    let tss_sel = selector::ap_tss(cpu);
+    // SAFETY: 两张表都由 BSP 建好、本核 TSS 描述符刚填好；lretq 用的新
+    // CS 是合法的 64 位内核代码段。栈操作是指令语义的一部分，不能声明
+    // nostack。
     unsafe {
         core::arch::asm!(
             "lgdt ({gdt})",
             "lidt ({idt})",
+            "ltr {tss:x}",
             "pushq {cs}",
             "leaq 2f(%rip), %rax",
             "pushq %rax",
@@ -245,6 +308,7 @@ pub unsafe fn ap_load_tables() {
             "2:",
             gdt = in(reg) &gdt_ptr,
             idt = in(reg) &idt_ptr,
+            tss = in(reg) tss_sel,
             cs = in(reg) selector::KERNEL_CS as u64,
             out("rax") _,
             options(att_syntax, preserves_flags)

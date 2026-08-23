@@ -51,8 +51,50 @@ mod syscall_scratch {
 /// 原版是指针数组（槽位空 = NULL），我们是值数组（槽位空 = `TaskState::Unused`）。
 static mut TASKS: [Task; NR_TASKS] = [const { Task::zeroed() }; NR_TASKS];
 
-/// 当前任务下标。对应原版全局 `struct task_struct *current`。
-static mut CURRENT: usize = 0;
+/// AP 空转哨兵：AP 上没有可偷的任务时 `CPU_CURRENT[cpu] == IDLE_SENTINEL`，
+/// 栈切换现场存在 [`AP_IDLE_RSP`]（即 AP main 循环自己）。
+pub const IDLE_SENTINEL: usize = usize::MAX;
+
+/// 每核当前任务。下标 = 逻辑 CPU。BSP 恒为真实任务号（至少 task[0]），
+/// AP 空闲时为 [`IDLE_SENTINEL`]。对应原版全局 `current`。
+static mut CPU_CURRENT: [usize; crate::smp::MAX_CPUS] = [0; crate::smp::MAX_CPUS];
+
+/// AP 空转循环的栈切换现场（AP 没有任务表槽位，用它存/取 rsp）。
+static mut AP_IDLE_RSP: [u64; crate::smp::MAX_CPUS] = [0; crate::smp::MAX_CPUS];
+
+/// 任务表互斥锁：SMP 下调度选择/唤醒/状态发布的跨核互斥。
+/// 注意 BSP 上只能在「已关中断」的段里拿它——若中断处理路径也拿，
+/// 而 BSP 主流程正持有，会同核自旋死锁。所以中断路径用
+/// [`sched_try_lock_irq`]：拿不到就置 NEED_WAKE_SCAN，由调度器补扫。
+static SCHED_LOCK: crate::smp::SpinLock = crate::smp::SpinLock::new();
+
+/// 拿任务表锁。只能在允许自旋的上下文用（BSP 上须先关中断）。
+pub fn sched_lock() {
+    SCHED_LOCK.lock();
+}
+
+pub fn sched_unlock() {
+    SCHED_LOCK.unlock();
+}
+
+/// 本核逻辑 CPU 号。UP / LAPIC 未初始化时恒 0。
+#[inline]
+pub fn this_cpu() -> usize {
+    if !crate::smp::is_apic_initialized() {
+        return 0;
+    }
+    let id = crate::smp::current_apic_id() as usize;
+    if id < crate::smp::MAX_CPUS { id } else { 0 }
+}
+
+/// 当前任务的下标。
+#[inline]
+pub fn current_nr() -> usize {
+    // SAFETY: 只读一个 usize；调度器改它时（本核）中断是关的。
+    let cpu = this_cpu();
+    let n = unsafe { *core::ptr::addr_of!(CPU_CURRENT[cpu]) };
+    if n == IDLE_SENTINEL { 0 } else { n }
+}
 
 /// 自启动以来的时钟滴答。对应原版 `unsigned long volatile jiffies`。
 #[unsafe(no_mangle)]
@@ -79,20 +121,14 @@ unsafe extern "C" {
 
 // ---- 访问器 ----
 
-/// 当前任务的下标。
-#[inline]
-pub fn current_nr() -> usize {
-    // SAFETY: 只读一个 usize；单核下调度器改它时中断是关的。
-    unsafe { *core::ptr::addr_of!(CURRENT) }
-}
-
 /// 当前任务。对应原版宏 `current`。
 ///
 /// # Safety
 /// 返回的引用在下一次 [`schedule`] 之前有效。调用方不得跨调度点持有。
 pub unsafe fn current() -> &'static mut Task {
-    // SAFETY: CURRENT 始终是有效槽位；契约要求不跨调度点持有。
-    unsafe { &mut (*core::ptr::addr_of_mut!(TASKS))[*core::ptr::addr_of!(CURRENT)] }
+    let nr = current_nr();
+    // SAFETY: nr 始终是有效槽位；契约要求不跨调度点持有。
+    unsafe { &mut (*core::ptr::addr_of_mut!(TASKS))[nr] }
 }
 
 /// 按下标取任务。
@@ -173,9 +209,12 @@ pub fn set_need_resched() {
 /// "Aiee: scheduling in interrupt"，我们同样检测）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn schedule() {
-    // 原版第一件事：中断里调度是严重错误
+    // 原版第一件事：中断里调度是严重错误。
+    // SMP 注意：intr_count 是全局计数（BSP 的 PIC IRQ 进出维护），
+    // AP 不接收外部中断（无 LAPIC timer/IPI），它看到的可能是 BSP
+    // 正在中断里的假象，所以只在 BSP 上检查。
     // SAFETY: 只读一个 u64。
-    if unsafe { *core::ptr::addr_of!(irq::intr_count) } != 0 {
+    if this_cpu() == 0 && unsafe { *core::ptr::addr_of!(irq::intr_count) } != 0 {
         crate::pr!(Level::Err, "Aiee: scheduling in interrupt");
         // SAFETY: 原版也是直接清零硬着头皮继续。
         unsafe { *core::ptr::addr_of_mut!(irq::intr_count) = 0 }
@@ -184,15 +223,19 @@ pub unsafe extern "C" fn schedule() {
     // SAFETY: 下面整段独占任务表；进入时中断状态由调用方决定，
     // 我们在挑选任务期间关中断以免 do_timer 改 counter。
     let flags = unsafe { irq::local_irq_save() };
+    let cpu = this_cpu();
 
-    // SAFETY: 单核，已关中断。
+    // AP 空转哨兵不参与「需要调度」逻辑，但 BSP 的 need_resched 语义保持。
+    // SAFETY: 单核/本核下一个 i32。
     unsafe { *core::ptr::addr_of_mut!(need_resched) = 0 }
 
+    sched_lock();
+
     let now = jiffies();
-    let cur = current_nr();
+    let cur = unsafe { *core::ptr::addr_of!(CPU_CURRENT[cpu]) };
 
     // 第一遍：唤醒超时和收到信号的可打断睡眠者（原版 confuse_gcc1 前那段）
-    // SAFETY: 遍历任务表，已关中断独占。
+    // SAFETY: 遍历任务表，持锁独占。
     unsafe {
         let tasks = &mut *core::ptr::addr_of_mut!(TASKS);
         for t in tasks.iter_mut() {
@@ -210,35 +253,29 @@ pub unsafe extern "C" fn schedule() {
         }
     }
 
-    // 第二遍：挑 counter 最大的 Running（原版 `c = -1` 到 confuse_gcc2 那段）。
-    //
-    // 关键：**扫描要跳过 task[0]**。原版的循环是
-    //   next = p = &init_task;
-    //   for (;;) { if ((p = p->next_task) == &init_task) goto confuse_gcc2; ... }
-    // 先自增再判等，所以 init_task 自己从不作为候选参与比较，只作为
-    // 「没有别的可运行任务」时的兜底默认值。
-    // 我们的 task[0] 是 idle，counter 恒为 priority(15) 且 do_timer 不减它，
-    // 一起参与比较的话它永远赢，别的任务一次都跑不上。见 buglog bug-006。
-    let mut best = 0usize; // 兜底：task[0]，即原版的 init_task/idle
+    // 第二遍：挑 counter 最大的可偷 Running 任务。排除条件：
+    // - task[0]（idle，只对 BSP 兜底用；原版就先自增再判等把它跳过）
+    // - on_cpu >= 0（正在别的核上跑——包括本核当前任务之外的一切）
+    // - AP 上跳过用户任务（pml4 != 0）：TSS rsp0/syscall_scratch 是
+    //   BSP 全局的，AP 只接 pml4==0 的纯内核线程。
+    let mut best: usize = if cpu == 0 { 0 } else { IDLE_SENTINEL };
     let mut best_counter = -1i64;
-    // SAFETY: 遍历任务环，已关中断独占。环由 kernel_thread/init 维护，
-    // 保证从 0 出发沿 next 一定能回到 0。
     unsafe {
         let mut nr = task(0).next;
         while nr != 0 {
             let t = task(nr);
-            if t.state == TaskState::Running && t.counter > best_counter {
+            if t.state == TaskState::Running
+                && t.on_cpu < 0
+                && (cpu == 0 || t.pml4 == 0)
+                && t.counter > best_counter
+            {
                 best_counter = t.counter;
                 best = nr;
             }
             nr = t.next;
         }
 
-        // 全部时间片耗尽 → 重新发放。原版：
-        //   if (!c) for_each_task(p) p->counter = (p->counter >> 1) + p->priority;
-        // 这里 `for_each_task` **包括** init_task（与上面的候选扫描不同）。
-        // 注意也包括睡眠中的任务，这是原版的有意设计：睡着的任务也在攒
-        // 时间片，醒来时优先级更高。
+        // 全部时间片耗尽 → 重新发放（包括睡着/正跑着的任务，同原版语义）。
         if best_counter == 0 {
             let tasks = &mut *core::ptr::addr_of_mut!(TASKS);
             for t in tasks.iter_mut() {
@@ -246,13 +283,16 @@ pub unsafe extern "C" fn schedule() {
                     t.counter = (t.counter >> 1) + t.priority;
                 }
             }
-            // 重新挑一次，否则这一轮还是会选到 counter=0 的那个
-            best = 0;
+            best = if cpu == 0 { 0 } else { IDLE_SENTINEL };
             best_counter = -1;
             let mut nr = task(0).next;
             while nr != 0 {
                 let t = task(nr);
-                if t.state == TaskState::Running && t.counter > best_counter {
+                if t.state == TaskState::Running
+                    && t.on_cpu < 0
+                    && (cpu == 0 || t.pml4 == 0)
+                    && t.counter > best_counter
+                {
                     best_counter = t.counter;
                     best = nr;
                 }
@@ -262,18 +302,20 @@ pub unsafe extern "C" fn schedule() {
     }
 
     if best == cur {
-        // 无需切换。原版也是走到 switch_to 里由宏判断（`cmpl %ecx,_current; je 1f`）
+        sched_unlock();
         // SAFETY: 与上面的 save 配对。
         unsafe { irq::restore_flags(flags) };
         return;
     }
 
-    // SAFETY: 只加一个计数器，已关中断。
+    // SAFETY: 只加一个计数器，持锁。
     unsafe { *core::ptr::addr_of_mut!(CONTEXT_SWITCHES) += 1 }
 
-    // SAFETY: best/cur 都是有效槽位；切换本身的前提见 switch_to_task 的契约。
-    unsafe { switch_to_task(cur, best) };
+    // SAFETY: best/cur 是有效槽位或 IDLE_SENTINEL；切换前提见
+    // switch_to_task 的契约。
+    unsafe { switch_to_task(cur, best, cpu) };
 
+    sched_unlock();
     // 回到这里说明我们又被调度回来了。恢复调用方的中断状态。
     // SAFETY: 与上面的 save 配对（flags 在我们自己的内核栈上，切换后仍有效）。
     unsafe { irq::restore_flags(flags) };
@@ -281,30 +323,51 @@ pub unsafe extern "C" fn schedule() {
 
 /// 执行一次上下文切换。对应原版宏 `switch_to(next)`。
 ///
+/// SMP 版：`prev`/`next` 可以是 [`IDLE_SENTINEL`]（AP 空转循环，其 rsp
+/// 现场在 [`AP_IDLE_RSP`]）。真实任务切换时同步更新 `on_cpu` /
+/// `CPU_CURRENT[cpu]`；TSS rsp0 / syscall scratch 只在 cpu==0 上维护
+/// （AP 只跑内核线程，不会走 syscall 入口，scratch 属于 BSP 的用户任务）。
+///
 /// # Safety
-/// 必须关中断调用；`prev`/`next` 必须是不同的有效槽位，且 `next` 的
-/// `tss.rsp` 必须指向一个由 [`kernel_thread`] 或 [`init`] 正确布置过的内核栈。
-unsafe fn switch_to_task(prev: usize, next: usize) {
-    // SAFETY: 契约保证下标有效。
-    let (prev_rsp_ptr, next_rsp, next_rsp0, next_cr3) = unsafe {
+/// 持有 [`SCHED_LOCK`] 且关中断调用；`prev`/`next` 不同；`next` 的
+/// `tss.rsp` 必须指向正确布置过的内核栈（或由 AP 空转循环提供）。
+unsafe fn switch_to_task(prev: usize, next: usize, cpu: usize) {
+    // SAFETY: 契约保证下标有效或 IDLE_SENTINEL。
+    let (prev_rsp_ptr, next_rsp, next_rsp0, next_cr3, prev_fs, prev_gs, next_fs, next_gs) = unsafe {
         let tasks = &mut *core::ptr::addr_of_mut!(TASKS);
-        (
-            core::ptr::addr_of_mut!(tasks[prev].tss.rsp),
-            tasks[next].tss.rsp,
-            tasks[next].tss.rsp0,
-            tasks[next].pml4 as u64,
-        )
+        let prev_slot: *mut u64 = if prev == IDLE_SENTINEL {
+            core::ptr::addr_of_mut!(AP_IDLE_RSP[cpu])
+        } else {
+            core::ptr::addr_of_mut!(tasks[prev].tss.rsp)
+        };
+        let next_rsp = if next == IDLE_SENTINEL {
+            AP_IDLE_RSP[cpu]
+        } else {
+            tasks[next].tss.rsp
+        };
+        let next_rsp0 = if next == IDLE_SENTINEL { 0 } else { tasks[next].tss.rsp0 };
+        let next_cr3 = if next == IDLE_SENTINEL { 0 } else { tasks[next].pml4 as u64 };
+        let (pfs, pgs, nfs, ngs) = if prev == IDLE_SENTINEL || next == IDLE_SENTINEL {
+            (0, 0, 0, 0)
+        } else {
+            (tasks[prev].fs_base, tasks[prev].gs_base, tasks[next].fs_base, tasks[next].gs_base)
+        };
+        (prev_slot, next_rsp, next_rsp0, next_cr3, pfs, pgs, nfs, ngs)
     };
 
-    // 先把 current 指向 next：switch_to 之后我们就在 next 的栈上了，
-    // 那时读 CURRENT 必须已经是新值（原版由 `movl %edx,_current` 在
-    // ljmp 之前完成，顺序相同）。
-    // SAFETY: 已关中断，单核独占。
-    unsafe { *core::ptr::addr_of_mut!(CURRENT) = next }
+    // on_cpu 发布：真实任务互斥归属。
+    unsafe {
+        if next != IDLE_SENTINEL {
+            task(next).on_cpu = cpu as i32;
+        }
+        if prev != IDLE_SENTINEL {
+            task(prev).on_cpu = -1;
+        }
+        *core::ptr::addr_of_mut!(CPU_CURRENT[cpu]) = next;
+    }
 
-    // 改写唯一 TSS 的 rsp0，让下次从用户态陷入时落到 next 自己的内核栈。
-    // 原版每任务一个 TSS，`ljmp` 时 CPU 自动加载，不需要这一步。
-    if next_rsp0 != 0 {
+    // TSS rsp0 与 syscall scratch 只 cpu0 维护（单 TSS 全局共享）。
+    if cpu == 0 && next != IDLE_SENTINEL && next_rsp0 != 0 {
         // SAFETY: next_rsp0 是 next 内核栈的栈顶，由创建时算好。
         unsafe { desc::set_rsp0(next_rsp0) }
         // 同步更新 syscall_entry 的内核栈 scratch
@@ -329,29 +392,30 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
         }
     }
 
-    // 切 FS/GS base（TLS）。只在值不同时才写 MSR。
-    // SAFETY: CPL=0，wrmsr 合法。
-    unsafe {
-        let tasks = &*core::ptr::addr_of_mut!(TASKS);
-        if tasks[prev].fs_base != tasks[next].fs_base {
-            core::arch::asm!("wrmsr",
-                in("ecx") 0xC000_0100u64,
-                in("eax") tasks[next].fs_base as u32,
-                in("edx") (tasks[next].fs_base >> 32) as u32,
-                options(nomem, nostack, preserves_flags));
-        }
-        if tasks[prev].gs_base != tasks[next].gs_base {
-            core::arch::asm!("wrmsr",
-                in("ecx") 0xC000_0101u64,
-                in("eax") tasks[next].gs_base as u32,
-                in("edx") (tasks[next].gs_base >> 32) as u32,
-                options(nomem, nostack, preserves_flags));
+    // 切 FS/GS base（TLS）。只在值不同时才写 MSR。AP 不涉及用户 TLS，
+    // 且 sentinel 情况下跳过。
+    if prev != IDLE_SENTINEL && next != IDLE_SENTINEL {
+        // SAFETY: CPL=0，wrmsr 合法。
+        unsafe {
+            if prev_fs != next_fs {
+                core::arch::asm!("wrmsr",
+                    in("ecx") 0xC000_0100u64,
+                    in("eax") next_fs as u32,
+                    in("edx") (next_fs >> 32) as u32,
+                    options(nomem, nostack, preserves_flags));
+            }
+            if prev_gs != next_gs {
+                core::arch::asm!("wrmsr",
+                    in("ecx") 0xC000_0101u64,
+                    in("eax") next_gs as u32,
+                    in("edx") (next_gs >> 32) as u32,
+                    options(nomem, nostack, preserves_flags));
+            }
         }
     }
 
-    // SAFETY: prev_rsp_ptr 指向 prev.tss.rsp；next_rsp 是 next 上次
-    // switch_to 时保存的栈指针（或新任务的初始栈）。entry.S 的 switch_to
-    // 会在那个栈上找到匹配的 callee-saved 保存区和返回地址。
+    // SAFETY: prev_rsp_ptr 指向 prev.tss.rsp 或 AP idle 现场；
+    // next_rsp 是 next 上次保存的栈指针（或新任务的初始栈 / AP idle 现场）。
     unsafe { switch_to(prev_rsp_ptr, next_rsp) }
 }
 
@@ -366,6 +430,15 @@ unsafe fn switch_to_task(prev: usize, next: usize) {
 /// 只能由 entry.S 的两个新任务入场点调用。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn schedule_tail() {
+    // SMP 调度锁的「换手」：锁是上一个在本核跑的任务在 schedule() 里拿
+    // 的，switch_to 把栈切到我们身上，本核继续持锁直到「被切进来的这
+    // 一方」释放。两条释放路径：
+    //   1. 老任务被重新调度回来：在 schedule() 的 switch_to_task 返回后
+    //      sched_unlock()；
+    //   2. 新任务第一次起跑：走到这里，由 schedule_tail 解锁。
+    // 漏掉这条会让锁永远被占着，新任务第一次 sleep/schedule 就自旋死锁。
+    sched_unlock();
+
     // CLONE_CHILD_SETTID：子进程把自己的 pid 写到 set_child_tid 指向的
     // 用户地址（对应 Linux ret_from_fork 的 `put_user(tsk->pid, ...)`）。
     // 必须在子进程上下文做：写自己的地址空间，COW 缺页会正确复制出私有页，
@@ -589,17 +662,21 @@ impl WaitQueue {
         }
         core::ptr::write_volatile(core::ptr::addr_of_mut!(self.head), nr);
         while cond() {
-            // SAFETY: 已关中断，独占任务表。
+            // SAFETY: 已关中断，独占任务表。SMP 下持调度锁发布状态。
+            sched_lock();
             unsafe {
                 let t = task(nr);
                 t.state = TaskState::Uninterruptible;
                 t.timeout = 0;
             }
+            sched_unlock();
             // SAFETY: 不在中断上下文（契约保证）；schedule 内部会开中断。
             unsafe { schedule() };
         }
         // SAFETY: 已关中断。
+        sched_lock();
         unsafe { task(nr).state = TaskState::Running };
+        sched_unlock();
         self.remove(nr);
         // SAFETY: 与上面的 save 配对。
         unsafe { irq::restore_flags(flags) };
@@ -615,7 +692,9 @@ impl WaitQueue {
         }
         // SAFETY: 挂链期间关中断，防止 wake_up 从中断里插进来看到半截链表。
         let flags = unsafe { irq::local_irq_save() };
-        // SAFETY: nr 有效；独占任务表与等待链。
+        // SAFETY: nr 有效；独占任务表与等待链。SMP 下 state 写入持调度锁，
+        // 与 AP 的 Running 扫描互斥排序。
+        sched_lock();
         unsafe {
             let t = task(nr);
             t.state = state;
@@ -624,6 +703,7 @@ impl WaitQueue {
                 core::ptr::read_volatile(core::ptr::addr_of!(self.head));
         }
         core::ptr::write_volatile(core::ptr::addr_of_mut!(self.head), nr);
+        sched_unlock();
 
         // 原版 __sleep_on 在 schedule() 之前 sti()：睡下之后必须能被中断唤醒。
         // SAFETY: IDT/PIC 就绪。
@@ -680,6 +760,10 @@ impl WaitQueue {
     fn wake_up_state(&mut self, only_interruptible: bool) {
         // SAFETY: 遍历等待链期间关中断。
         let flags = unsafe { irq::local_irq_save() };
+        // SMP：直接自旋拿调度锁。安全前提：调度锁只在「关中断」段里
+        // 持有，所以持锁核不会被自己的中断打断去重拿同一把锁；
+        // 这里若是在中断里，只能是别的核（AP 空转）持有，自旋即可。
+        sched_lock();
         // SAFETY: 独占任务表与等待链。
         unsafe {
             let cur_counter = task(current_nr()).counter;
@@ -703,6 +787,7 @@ impl WaitQueue {
                 p = next[p];
             }
         }
+        sched_unlock();
         // SAFETY: 与上面的 save 配对。
         unsafe { irq::restore_flags(flags) };
     }
@@ -718,6 +803,33 @@ pub unsafe fn yield_now() {
     unsafe { schedule() }
 }
 
+/// AP 空转入口：把本核注册为 idle，然后进入「派工 + 偷任务」循环。
+/// 不返回。由 `smp::smp_ap_main` 在 LAPIC 初始化完成后调用。
+///
+/// 循环语义：
+/// 1. 先检查 BSP 派工（`run_on_all_cpus` 的 JOB_SEQ），有就执行。
+/// 2. 否则调 [`schedule`]：它能从任务环里偷到一个 `Running`、
+///    `on_cpu < 0`、`pml4 == 0` 的纯内核线程就切过去跑；偷不到就
+///    保持 [`IDLE_SENTINEL`]（本循环自己）继续空转。
+pub unsafe fn ap_idle_enter(cpu: usize) -> ! {
+    // SAFETY: 本核独占自己的槽位；AP 还没跑任何任务。
+    unsafe { *core::ptr::addr_of_mut!(CPU_CURRENT[cpu]) = IDLE_SENTINEL };
+
+    let mut last_seq = crate::smp::job_seq();
+    loop {
+        let seq = crate::smp::job_seq();
+        if seq != last_seq {
+            crate::smp::run_pending_job(cpu, seq);
+            last_seq = seq;
+            continue;
+        }
+        // SAFETY: AP 不在中断上下文；schedule 偷不到任务时
+        // （cur == IDLE_SENTINEL && best == IDLE_SENTINEL）直接返回。
+        unsafe { schedule() };
+        core::hint::spin_loop();
+    }
+}
+
 /// 睡指定的滴答数。原版的等价物是 `sys_pause` + `current->timeout`
 /// 或 `add_timer`；这里做成最简形式供自检用。
 ///
@@ -728,12 +840,17 @@ pub unsafe fn sleep_ticks(ticks: u64) {
     if nr == 0 {
         panic!("task[0] trying to sleep");
     }
-    // SAFETY: 契约保证调用环境；只改自己的状态然后让出。
+    // SAFETY: 契约保证调用环境；只改自己的状态然后让出。SMP 下持锁发布。
+    let flags = unsafe { irq::local_irq_save() };
+    sched_lock();
     unsafe {
         let t = task(nr);
         t.state = TaskState::Interruptible;
         t.timeout = jiffies() + ticks;
-        irq::sti();
+    }
+    sched_unlock();
+    unsafe {
+        irq::restore_flags(flags);
         schedule();
     }
 }
@@ -937,7 +1054,10 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
             sp as u64
         };
 
-        // SAFETY: nr 是刚找到的空槽位，已关中断独占。
+        // SAFETY: nr 是刚找到的空槽位，已关中断独占。SMP 下还要拿
+        // 调度锁：state=Running 是「发布」点，AP 扫描持同一把锁，
+        // 保证它要么看到全新任务要么完全看不到。
+        sched_lock();
         unsafe {
             let t = task(nr);
             *t = Task::empty();
@@ -965,6 +1085,7 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
             (*task_ptr(cur)).next = nr;
             (*task_ptr(old_next)).prev = nr;
         }
+        sched_unlock();
         Ok(nr)
     })();
     // SAFETY: 与上面的 save 配对。
@@ -993,8 +1114,11 @@ pub unsafe extern "C" fn do_kthread_exit(code: u64) {
         let (p, n) = (t.prev, t.next);
         (*task_ptr(p)).next = n;
         (*task_ptr(n)).prev = p;
+        sched_lock();
         t.state = TaskState::Unused;
+        t.on_cpu = -1;
         t.kernel_stack = 0;
+        sched_unlock();
         irq::restore_flags(flags);
 
         // 此刻我们还在这个栈上跑，不能立刻归还——归还后它可能被
@@ -1049,7 +1173,8 @@ pub unsafe fn init() -> KResult<()> {
         // `/* schedlink */ &init_task,&init_task`）
         t.next = 0;
         t.prev = 0;
-        *core::ptr::addr_of_mut!(CURRENT) = 0;
+        t.on_cpu = 0;
+        *core::ptr::addr_of_mut!(CPU_CURRENT[0]) = 0;
         *core::ptr::addr_of_mut!(LAST_PID) = 0;
     }
 

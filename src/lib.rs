@@ -158,11 +158,16 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
 
     // 真正启动 SMP：映射 LAPIC MMIO、使能 BSP LAPIC、按 INIT-SIPI-SIPI
     // 拉起所有 AP。必须在用户进程创建之前调（此时 cr3 是内核引导 PML4，
-    // 低 1GB 恒等映射完好，蹦床与信箱都靠它）。AP 起来后停在派工等待
-    // 循环里，不参与调度。
+    // 低 1GB 恒等映射完好，蹦床与信箱都靠它）。AP 起来后进入
+    // sched::ap_idle_enter：从任务环偷 Running 的纯内核线程跑（协作式，
+    // 无 LAPIC 定时器抢占），空转时仍响应 run_on_all_cpus 派工。
     smp::smp_init();
     if !smp::tests::parallel_selftest() {
         sprintln!("smp: parallel selftest FAIL");
+    }
+    // AP 空转循环已接入调度器：验证它真的能从任务环偷到内核线程跑。
+    if !smp::tests::sched_steal_selftest() {
+        sprintln!("smp: sched steal selftest FAIL");
     }
 
     // ---- 模块 5：文件系统与设备驱动 ----

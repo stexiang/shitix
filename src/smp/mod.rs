@@ -561,8 +561,10 @@ pub fn smp_init() {
             continue;
         }
         // SAFETY: 蹦床已就位，信箱逐核填写；每次只启动一个核。
-        if unsafe { start_one_ap(kernel_pml4, apic_id, logical) } {
-            crate::sprintln!("SMP: CPU{} online (APIC id={})", logical, apic_id);
+        // 用 APIC ID 当逻辑 CPU 号：调度器的 this_cpu() 直接读 LAPIC IDR，
+        // 两个编号必须一致（QEMU 下本来就是 0..n-1 连续）。
+        if unsafe { start_one_ap(kernel_pml4, apic_id, apic_id as usize) } {
+            crate::sprintln!("SMP: CPU{} online (APIC id={})", apic_id, apic_id);
             logical += 1;
         }
     }
@@ -697,7 +699,7 @@ extern "C" fn smp_ap_main(cpu_id: u64) -> ! {
     // SAFETY: 蹦床已把内核 CR3/栈/本函数地址交给我们；BSP 的 GDT/IDT
     // 早已建好。中断在本核保持关闭（蹦床 cli 后没开），lidt 只是
     // 让异常有个去处（真出异常说明 AP 路径有 bug）。
-    unsafe { crate::desc::ap_load_tables() };
+    unsafe { crate::desc::ap_load_tables(cpu) };
 
     // 本核 LAPIC：使能 + 清 TPR，屏蔽 LINT0/LINT1/Timer（PIC 的
     // ExtINT 只该去 BSP，AP 不接外设中断）
@@ -716,32 +718,38 @@ extern "C" fn smp_ap_main(cpu_id: u64) -> ! {
     // 报到
     CPU_ONLINE[cpu].store(true, Ordering::Release);
 
-    // 任务等待循环
-    let mut last_seq = JOB_SEQ.load(Ordering::Acquire);
-    loop {
-        let seq = JOB_SEQ.load(Ordering::Acquire);
-        if seq != last_seq {
-            let f = JOB_FN.load(Ordering::Acquire);
-            let arg = JOB_ARG.load(Ordering::Acquire);
-            if f != 0 {
-                // SAFETY: f 由 BSP 在派工前置入，一定是合法的
-                // extern "C" fn(usize, usize)（见 run_on_all_cpus）。
-                let job: extern "C" fn(usize, usize) =
-                    unsafe { core::mem::transmute(f as *const ()) };
-                job(cpu, arg);
-            }
-            JOB_DONE[cpu].store(seq, Ordering::Release);
-            last_seq = seq;
-        }
-        core::hint::spin_loop();
+    // 进入调度空转：AP 的真调度器接入点。先把自己注册为 idle，
+    // 然后循环：优先响应 BSP 派工（兼容 run_on_all_cpus），否则调
+    // 调度器偷一个 Running 的内核线程跑（schedule 内部会偷不到就
+    // 切回这里，栈现场存在 AP_IDLE_RSP）。
+    unsafe { crate::sched::ap_idle_enter(cpu) };
+}
+
+/// 当前派工序号。AP 空转循环轮询它。
+pub fn job_seq() -> u64 {
+    JOB_SEQ.load(Ordering::Acquire)
+}
+
+/// 在本核执行当前派工（如果有）并上报完成。由 AP 空转循环调用。
+pub fn run_pending_job(cpu: usize, seq: u64) {
+    let f = JOB_FN.load(Ordering::Acquire);
+    let arg = JOB_ARG.load(Ordering::Acquire);
+    if f != 0 {
+        // SAFETY: f 由 BSP 在派工前置入，一定是合法的
+        // extern "C" fn(usize, usize)（见 run_on_all_cpus）。
+        let job: extern "C" fn(usize, usize) =
+            unsafe { core::mem::transmute(f as *const ()) };
+        job(cpu, arg);
     }
+    JOB_DONE[cpu].store(seq, Ordering::Release);
 }
 
 /// 派一个任务到所有在线核（含 BSP 自己，cpu 号 0）并行执行，
 /// 阻塞等待全部完成后返回。
 ///
-/// 调度器本身仍是单核的，这是给「多核并行计算」用的显式分发接口：
-/// `job` 在每个核上以 `(cpu 逻辑号, arg)` 调用一次。
+/// 注意：AP 的空转循环已接入调度器（会偷内核线程跑），派工只在
+/// AP 空转态下被拾取；若 AP 正忙着跑偷来的内核线程，本函数会
+/// 等它跑完一轮（协作式）。这与纯派工时代相比多了延迟但语义不变。
 pub fn run_on_all_cpus(job: extern "C" fn(usize, usize), arg: usize) {
     let ncpu = get_cpu_count() as usize;
     JOB_FN.store(job as usize, Ordering::Relaxed);

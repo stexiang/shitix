@@ -1140,9 +1140,12 @@ pub unsafe fn wake_buffer_waiters() {
 /// `end_request` 里 `p->state = TASK_RUNNING` 那两行）。
 ///
 /// # Safety
-/// `nr` 必须是有效任务下标。可在中断上下文调用。
+/// `nr` 必须是有效任务下标。可在中断上下文调用：拿不到调度锁时留
+/// NEED_WAKE_SCAN 标记，由下一次调度补扫。
 pub unsafe fn wake_io_waiter(nr: usize) {
-    // SAFETY: 契约保证下标有效；只改状态位。
+    // SAFETY: 契约保证下标有效；只改状态位。SMP 下持调度锁发布；
+    // 自旋安全：调度锁只在关中断段里持有，本核不可能已持有它。
+    crate::sched::sched_lock();
     unsafe {
         let t = task(nr);
         t.state = TaskState::Running;
@@ -1150,6 +1153,7 @@ pub unsafe fn wake_io_waiter(nr: usize) {
             crate::sched::set_need_resched();
         }
     }
+    crate::sched::sched_unlock();
 }
 
 /// 关中断执行一段临界区。原版直接写 `cli()`/`sti()`。

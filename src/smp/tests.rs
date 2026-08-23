@@ -144,3 +144,54 @@ pub fn parallel_selftest() -> bool {
     );
     ok
 }
+
+// ---- 调度偷取自检：AP 是否真的从任务环里偷到一个内核线程并执行 ----
+
+static STEAL_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STEAL_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn steal_worker(_arg: u64) {
+    STEAL_CPU.store(crate::sched::this_cpu() as u64, Ordering::Release);
+    STEAL_DONE.store(true, Ordering::Release);
+}
+
+/// 多核调度自检：创建一个内核线程，BSP 不调度它（忙等），验证它被
+/// 某个 AP 从任务环偷走并执行（worker 汇报 this_cpu() > 0）。
+/// 单核环境直接跳过（没有 AP 可偷）。
+pub fn sched_steal_selftest() -> bool {
+    let ncpu = get_cpu_count() as usize;
+    if ncpu < 2 {
+        crate::sprintln!("smp sched: single CPU, skip steal test");
+        return true;
+    }
+    STEAL_DONE.store(false, Ordering::Relaxed);
+    STEAL_CPU.store(u64::MAX, Ordering::Relaxed);
+    let nr = match crate::sched::kernel_thread("stealtest", steal_worker, 0, 15) {
+        Ok(n) => n,
+        Err(_) => {
+            crate::sprintln!("smp sched: kernel_thread failed");
+            return false;
+        }
+    };
+    let _ = nr;
+    // BSP 忙等不调度：只有自己不调 schedule()，线程才必然由 AP 偷走。
+    // 开中断让 jiffies 走动以做超时。
+    // SAFETY: IDT/PIC 就绪。
+    unsafe { crate::irq::sti() };
+    let deadline = crate::sched::jiffies() + 200;
+    while !STEAL_DONE.load(Ordering::Acquire) {
+        if crate::sched::jiffies() > deadline {
+            crate::sprintln!("smp sched: steal TIMEOUT");
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    let cpu = STEAL_CPU.load(Ordering::Acquire);
+    let ok = cpu > 0 && (cpu as usize) < ncpu;
+    crate::sprintln!(
+        "smp sched: worker ran on cpu{} {}",
+        cpu,
+        if ok { "ok" } else { "FAIL (expected AP)" }
+    );
+    ok
+}

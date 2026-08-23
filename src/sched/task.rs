@@ -159,6 +159,10 @@ pub struct Task {
     /// 非 0 时 `switch_to_task` 会在切任务时改写 CR3。
     pub pml4: usize,
 
+    /// SMP：本任务正在执行的逻辑 CPU（-1 = 没在跑）。AP 的调度扫描
+    /// 只会偷 `on_cpu < 0` 的 Running 任务，防止同一任务跑在两核上。
+    pub on_cpu: i32,
+
     /// FS 段基址（原版没有，x86_64 TLS 用 MSR IA32_FS_BASE）。
     /// `arch_prctl(ARCH_SET_FS)` 写入，`switch_to_task` 恢复。
     pub fs_base: u64,
@@ -303,6 +307,7 @@ impl Task {
             tss: Tss::new(),
             brk: 0,
             pml4: 0,
+            on_cpu: -1,
             fs_base: 0,
             gs_base: 0,
             exit_code: 0,
