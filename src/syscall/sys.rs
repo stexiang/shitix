@@ -3905,16 +3905,73 @@ pub fn mbind(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn set_mempolicy(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn get_mempolicy(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn migrate_pages(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
-pub fn move_pages(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn mlock2(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// `move_pages(pid, count, pages, nodes, status, flags)`。单节点（node 0）
+/// 系统：查询模式（nodes==NULL）把每个页的状态写成 0；迁移模式目标节点
+/// 非 0 时报 -ENODEV，目标是 0 时什么都不用做。
+pub fn move_pages(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    use crate::klib::errno::ENODEV;
+    const MPOL_MF_MOVE: u64 = 1 << 1;
+    const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
+    let pid = args.a0 as i32;
+    let count = args.a1;
+    let nodes = args.a3 as *const i32;
+    let status = args.a4 as *mut i32;
+    let flags = args.a5;
+    if flags & !(MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 {
+        return -(EINVAL as i64);
+    }
+    if pid != 0 && find_task_by_pid(pid).is_none() {
+        return -(ESRCH as i64);
+    }
+    if nodes.is_null() {
+        // 查询：所有页都在节点 0
+        if !status.is_null() {
+            for i in 0..count as usize {
+                // SAFETY: 用户指针恒等映射；调用方保证可写 count 个 i32。
+                unsafe { core::ptr::write_volatile(status.add(i), 0) };
+            }
+        }
+        return 0;
+    }
+    for i in 0..count as usize {
+        // SAFETY: 用户指针恒等映射。
+        let node = unsafe { core::ptr::read_volatile(nodes.add(i)) };
+        if node != 0 {
+            return -(ENODEV as i64);
+        }
+    }
+    0
+}
+/// `mlock2(addr, len, flags)`。内存不足错误（ENOMEM）场景我们不换出
+/// 锁定页的追踪表也没有——接受并忽略（等价于页永远 pin 住的语义上界）。
+/// 只认 MLOCK_ONFAULT=0x01。
+pub fn mlock2(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    const MLOCK_ONFAULT: u64 = 0x01;
+    if args.a2 & !MLOCK_ONFAULT != 0 {
+        return -(EINVAL as i64);
+    }
+    0
+}
 
-/// io setup.
-pub fn io_setup(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn io_destroy(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn io_submit(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn io_getevents(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn io_cancel(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-pub fn io_pgetevents(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 内核 AIO（io_setup 系列）。同步实现，见 [`crate::fs::aio`]。
+pub fn io_setup(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::aio::io_setup(args.a0, args.a1)
+}
+pub fn io_destroy(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::aio::io_destroy(args.a0)
+}
+pub fn io_submit(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::aio::io_submit(args.a0, args.a1 as i64, args.a2)
+}
+pub fn io_getevents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::aio::io_getevents(args.a0, args.a1 as i64, args.a2 as i64, args.a3)
+}
+pub fn io_cancel(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::aio::io_cancel(args.a0, args.a1, args.a2)
+}
+pub fn io_pgetevents(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    crate::fs::aio::io_pgetevents(args.a0, args.a1 as i64, args.a2 as i64, args.a3)
+}
 
 /// keyctl syscalls.
 pub fn add_key(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
@@ -4547,7 +4604,44 @@ pub fn sched_getattr(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     }
     0
 }
-pub fn seccomp(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// seccomp（Linux 3.17+）。实现经典 strict 模式：置位后当前进程只剩
+/// read/write/exit/rt_sigreturn/exit_group，其余系统调用在 `do_syscall`
+/// 的派发点直接 SIGKILL。FILTER 模式需要 cBPF 引擎，不支持。
+pub fn seccomp(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    const SECCOMP_SET_MODE_STRICT: u64 = 0;
+    const SECCOMP_SET_MODE_FILTER: u64 = 1;
+    const SECCOMP_GET_ACTION_AVAIL: u64 = 2;
+    // SECCOMP_RET_KILL_PROCESS / KILL_THREAD / ALLOW
+    const KILL_PROCESS: u32 = 0x8000_0000;
+    const KILL_THREAD: u32 = 0x0000_0000;
+    const ALLOW: u32 = 0x7fff_0000;
+
+    let op = args.a0;
+    let flags = args.a1;
+    match op {
+        SECCOMP_SET_MODE_STRICT => {
+            if flags != 0 || args.a2 != 0 {
+                return -(EINVAL as i64);
+            }
+            // SAFETY: 系统调用上下文，current 有效。
+            unsafe { crate::sched::current() }.seccomp_strict = true;
+            0
+        }
+        SECCOMP_SET_MODE_FILTER => -(EINVAL as i64),
+        SECCOMP_GET_ACTION_AVAIL => {
+            if flags != 0 || args.a2 == 0 {
+                return -(EFAULT as i64);
+            }
+            // SAFETY: 用户指针恒等映射。
+            let action = unsafe { core::ptr::read_volatile(args.a2 as *const u32) };
+            match action {
+                KILL_PROCESS | KILL_THREAD | ALLOW => 0,
+                _ => -(EOPNOTSUPP as i64),
+            }
+        }
+        _ => -(EINVAL as i64),
+    }
+}
 pub fn memfd_create(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 pub fn userfaultfd(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn membarrier(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
@@ -5613,8 +5707,32 @@ pub fn ustat(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 pub fn sysfs(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 改 LDT。`src/desc.rs` 只建了 GDT，没有 LDT。
 pub fn modify_ldt(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 换根挂载点。需要挂载树，现在只支持单个根。
-pub fn pivot_root(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 换根挂载点。没有挂载树（单根），退化成 chroot 语义：new_root 必须
+/// 是已存在目录，进程根切到 new_root 并 chdir("/")。put_old 的
+/// 「把旧根卸到子目录」语义无法表达（没有挂载栈），只做存在性校验。
+pub fn pivot_root(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    // SAFETY: 同 [`chroot`]/[`chdir`] 的用户路径读取。
+    let new_root = match unsafe { user_path(args.a0) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let put_old = match unsafe { user_path(args.a1) } {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // SAFETY: 系统调用上下文；先校验 put_old 可解析，再切根。
+    unsafe {
+        let r = crate::fs::open::sys_chdir(put_old);
+        if r != 0 {
+            return r;
+        }
+        let r = crate::fs::open::sys_chroot(new_root);
+        if r != 0 {
+            return r;
+        }
+        crate::fs::open::sys_chdir(b"/")
+    }
+}
 /// 旧式 sysctl（已废弃）。
 pub fn sysctl(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 架构相关的进程控制。x86_64 上主要是 FS/GS base（TLS）。
@@ -6001,8 +6119,58 @@ pub fn mq_getsetattr(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     crate::fs::mqueue::sys_mq_getsetattr(
         args.a0 as i64, args.a1 as *const u64, args.a2 as *mut u64)
 }
-/// 等子进程（可不收尸）。`wait4` 已有，WNOWAIT 语义还没有。
-pub fn waitid(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// `waitid(idtype, id, infop, options)`。在 [`wait4`] 的 pid 语义上换算：
+/// P_PID(1)→`id`、P_PGID(2)→`-id`、P_ALL(0)→`-1`。WNOHANG(1) 与
+/// WSTOPPED(2) 的位值和 wait4 的 WNOHANG/WUNTRACED 相同直接透传；
+/// WEXITED(4) 是必选项；WNOWAIT（收尸前 peek）不支持。
+pub fn waitid(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    const P_ALL: i32 = 0;
+    const P_PID: i32 = 1;
+    const P_PGID: i32 = 2;
+    const WEXITED: u64 = 4;
+    const WNOWAIT: u64 = 0x0200_0000;
+
+    let idtype = args.a0 as i32;
+    let id = args.a1 as i32;
+    let infop = args.a2 as *mut i32;
+    let options = args.a3;
+    if idtype < P_ALL || idtype > P_PGID || options & WEXITED == 0 {
+        return -(EINVAL as i64);
+    }
+    if options & WNOWAIT != 0 {
+        return -(EOPNOTSUPP as i64);
+    }
+    let pid: i64 = match idtype {
+        P_PID => id as i64,
+        P_PGID => -(id as i64),
+        _ => -1,
+    };
+    // SAFETY: 同 [`wait4`]；状态字先写到内核栈，再拆进 siginfo。
+    let mut status: i32 = 0;
+    let r = unsafe {
+        crate::exit::sys_wait4(pid, &mut status as *mut i32 as u64, options & 3)
+    };
+    if r <= 0 {
+        // 0 = WNOHANG 无就绪子进程；负数 = errno，都直接透传。
+        return r;
+    }
+    if !infop.is_null() {
+        // siginfo_t 头（x86_64）：si_signo/si_errno/si_code/pad/si_pid/
+        // si_uid/si_status。CLD_EXITED=1（stopped 语义 wait4 已编码进
+        // status，这里按 exited 报告）。
+        // SAFETY: 用户指针恒等映射；调用方保证可写 siginfo_t。
+        unsafe {
+            core::ptr::write_volatile(infop, 17); // SIGCHLD
+            core::ptr::write_volatile(infop.add(1), 0);
+            core::ptr::write_volatile(infop.add(2), 1); // CLD_EXITED
+            core::ptr::write_volatile(infop.add(3), 0);
+            core::ptr::write_volatile(infop.add(4), r as i32);
+            core::ptr::write_volatile(infop.add(5), 0);
+            core::ptr::write_volatile(infop.add(6), (status >> 8) & 0xff);
+        }
+    }
+    0
+}
 /// 设 I/O 优先级。`ll_rw_blk` 的请求队列没有优先级。
 pub fn ioprio_set(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
 /// 取 I/O 优先级。同 [`ioprio_set`]。
@@ -6470,8 +6638,19 @@ pub fn pidfd_getfd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
         new as i64
     }
 }
-/// 对别的进程做 madvise。需要跨进程地址空间访问。
-pub fn process_madvise(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 对别的进程做 madvise。跨进程地址空间操作不支持；校验 pidfd 有效后
+/// 接受并忽略（advice 本就是提示），返回 0。
+pub fn process_madvise(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pidfd = args.a0 as i64;
+    let flags = args.a4 as u32;
+    if flags != 0 || pidfd & !0xFFFF != PIDFD_MAGIC {
+        return -(EINVAL as i64);
+    }
+    match find_task_by_pid((pidfd & 0xFFFF) as i32) {
+        None => -(ESRCH as i64),
+        Some(_) => 0,
+    }
+}
 /// 改挂载点属性。同 [`open_tree`]。
 pub fn mount_setattr(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 按 fd 的配额控制。同 [`quotactl`]。
@@ -6484,5 +6663,19 @@ pub fn landlock_add_rule(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS 
 pub fn landlock_restrict_self(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
 /// 建不可映射到内核的匿名内存 fd。同 [`memfd_create`] 的限制。
 pub fn memfd_secret(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
-/// 提前释放被杀进程的内存。需要 `do_exit` 的完整回收链。
-pub fn process_mrelease(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { -(ENOSYS as i64) }
+/// 提前回收被杀进程的内存。`do_exit` 已经回收地址空间，这里等价于
+/// 「确保目标死了」：对 pidfd 指向的存活进程发 SIGKILL。
+pub fn process_mrelease(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
+    let pidfd = args.a0 as i64;
+    let flags = args.a1 as u32;
+    if flags != 0 || pidfd & !0xFFFF != PIDFD_MAGIC {
+        return -(EINVAL as i64);
+    }
+    match find_task_by_pid((pidfd & 0xFFFF) as i32) {
+        None => -(ESRCH as i64),
+        Some(i) => {
+            let r = crate::signal::send_sig(9, i, 0); // SIGKILL
+            if r == 0 { 0 } else { -(ESRCH as i64) }
+        }
+    }
+}

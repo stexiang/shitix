@@ -1238,6 +1238,18 @@ pub unsafe extern "C" fn do_syscall(regs: *mut PtRegs) {
     let cur = unsafe { crate::sched::current() };
     cur.errno = 0;
 
+    // seccomp strict（SECCOMP_SET_MODE_STRICT）：只剩 read/write/exit/
+    // rt_sigreturn/exit_group 可用，其余调用直接 SIGKILL——不执行该调用。
+    if cur.seccomp_strict
+        && !matches!(call_nr,
+            nr::READ | nr::WRITE | nr::EXIT | nr::RT_SIGRETURN | nr::EXIT_GROUP)
+    {
+        crate::signal::send_sig_current(9); // SIGKILL
+        regs.rax = 0;
+        set_carry(regs, false);
+        return;
+    }
+
     let args = SysArgs::from_regs(regs);
 
     // SAFETY: init_table 在启动早期已填表；None 走 ni_syscall。

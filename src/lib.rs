@@ -438,6 +438,10 @@ fn ipc_selftest() {
         mq_ok &= fs::mqueue::sys_mq_unlink(name.as_ptr()) == 0;
     }
     kprintln!("ipc: posix mq open/prio/recv/unlink ok={}", mq_ok);
+
+    // 内核 AIO：io_setup/io_getevents 的完成环机制（提交路径本身是
+    // 同步执行 pread/pwrite，需要真实 fd，留给用户态程序验证）
+    kprintln!("ipc: aio ring ok={}", fs::aio::selftest());
 }
 
 /// klib 自检：ctype 表、string 系列、number 补位、simple_strtoul、printk 过滤。

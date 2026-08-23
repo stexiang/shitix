@@ -237,6 +237,10 @@ pub struct Task {
     // ---- 资源限制。对应原版 task_struct 的 rlim[RLIM_NLIMITS] ----
     /// 资源限制表（{soft, hard} 对）。下标是 RLIMIT_* 常量。
     pub rlim: [Rlimit; RLIM_NLIMITS],
+    /// seccomp strict 模式（SECCOMP_SET_MODE_STRICT）。置位后只剩
+    /// read/write/exit/rt_sigreturn/exit_group 可用，其余系统调用
+    /// 直接 SIGKILL（经典 seccomp 语义）。
+    pub seccomp_strict: bool,
 }
 
 /// 资源限制项。对应 `struct rlimit`。
@@ -335,6 +339,7 @@ impl Task {
             it_prof_value: 0,
             it_prof_incr: 0,
             rlim: default_rlimits(),
+            seccomp_strict: false,
         }
     }
 
