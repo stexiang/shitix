@@ -512,6 +512,11 @@ pub fn smp_init() {
     // 2. 使能 BSP 的 LAPIC，记录真实 BSP APIC ID
     lapic_enable();
     lapic_set_tpr(0);
+    // 屏蔽 BSP 的 LINT1（NMI 引脚）：多核 QEMU 的 PC 机型在 LAPIC 激活后
+    // 会经 NMI 引脚发杂散 NMI，不屏蔽就会在 fb 自检等处连刷 do_nmi 的
+    // 「硬件问题」提示，挤满串口并拖慢 boot 到超过测试超时。LINT0 保持
+    // 不动（ExtINT 时钟走它，屏蔽会让 100Hz tick 断流）。
+    lapic_write(ApicReg::LvtLint1, LVT_MASKED);
     let bsp_id = lapic_id();
     BSP_APIC_ID.store(bsp_id as u32, Ordering::Release);
     CPU_ONLINE[0].store(true, Ordering::Release);
@@ -628,7 +633,9 @@ unsafe fn start_one_ap(kernel_pml4: usize, apic_id: u8, logical: usize) -> bool 
     // INIT → 10ms → SIPI → 200us → SIPI（MP 规范 B.4）。
     // 等待全部用 jiffies（wall-clock 恒定），不能用数空转的忙等待：
     // TCG 限速宿主上忙循环可能几十倍快于真实时间，AP 的 vCPU 线程
-    // 拿不到时间片就永远等不到。
+    // 拿不到时间片就永远等不到。INIT 后的等待给足余量：部分 QEMU
+    // （尤其 TCG + 多 vCPU 同启动）里 10ms 窗口不够 vCPU 完成 INIT
+    // 握手，放长到 ~200ms（代价只是启动稍慢，INIT 只在 boot 发一次）。
     let vector = (TRAMPOLINE_PHYS >> 12) as u8;
     lapic_send_init(apic_id);
     wait_ticks(2); // ~20ms >= 规范的 10ms

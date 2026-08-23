@@ -75,6 +75,15 @@ tramp_pm32:
     orl     $0x6A0, %eax
     movl    %eax, %cr4
 
+    /* 尽早屏蔽本核 LAPIC 的 LINT0/LINT1：必须先于 CR3 装载做——
+     * 此时还没开分页，0xFEE00000 就是物理 LAPIC，写直达。装 CR3 之后
+     * 低 4GB 的「恒等映射」其实是 setup.S 的引导页表（2MB 大页、
+     * 低 1GB），LAPIC 不在其内，写会落进 RAM 无效。多核 QEMU 的
+     * PC 机型会给每个 vCPU 的 NMI 引脚发杂散 NMI（约在 guest 首次
+     * PCI 枚举/IO-APIC 活跃时刻，一次一核）。 */
+    movl    $0x10000, 0xFEE00360    /* LVT_LINT1 = MASKED */
+    movl    $0x10000, 0xFEE00350    /* LVT_LINT0 = MASKED */
+
     /* CR3 = 内核 PML4（BSP 填在信箱里）。低 1GB 恒等映射 + 高半区
      * 直接映射都在这张表里。 */
     movl    TRAMP_CR3, %eax

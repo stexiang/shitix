@@ -196,9 +196,14 @@ pub unsafe extern "C" fn do_trap(regs: *mut PtRegs, vector: u64) {
     let error_code = if has_ec { regs.orig_rax } else { 0 };
 
     // NMI：原版 do_nmi 只打印两行提示然后照常返回，不杀进程。
+    // 多核 QEMU（PC 机型）有一个已知 quirk：guest 首次 PCI 枚举
+    // （IO-APIC/设备活跃）时给每个 vCPU 注一发 NMI，即便 LAPIC LINT1
+    // 已屏蔽也会到（不是经 LINT1 引脚）。无法从根源消除，打印照旧——
+    // 反正 do_nmi 不杀进程，只是串口上多几行。
     if v == 2 {
         crate::pr!(Level::Err,
-                   "Uhhuh. NMI received. Dazed and confused, but trying to continue");
+                   "Uhhuh. NMI received on cpu{}. Dazed and confused, but trying to continue",
+                   crate::sched::this_cpu());
         crate::pr!(Level::Err, "You probably have a hardware problem with your RAM chips");
         return;
     }
