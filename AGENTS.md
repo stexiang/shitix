@@ -464,3 +464,16 @@ LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接
   写回（恒 0/0，调度只在 BSP）。reboot/chroot/shebang 此前已实现。
 - **push 被拒**：GITHUB_TOKEN 属 alphashit，对 stexiang/shitix 无写权限
   （403），提交只到本地 feat/vm-swap-mm 分支，待用户换凭据后 push。
+- **Batch 5**（3bd31fc）：补齐剩余可实现的 ENOSYS 存根——waitid（换算
+  到 wait4 pid 语义 + siginfo）、seccomp strict（Task.seccomp_strict +
+  do_syscall 拦截非白名单调用直接 SIGKILL；FILTER 无 cBPF 返回 EINVAL）、
+  io_* 内核 AIO（src/fs/aio.rs 同步实现：submit 原地 pread/pwrite/fsync，
+  完成事件定长环 4×32，注意 BSS 上限 0x200000 很紧）、move_pages 单节点、
+  mlock2/process_madvise 接受返回 0、process_mrelease=pidfd+SIGKILL、
+  pivot_root 退化为 chroot 语义。保留 ENOSYS（CONFIG-off）：io_uring、
+  keyctl、perf、bpf、landlock、fanotify、quotactl、kexec、userfaultfd、
+  memfd_secret、新挂载 API、模块系列、pkey、32-bit/废弃项。
+- **环境注意**：本机会被重置（cargo/qemu/git-lfs 会丢）；rustup nightly +
+  x86_64-unknown-none + qemu-system-x86 + git-lfs 需重装。tcp echo 自检在
+  无 echo 服务器的环境打印 `connect -111 -> skipped`（设计行为，非回归：
+  RST 本身就证明 TCP 路径通）。
