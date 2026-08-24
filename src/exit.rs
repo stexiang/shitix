@@ -213,6 +213,23 @@ pub fn release(task_idx: usize) -> i32 {
         // init_task 的栈是 head.S 的静态栈（kernel_stack == 0），不能还给分配器。
         let stack = (*task).kernel_stack;
         if stack != 0 {
+            // 高水位告警：槽在 free_kstack 里清零，高水位测的是本次
+            // 占用期的真实峰值。超过 3/4 说明离溢出砸邻居槽不远了
+            // （溢出曾把邻居任务的 switch 帧抹成 0/1 → RIP=1 panic）。
+            let hi = stack as usize + crate::sched::KSTACK_SIZE;
+            let mut p = stack as usize + 8; // 跳过底部 STACK_MAGIC
+            while p < hi {
+                if core::ptr::read_volatile(p as *const u64) != 0 {
+                    break;
+                }
+                p += 8;
+            }
+            let used = hi - p;
+            if used > crate::sched::KSTACK_SIZE * 3 / 4 {
+                crate::sprintln!(
+                    "[WARN] task {} (pid {}) kernel stack high water {}/{} bytes",
+                    task_idx, (*task).pid, used, crate::sched::KSTACK_SIZE);
+            }
             crate::sched::free_kstack(stack as usize);
             (*task).kernel_stack = 0;
         }
@@ -252,7 +269,7 @@ pub fn release(task_idx: usize) -> i32 {
         crate::sched::sched_unlock();
         crate::irq::restore_flags(fl);
 
-        crate::sprintln!("[INFO] released task slot {}", task_idx);
+        crate::sprintln!("[INFO] released task slot {} (pid {})", task_idx, (*task).pid);
         0
     }
 }

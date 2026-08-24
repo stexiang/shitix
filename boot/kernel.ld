@@ -44,9 +44,11 @@ SECTIONS
     /* 装载镜像（objcopy 出来的 system.bin）加载到 0x10000，不能碰 0x90000 */
     ASSERT(_image_end <= 0x90000,
            "kernel image (text/rodata/data) extends past safe area at 0x90000")
-    /* BSS 顶到 2MB 之前要停下，给 mem_map/引用计数表/内核栈池留地方 */
-    ASSERT(_kernel_end <= 0x200000,
-           "kernel BSS extends past 0x200000")
+    /* BSS 顶到 2.5MB 之前要停下，给 mem_map/引用计数表/内核栈池留地方。
+     * 这些表是按 kernel_end 动态往后排的（见 page_alloc.rs），这里只是
+     * 留余量的护栏：256MB 内存下 mem_map+ref+kstack 合计 <1MB。 */
+    ASSERT(_kernel_end <= 0x280000,
+           "kernel BSS extends past 0x280000")
 
     /DISCARD/ : {
         *(.note*)

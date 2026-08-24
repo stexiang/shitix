@@ -13,9 +13,11 @@
 
 use crate::sched::NR_TASKS;
 
-/// 每任务最多同时存活的 file-backed VMA 数。glibc 一个进程映射
-/// libc/ld.so/libm 各 3-4 段，32 足够。
-pub const MAX_VMAS: usize = 32;
+/// 每任务最多同时存活的 file-backed VMA 数。glibc ld.so 对每个库先
+/// 整文件 PROT_NONE 预约、再逐段 MAP_FIXED：PROT_NONE 的洞不记账
+/// （见 `sys_mmap`），但 cc1 链接 libgmp/libmpfr/libmpc/libz/libzstd
+/// 等七八个库、每库 4-5 段，32 不够，64 留一倍余量。
+pub const MAX_VMAS: usize = 64;
 
 /// VMA 后端类型。
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -58,6 +60,29 @@ pub fn add(task: usize, vma: MmapVma) -> bool {
     unsafe {
         let flags = crate::irq::local_irq_save();
         let tbl = &mut (*core::ptr::addr_of_mut!(VMA_TABLE))[task];
+        // 先尝试与相邻的同源 VMA 合并（同文件、同权限、文件偏移连续、
+        // 地址相接）——munmap/MAP_FIXED 裁剪会留下可与邻居接回去的残段。
+        for v in tbl.iter_mut() {
+            if v.kind == VmaKind::Empty || v.prot != vma.prot {
+                continue;
+            }
+            if let (VmaKind::File { sb: s1, ino: i1, offset: o1 },
+                    VmaKind::File { sb: s2, ino: i2, offset: o2 }) = (v.kind, vma.kind) {
+                if s1 != s2 || i1 != i2 {
+                    continue;
+                }
+                if v.end == vma.start && o1 + (v.end - v.start) as u64 == o2 {
+                    v.end = vma.end;
+                    crate::irq::restore_flags(flags);
+                    return true;
+                }
+                if vma.end == v.start && o2 + (vma.end - vma.start) as u64 == o1 {
+                    v.start = vma.start;
+                    crate::irq::restore_flags(flags);
+                    return true;
+                }
+            }
+        }
         let mut slot = None;
         for (i, v) in tbl.iter().enumerate() {
             if v.kind == VmaKind::Empty {

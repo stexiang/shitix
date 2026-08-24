@@ -1660,6 +1660,14 @@ pub fn mmap(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
                     return -(ENOMEM as i64);
                 }
             }
+            // PROT_NONE 预约（ld.so 对共享库的「整文件先 map 一次」）不记
+            // VMA：它没有合法访问路径，记了只会被逐段 MAP_FIXED 的
+            // remove_range 切成一堆洞残段把 VMA 表吃满（cc1 链 7-8 个库
+            // 直接撑爆）。页表里的 RESERVED 叶子照旧保留，地址空间占位
+            // 语义不变；真去踩洞会落成匿名零页而不是 SIGSEGV——可接受。
+            if prot == 0 {
+                return map_addr as i64;
+            }
             let task = sched::current_index();
             let vma = crate::mm::mmap_vma::MmapVma {
                 start: map_addr,
@@ -1802,72 +1810,95 @@ pub fn getcwd(args: &SysArgs, _regs: &mut PtRegs) -> i64 {
     // d_parent 走的语义；本树没有 dcache，用「扫父目录」代替。
     // SAFETY: 系统调用上下文。
     unsafe {
-        let nr = sched::current_index();
-        let t = sched::task_ptr(nr);
-        let pwd = (*t).pwd;
-        let root = (*t).root;
-        if pwd == usize::MAX {
+        // 走与 namei 相同的兜底：per-task pwd/root 没设置过（任务从未
+        // chdir——/init 和它的孩子们就是这样）时回退到 mount_root 装的
+        // 全局根。直接读 task.pwd 会把「未设置」误判成 ENOENT，bash
+        // 启动就报 shell-init: getcwd: cannot access parent directories。
+        let pwd = crate::fs::super_block::pwd_inode();
+        let root = crate::fs::super_block::task_root_inode();
+        if pwd == crate::fs::inode::NIL || root == crate::fs::inode::NIL {
             return -(ENOENT as i64);
         }
-        // 分量栈（自叶向根收集，输出时倒序）。深度封顶 32 层防路径死循环。
-        let mut comps: [([u8; 255], usize); 32] = [([0; 255], 0); 32];
+        // 分量从页尾往前 prepend（对应现代内核 prepend_path 的做法），
+        // 不用栈上分量数组——旧实现 `[( [u8;255], usize ); 32]` 是 8.4KB
+        // 的栈帧，叠加 syscall 入口 + ext4 namei（4KB 目录缓冲）+ bread/hd
+        // 的调用链直接顶穿 16KB 内核栈，溢出字节砸进相邻栈槽顶部、把
+        // 邻居任务的 switch 帧 ret 槽抹成 0/1（实测 /bin/pwd 触发：
+        // switch_to 返回到 0x1，全内核 panic）。
+        let page = crate::mm::page_alloc::get_free_page();
+        if page == 0 {
+            return -(crate::klib::errno::ENOMEM as i64);
+        }
+        let bounce = (crate::mm::paging::PHYS_MAP_BASE + page) as *mut u8;
+        let mut pos: usize = crate::mm::PAGE_SIZE;
         let mut depth = 0usize;
         let mut cur = pwd;
         // 非 pwd/root 的中间 inode 是我们 lookup_one("..") 多拿的引用，用完要还。
-        while cur != root {
+        let ret = loop {
+            if cur == root {
+                break 0i64;
+            }
+            if depth >= 64 {
+                // 防路径死循环（文件系统损坏成环）
+                if cur != pwd { crate::fs::inode::iput(cur); }
+                break -(ENAMETOOLONG as i64);
+            }
             let cur_ino = crate::fs::inode::inode(cur).i_ino;
             let parent = match crate::fs::namei::lookup_one(cur, b"..") {
                 Ok(p) => p,
                 Err(e) => {
                     if cur != pwd { crate::fs::inode::iput(cur); }
-                    return -(e as i64);
+                    break -(e as i64);
                 }
             };
             if parent == cur {
                 // 到达文件系统根但不是 chroot 根（被卸载/孤儿目录）：
                 // 按原版 prepend_path 的语义报「不可达」。
                 if cur != pwd { crate::fs::inode::iput(cur); }
-                return -(ENOENT as i64);
+                break -(ENOENT as i64);
             }
             let mut name = [0u8; 255];
             let nlen = crate::fs::namei::lookup_ino_name(parent, cur_ino, &mut name);
             // 换到父目录：还掉子目录的额外引用（pwd 是任务持有的，不还）
             if cur != pwd { crate::fs::inode::iput(cur); }
             let nlen = match nlen {
-                Some(n) if depth < 32 => n,
-                _ => {
+                Some(n) => n,
+                None => {
                     if parent != root { crate::fs::inode::iput(parent); }
-                    return if depth >= 32 { -(ENAMETOOLONG as i64) } else { -(ENOENT as i64) };
+                    break -(ENOENT as i64);
                 }
             };
-            comps[depth] = (name, nlen);
+            if pos < nlen + 1 {
+                if parent != root { crate::fs::inode::iput(parent); }
+                break -(ENAMETOOLONG as i64);
+            }
+            pos -= nlen;
+            core::ptr::copy_nonoverlapping(name.as_ptr(), bounce.add(pos), nlen);
+            pos -= 1;
+            *bounce.add(pos) = b'/';
             depth += 1;
             cur = parent;
-        }
+        };
         // 末尾 cur==root 是 lookup_one 多拿的引用（0 次迭代时例外：pwd==root）
         if depth > 0 { crate::fs::inode::iput(cur); }
-
-        // 组装 "/a/b/c"
-        let mut path_len = 1usize; // 开头的 '/'
-        for d in 0..depth {
-            path_len += 1 + comps[d].1;
+        if ret != 0 {
+            crate::mm::page_alloc::free_page(page);
+            return ret;
         }
+
+        if pos == crate::mm::PAGE_SIZE {
+            // pwd 就是 root：路径 "/"
+            pos -= 1;
+            *bounce.add(pos) = b'/';
+        }
+        let path_len = crate::mm::PAGE_SIZE - pos;
         if size < path_len + 1 {
+            crate::mm::page_alloc::free_page(page);
             return -(ERANGE as i64);
         }
-        let mut w = buf;
-        if depth == 0 {
-            *w = b'/';
-            w = w.add(1);
-        } else {
-            for d in (0..depth).rev() {
-                *w = b'/';
-                w = w.add(1);
-                core::ptr::copy_nonoverlapping(comps[d].0.as_ptr(), w, comps[d].1);
-                w = w.add(comps[d].1);
-            }
-        }
-        *w = 0;
+        core::ptr::copy_nonoverlapping(bounce.add(pos), buf, path_len);
+        *buf.add(path_len) = 0;
+        crate::mm::page_alloc::free_page(page);
     }
 
     buf as i64

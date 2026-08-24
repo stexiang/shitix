@@ -902,7 +902,13 @@ unsafe fn find_empty_process() -> KResult<usize> {
 ///                             ← tss.rsp 指这里
 /// ```
 /// 每个内核线程的栈页数。见 [`kernel_thread`] 里关于「一页不够」的说明。
-pub const KSTACK_PAGES: usize = 4;
+///
+/// 16KB（4 页）不够：sys_getcwd 这类 syscall 的调用链会叠 ext4 namei
+/// （4KB 目录栈缓冲）+ bread/hd 等待帧，再加早期版本 getcwd 自己的
+/// 8.4KB 分量数组，实测溢出槽底、把相邻槽顶部的 switch 帧抹成 0/1
+/// （switch_to ret 到 0x1，全内核 panic）。32KB + getcwd 改用 bounce
+/// 页之后，最深链实测 ~10KB，余量充足。
+pub const KSTACK_PAGES: usize = 8;
 /// 池里放几份栈。task[0] 不占一份（它用 head.S 里的静态栈）。
 ///
 /// 曾经是 3，因为那时池子放在 BSS 里，而 BSS 一旦长过 0x90000 就会盖掉
@@ -996,6 +1002,9 @@ pub unsafe fn free_kstack(addr: usize) {
         let used = &mut *core::ptr::addr_of_mut!(KSTACK_USED);
         if i < used.len() {
             used[i] = false;
+            // 清零归还的槽：`kstack_high_water` 靠「从栈底往上找第一个非零
+            // 字」测高水位，槽复用时旧内容会把测量废掉。
+            core::ptr::write_bytes(addr as *mut u8, 0, KSTACK_SIZE);
         }
     }
 }

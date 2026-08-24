@@ -517,3 +517,55 @@ LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接
 验证：默认 `scripts/test.sh`（debug，-smp 4）PASS；release+extra-drivers
 下 -smp 1/4/8 全部 CPU online、busybox shell 可交互（echo/ls 正常、
 子进程回收正常）、零 NMI、零缺页风暴。
+
+### 本次会话修复（gcc 编译期噪声 + getcwd 栈溢出 RIP=1 panic，2026-08-24）
+
+用户报告 gcc 编译测试的一串噪声：`cc1: failed to map segment from shared
+object`、`shell-init: getcwd: cannot access parent directories`、可疑的
+exit code/重复 released 日志。逐个定位：
+
+1. **VMA 表撑爆（cc1 加载 libc 失败）**：glibc ld.so 对每个共享库先整文件
+   PROT_NONE 预约、再逐段 MAP_FIXED 重 map。旧实现把 PROT_NONE 的洞也记成
+   VMA，`remove_range` 又按每个 MAP_FIXED 段把它切成左/右两个残段——一个库
+   留下 ~2n+1 条，cc1 链接 7-8 个库直接撑爆 MAX_VMAS=32，后续 mmap 返回
+   ENOMEM。修复三件套：`sys_mmap` 对 PROT_NONE 的 file-backed 预约不记 VMA
+   （洞没有合法访问路径）；`mmap_vma::add` 先尝试与相邻同源 VMA 合并
+   （munmap/MAP_FIXED 裁剪留下的残段可接回去）；MAX_VMAS 32→64。
+2. **getcwd ENOENT（shell-init 报错）**：`sys_getcwd` 直接读 per-task
+   `task.pwd`/`task.root`，没设置过就是 NIL sentinel → 误判 ENOENT。/init
+   和它的孩子们从没 chdir，per-task 字段一直是空。修复：走与 namei 相同
+   的兜底 `pwd_inode()`/`task_root_inode()`（per-task 未设时回退 mount_root
+   装的全局根）。
+3. **getcwd 8.4KB 栈帧 → 内核栈溢出 → RIP=1 全内核 panic（最凶的）**：
+   `sys_getcwd` 栈上开 `[( [u8;255], usize ); 32]`（8.4KB），调用链再叠
+   syscall 入口 + ext4 namei（4KB 目录栈缓冲）+ bread/hd 等待帧，顶穿
+   16KB（KSTACK_PAGES=4）内核栈槽底，溢出字节砸进**相邻槽顶部**——那里
+   正好躺着邻居任务的 switch_to 帧，ret 槽被抹成 0/1。下次调度切到邻居，
+   `switch_to` 的 `ret` 跳到 0x1，not-present read kernel 缺页，全内核
+   panic（现场 RIP=0x1、CR2=某个被截断的指针）。这解释了 HEAD 上也能复现、
+   以及「gcc/g++ 连跑几次挂死」的噪声。修复三件套：
+   (a) getcwd 改用 bounce 页从页尾 prepend 分量（对应 prepend_path），栈上
+       不再有大数组；(b) KSTACK_PAGES 4→8（16KB→32KB）；(c) free_kstack 清零
+       归还的槽 + release() 里测高水位、超过 3/4 打 WARN。
+   调试手法：在 switch_to_task 里校验 next 栈顶 ret 槽是不是合法内核文本
+   （0x10000..0x90000），逮到「整个 switch 帧被清成 0」的现行；帧全 0 且
+   地址在槽边界附近 = 相邻槽溢出。
+4. **日志可读性**：`released task slot N` 改成 `released task slot N (pid P)`
+   ——task slot 会被快速复用（pid 4/5/6 都住过 slot 4），用户误读成
+   「重复释放」。exit code 32512 = 127<<8 是正确的 wait 状态编码（命令
+   未找到），不是 bug。
+
+附带：kernel.ld 的 BSS 护栏从 0x200000 放宽到 0x280000（mem_map/引用计数表
+/内核栈池本来就按 kernel_end 动态往后排，护栏只是留余量；VMA 表翻倍 +
+栈池翻倍把 _kernel_end 顶到了 2.08MB）。
+
+验证：gnu-full.img 上 vmastress（模拟 ld.so PROT_NONE+MAP_FIXED）segs=24
+OK、无 VMA 警告；getcwd 在 / 与 /usr/bin 下都返回正确路径、无 shell-init
+报错；连跑 t.sh/t3.sh/t4.sh 无 panic、无 high water WARN（栈峰值 ~10KB
+远低 32KB）；scripts/test.sh 默认（debug, -smp 4）PASS；release 下 -smp
+1/4 busybox shell 正常、IDE 检测正常（`hd: 2 drive(s) ready`）。
+
+**剩余已知问题（未解决）**：bash 内建 `pwd` 的命令替换 `$(pwd)` 偶尔丢
+数据（writer 极快写 2 字节立即关写端，read 端偶发读不到），外置
+`/bin/pwd` 不受影响；表现为 `echo X=$(pwd)` 里 X 为空。疑管道写端关闭
+与读端唤醒的竞态，未深挖。
