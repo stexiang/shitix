@@ -762,6 +762,25 @@ struct SigFrame {
     saved_rflags: u64,
     saved_cs: u64,
     saved_rip: u64,
+    // 全部通用寄存器：rt_sigreturn 必须原样恢复，否则被信号打断的
+    // 系统调用返回值（rax）会被 handler + sigreturn 踩成 0/垃圾——
+    // bash 的 $(...) 里 read 到 3 字节却被 sigreturn 改成 0 → 当成
+    // EOF → 替换结果为空（bug-pipe-sigrax）。
+    saved_rax: u64,
+    saved_rbx: u64,
+    saved_rcx: u64,
+    saved_rdx: u64,
+    saved_rsi: u64,
+    saved_rdi: u64,
+    saved_rbp: u64,
+    saved_r8: u64,
+    saved_r9: u64,
+    saved_r10: u64,
+    saved_r11: u64,
+    saved_r12: u64,
+    saved_r13: u64,
+    saved_r14: u64,
+    saved_r15: u64,
     trampoline: [u8; 12], // mov $15,%rax; syscall (12 bytes on x86_64 with REX prefix)
 }
 
@@ -784,6 +803,21 @@ struct SigFrameExt {
     saved_rflags: u64,
     saved_cs: u64,
     saved_rip: u64,
+    saved_rax: u64,
+    saved_rbx: u64,
+    saved_rcx: u64,
+    saved_rdx: u64,
+    saved_rsi: u64,
+    saved_rdi: u64,
+    saved_rbp: u64,
+    saved_r8: u64,
+    saved_r9: u64,
+    saved_r10: u64,
+    saved_r11: u64,
+    saved_r12: u64,
+    saved_r13: u64,
+    saved_r14: u64,
+    saved_r15: u64,
     trampoline: [u8; 12],
     info: SigInfo,      // siginfo_t for SA_SIGINFO
 }
@@ -811,6 +845,27 @@ unsafe fn setup_frame(regs: *mut crate::traps::PtRegs, signum: u32,
             0xcc, 0xcc, 0xcc,
         ];
 
+        macro_rules! save_regs {
+            ($frame:expr) => {
+                let f = &mut *$frame;
+                f.saved_rax = r.rax;
+                f.saved_rbx = r.rbx;
+                f.saved_rcx = r.rcx;
+                f.saved_rdx = r.rdx;
+                f.saved_rsi = r.rsi;
+                f.saved_rdi = r.rdi;
+                f.saved_rbp = r.rbp;
+                f.saved_r8 = r.r8;
+                f.saved_r9 = r.r9;
+                f.saved_r10 = r.r10;
+                f.saved_r11 = r.r11;
+                f.saved_r12 = r.r12;
+                f.saved_r13 = r.r13;
+                f.saved_r14 = r.r14;
+                f.saved_r15 = r.r15;
+            };
+        }
+
         if has_siginfo {
             let frame = frame_addr as *mut SigFrameExt;
             (*frame).trampoline = tramp;
@@ -819,7 +874,8 @@ unsafe fn setup_frame(regs: *mut crate::traps::PtRegs, signum: u32,
             (*frame).saved_rflags = r.rflags;
             (*frame).saved_rsp = r.rsp;
             (*frame).saved_ss = r.ss;
-            (*frame).ret_addr = frame_addr + 48; // &trampoline
+            save_regs!(frame);
+            (*frame).ret_addr = frame_addr + core::mem::offset_of!(SigFrameExt, trampoline) as u64;
             // Fill siginfo
             (*frame).info = SigInfo { si_signo: signum as i32, si_errno: 0,
                                       si_code: 0, _pad: [0; 116] };
@@ -835,7 +891,8 @@ unsafe fn setup_frame(regs: *mut crate::traps::PtRegs, signum: u32,
             (*frame).saved_rflags = r.rflags;
             (*frame).saved_rsp = r.rsp;
             (*frame).saved_ss = r.ss;
-            (*frame).ret_addr = frame_addr + 48;
+            save_regs!(frame);
+            (*frame).ret_addr = frame_addr + core::mem::offset_of!(SigFrame, trampoline) as u64;
             r.rdi = signum as u64;
         }
 

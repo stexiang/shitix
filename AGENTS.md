@@ -566,6 +566,42 @@ OK、无 VMA 警告；getcwd 在 / 与 /usr/bin 下都返回正确路径、无 s
 1/4 busybox shell 正常、IDE 检测正常（`hd: 2 drive(s) ready`）。
 
 **剩余已知问题（未解决）**：bash 内建 `pwd` 的命令替换 `$(pwd)` 偶尔丢
-数据（writer 极快写 2 字节立即关写端，read 端偶发读不到），外置
-`/bin/pwd` 不受影响；表现为 `echo X=$(pwd)` 里 X 为空。疑管道写端关闭
-与读端唤醒的竞态，未深挖。
+数据——~~疑管道竞态~~ **已根治（2026-08-24 第二批，bug-sigrax）**，见下。
+
+### rt_sigreturn 踩掉被中断系统调用的返回值（bug-sigrax，2026-08-24）
+
+症状：bash `echo "BI=[$(echo hi)]"` 打印 `BI=[]`，所有 `$()` 内的内建/
+外置命令偶发输出全丢；内核侧 pipe_write/pipe_read 字节级全对（ring 有
+"hi\n"、read 返回 3、用户缓冲区物理页读回也是 "hi\n"）。
+
+排查走过的弯路（都有价值，别重蹈）：
+- 先怀疑 pipe 数据丢失 → C 测试 fork-only 子进程写管道 200 次全过，
+  排除内核管道层；
+- 怀疑 child reap 把 bash 的栈页 free 掉 → FUPDBG 全程没碰那页；
+- 怀疑 PTE 野指 → VA watch 显示映射历史正常；
+- 最后注意到 read 返回与「打印 []」之间隔着 child reap 的 FUP 爆发
+  → reap 是 bash 的 SIGCHLD handler 干的 → 信号投递打断了 read 的
+  返回路径。
+
+根因：`setup_frame` 只在用户栈保存 rip/cs/rflags/rsp/ss 五个字段，
+`rt_sigreturn` 恢复后顺手 `regs.rax = 0`。bash 的 read 内核里已经返回
+3，返回用户态前 do_signal 投递 SIGCHLD、handler 跑完 trampoline 调
+rt_sigreturn → rax 被改成 0 → bash 认为 read 返回 0（EOF）→ 命令替换
+为空。Linux 的 rt_sigreturn 从 ucontext 恢复**全部**通用寄存器。
+
+修复：
+- `SigFrame`/`SigFrameExt` 增加全部 15 个 GP 寄存器槽（rax..r15），
+  `setup_frame` 保存、`rt_sigreturn` 恢复；
+- ret_addr 的 trampoline 偏移不再硬编码 48，改
+  `core::mem::offset_of!`（帧布局变了两次都差点踩坑）；
+- `rt_sigreturn` 的返回值改成 saved_rax——syscall 分发器会用 handler
+  返回值覆盖 regs.rax，直接返回恢复的 rax 保住被中断调用的返回值。
+
+验证：gnu-full 上 `$(echo hi)`=`[hi]`、`$(pwd)`=`[/]`、`$(/bin/pwd)`=
+`[/]` 全对；t.sh/t3.sh/t4.sh/pipetest(0/200) 全过；scripts/test.sh 默认
+PASS；release -smp 1/4 lfs3 busybox 正常。
+
+**坑**：`scripts/test.sh`（默认无 extra-drivers）会覆盖
+`target/boot/shitix.img`——之后立刻拿这镜像跑 lfs3 必报「IDE not
+found」；两连踩（上次以为是回归）。测 lfs3 前务必重新
+`build.sh --release --features extra-drivers`。

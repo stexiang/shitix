@@ -5907,6 +5907,21 @@ pub fn rt_sigreturn(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
         let saved_rflags = core::ptr::read_volatile(saved.add(2));
         let saved_cs = core::ptr::read_volatile(saved.add(3));
         let saved_rip = core::ptr::read_volatile(saved.add(4));
+        let saved_rax = core::ptr::read_volatile(saved.add(5));
+        let saved_rbx = core::ptr::read_volatile(saved.add(6));
+        let saved_rcx = core::ptr::read_volatile(saved.add(7));
+        let saved_rdx = core::ptr::read_volatile(saved.add(8));
+        let saved_rsi = core::ptr::read_volatile(saved.add(9));
+        let saved_rdi = core::ptr::read_volatile(saved.add(10));
+        let saved_rbp = core::ptr::read_volatile(saved.add(11));
+        let saved_r8 = core::ptr::read_volatile(saved.add(12));
+        let saved_r9 = core::ptr::read_volatile(saved.add(13));
+        let saved_r10 = core::ptr::read_volatile(saved.add(14));
+        let saved_r11 = core::ptr::read_volatile(saved.add(15));
+        let saved_r12 = core::ptr::read_volatile(saved.add(16));
+        let saved_r13 = core::ptr::read_volatile(saved.add(17));
+        let saved_r14 = core::ptr::read_volatile(saved.add(18));
+        let saved_r15 = core::ptr::read_volatile(saved.add(19));
 
         // Validate: saved CS must be user CS (0x1B) and SS must be user DS (0x23)
         if saved_cs != USER_CS as u64 || saved_ss != USER_DS as u64 {
@@ -5917,16 +5932,34 @@ pub fn rt_sigreturn(_args: &SysArgs, regs: &mut PtRegs) -> i64 {
             return 0;
         }
 
-        // Restore pt_regs
+        // Restore pt_regs：全部寄存器都要恢复（对齐 Linux 从 ucontext 恢复
+        // sigcontext）。旧实现只恢复 5 个 + `regs.rax = 0`，被 SIGCHLD 打断
+        // 的 read 明明返回了 N 字节，sigreturn 却把 rax 踩成 0，bash 的
+        // $(...) 把「读到 N 字节」当成 EOF，命令替换结果整段丢失。
         regs.rip = saved_rip;
         regs.cs = saved_cs;
         regs.rflags = saved_rflags;
         regs.rsp = saved_rsp;
         regs.ss = saved_ss;
-        // rax is the return value from rt_sigreturn (0 = success)
-        regs.rax = 0;
+        regs.rax = saved_rax;
+        regs.rbx = saved_rbx;
+        regs.rcx = saved_rcx;
+        regs.rdx = saved_rdx;
+        regs.rsi = saved_rsi;
+        regs.rdi = saved_rdi;
+        regs.rbp = saved_rbp;
+        regs.r8 = saved_r8;
+        regs.r9 = saved_r9;
+        regs.r10 = saved_r10;
+        regs.r11 = saved_r11;
+        regs.r12 = saved_r12;
+        regs.r13 = saved_r13;
+        regs.r14 = saved_r14;
+        regs.r15 = saved_r15;
+        // 系统调用分发器会用本函数返回值覆盖 regs.rax——把恢复的 rax
+        // 作为返回值交出去，保住被中断系统调用的返回值。
+        return saved_rax as i64;
     }
-    0
 }
 /// 调整系统时钟。没有 RTC 与 NTP 环路，接受但忽略。
 pub fn adjtimex(_args: &SysArgs, _regs: &mut PtRegs) -> i64 { 0 }
