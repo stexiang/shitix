@@ -201,7 +201,11 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
     // 让 fs_init_thread 拿到 pid 1。busybox init / sysvinit 都硬检查
     // `getpid() == 1`，拿不到就直接报「must be run as PID 1」退出。
     sched::reset_last_pid();
-    let init_thread = sched::kernel_thread("fsinit", fs_init_thread, 0, 15);
+    // fsinit 必须钉在 BSP：它中途会 execve 成用户态 pid 1，而 AP 没有
+    // 自己的 TSS、syscall 栈 scratch 也是 BSP 全局的——一旦它在睡眠
+    // （mount_root 的磁盘 I/O）时被 AP 偷走，execve 后第一个系统调用
+    // 就会在 AP 上崩掉，表现为 boot ok 之后 init 无声无息地挂死。
+    let init_thread = sched::kernel_thread_bsp("fsinit", fs_init_thread, 0, 15);
     if init_thread.is_err() {
         panic!("cannot create fs init thread");
     }
@@ -233,7 +237,6 @@ pub extern "C" fn start_kernel(params: *const BootParams) -> ! {
 
     cprintln!(Color::Yellow, Color::Black, "shitix: boot ok, idling.");
     serial::print("shitix: boot ok\n");
-
     // 测试脚本靠这个标记判断启动成功
     serial::print("SHITIX_BOOT_OK\n");
 

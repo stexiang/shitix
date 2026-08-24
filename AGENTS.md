@@ -477,3 +477,43 @@ LFS merged-usr 布局用 `/sbin`->`usr/sbin`、`/bin`->`usr/bin` 等符号链接
   x86_64-unknown-none + qemu-system-x86 + git-lfs 需重装。tcp echo 自检在
   无 echo 服务器的环境打印 `connect -111 -> skipped`（设计行为，非回归：
   RST 本身就证明 TCP 路径通）。
+
+### 本次会话修复（-smp 4 下 /init 挂死 + 杂散 NMI 根治，2026-08-23）
+
+用户报告：`-smp 4` 下 boot ok 后 busybox init 无声无息，AP 上杂散 NMI。
+实际是三个叠加 bug：
+
+1. **fsinit 被 AP 偷走**：fs_init_thread 中途要 execve 成用户态 pid 1，但
+   AP 没有自己的 TSS（从不 ltr）、syscall 栈 scratch 也是 BSP 全局的。
+   fsinit 睡眠（mount_root 磁盘 I/O）时被 AP 的调度扫描偷走，execve 后
+   第一个系统调用即在 AP 上崩。修复：`Task.bsp_only` + `kernel_thread_bsp()`
+   （创建时就钉住，事后补标志有 race），schedule 偷取扫描过滤 bsp_only。
+2. **用户 PML4 缺内核 MMIO 子树（PDPT[3]，3-4GB）**：`this_cpu()` 每次读
+   LAPIC ID（0xFEE00020）都要走 MMIO，但 smp_init 只把它映进了内核引导
+   PML4。内核路径在用户 CR3 下（syscall 入口、缺页处理）一碰 LAPIC 就
+   not-present 缺页，do_trap 里再读 LAPIC → 递归 #PF 风暴、CR2 恒为
+   0xFEE00020。修复：`clone_kernel_pdpt` 把 boot PDPT(0x5000) 的 entry 3
+   原样共享进每个用户 PML4（中间级不带 USER，ring-3 够不到）。
+   **配套**：`free_user_pages` 必须跳过这棵共享子树（按 entry 与
+   boot PDPT[3] 相等判定）——否则 execve/exit 拆地址空间时把内核的
+   LAPIC PT 页送进空闲链表，页被二次分配后全系统 LAPIC 不可读。
+   （调试手法：FREE_COOKIE=0xF0F0C0DE 出现在 PT 页里 = 该页被 free_page 了；
+   QEMU monitor `xp` 物理 dump 全链 vs 内核 translate 对照。）
+3. **fb 选错 BAR 踩烂 LAPIC（杂散 NMI 与「时钟停摆」的真正根源）**：
+   BochsVbe::probe 拿 `bars[2]`（QEMU 放在 0xFEBF0000 的 4KB 寄存器区）
+   当 LFB，而真 LFB 是 BAR0（0xFD000000，16MB）。1024x768x32 的 3MB
+   像素写从 0xFEBF0000 起，第 528 行正压 0xFEE00000 LAPIC 窗口
+   （第 256 行压 0xFEC00000 IOAPIC）：LVT LINT0 被写成背景色
+   0x00336699（ExtINT 失效 → 100Hz tick 断流 → 睡眠任务永不唤醒 →
+   shell 看似挂死），LINT1/SIVR 同样被写花（杂散 NMI 之源）。
+   修复：选**最大的非 IO 内存 BAR**。修复后 fb 像素回读自检也全对。
+   教训：SMP 之前 LAPIC 没启用，踩了也无感——这类「MMIO 窗口被当显存
+   误写」的 bug 会在启用 LAPIC 后才爆炸。
+
+另：usb/mod.rs 的 `scan_ports` 无条件调 `uhci::rescan_ports()`，但 uhci
+模块 gated 在 extra-drivers 后面——默认 build 挂（HEAD 上已有），
+给 match arm 补了 cfg。
+
+验证：默认 `scripts/test.sh`（debug，-smp 4）PASS；release+extra-drivers
+下 -smp 1/4/8 全部 CPU online、busybox shell 可交互（echo/ls 正常、
+子进程回收正常）、零 NMI、零缺页风暴。

@@ -256,8 +256,10 @@ pub unsafe extern "C" fn schedule() {
     // 第二遍：挑 counter 最大的可偷 Running 任务。排除条件：
     // - task[0]（idle，只对 BSP 兜底用；原版就先自增再判等把它跳过）
     // - on_cpu >= 0（正在别的核上跑——包括本核当前任务之外的一切）
-    // - AP 上跳过用户任务（pml4 != 0）：TSS rsp0/syscall_scratch 是
-    //   BSP 全局的，AP 只接 pml4==0 的纯内核线程。
+    // - AP 上跳过用户任务（pml4 != 0）和 bsp_only 任务：TSS
+    //   rsp0/syscall_scratch 是 BSP 全局的，AP 只接「永远是纯内核线程」
+    //   的任务（pml4==0 且未钉 BSP——fsinit 会 execve 成 pid 1，pml4
+    //   在睡着被偷时还是 0，只能靠 bsp_only 提前排除）。
     let mut best: usize = if cpu == 0 { 0 } else { IDLE_SENTINEL };
     let mut best_counter = -1i64;
     unsafe {
@@ -266,7 +268,7 @@ pub unsafe extern "C" fn schedule() {
             let t = task(nr);
             if t.state == TaskState::Running
                 && t.on_cpu < 0
-                && (cpu == 0 || t.pml4 == 0)
+                && (cpu == 0 || (t.pml4 == 0 && !t.bsp_only))
                 && t.counter > best_counter
             {
                 best_counter = t.counter;
@@ -290,7 +292,7 @@ pub unsafe extern "C" fn schedule() {
                 let t = task(nr);
                 if t.state == TaskState::Running
                     && t.on_cpu < 0
-                    && (cpu == 0 || t.pml4 == 0)
+                    && (cpu == 0 || (t.pml4 == 0 && !t.bsp_only))
                     && t.counter > best_counter
                 {
                     best_counter = t.counter;
@@ -999,6 +1001,19 @@ pub unsafe fn free_kstack(addr: usize) {
 }
 
 pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KResult<usize> {
+    kernel_thread_ex(name, entry, arg, priority, false)
+}
+
+/// 同 [`kernel_thread`]，但创建时把任务钉在 BSP 上（`bsp_only`），
+/// AP 的调度扫描永不偷它。
+///
+/// 必须在创建时（持调度锁的发布点之前）就置位：任务一旦以 Running
+/// 入环，AP 随时可能偷走，事后再补标志就是一个 race 窗口。
+pub fn kernel_thread_bsp(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KResult<usize> {
+    kernel_thread_ex(name, entry, arg, priority, true)
+}
+
+fn kernel_thread_ex(name: &str, entry: fn(u64), arg: u64, priority: i64, bsp_only: bool) -> KResult<usize> {
     // SAFETY: 全程关中断，独占任务表。
     let flags = unsafe { irq::local_irq_save() };
     let result = (|| -> KResult<usize> {
@@ -1074,6 +1089,7 @@ pub fn kernel_thread(name: &str, entry: fn(u64), arg: u64, priority: i64) -> KRe
             t.tss.rsp0 = stack_top;
             // 共用内核页表（pml4=0；原版 fork 会 copy_page_tables 出一份新的）
             t.pml4 = 0;
+            t.bsp_only = bsp_only;
 
             // 挂进调度环。原版 `SET_LINKS(p)` 操作 next_task/prev_task 指针，
             // 我们操作下标，语义相同。

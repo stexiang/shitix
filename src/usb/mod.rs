@@ -475,6 +475,7 @@ pub fn free_device(addr: u8) {
 pub fn scan_ports(hc_index: usize) {
     crate::pr_debug!("USB: Scanning ports...");
     match hc_index {
+        #[cfg(feature = "extra-drivers")]
         0 => uhci::rescan_ports(),
         _ => crate::pr_debug!("USB: hc{} not present", hc_index),
     }

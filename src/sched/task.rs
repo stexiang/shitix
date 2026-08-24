@@ -163,6 +163,13 @@ pub struct Task {
     /// 只会偷 `on_cpu < 0` 的 Running 任务，防止同一任务跑在两核上。
     pub on_cpu: i32,
 
+    /// SMP：钉死在 BSP 上，AP 的调度扫描永远不偷。
+    ///
+    /// 只给「运行途中会变成用户态」的内核线程用（fsinit 会 execve 成
+    /// pid 1）：AP 没有自己的 TSS（从不 ltr），syscall 栈 scratch 也是
+    /// BSP 全局的，用户任务落到 AP 上第一次系统调用/中断就崩。
+    pub bsp_only: bool,
+
     /// FS 段基址（原版没有，x86_64 TLS 用 MSR IA32_FS_BASE）。
     /// `arch_prctl(ARCH_SET_FS)` 写入，`switch_to_task` 恢复。
     pub fs_base: u64,
@@ -312,6 +319,7 @@ impl Task {
             brk: 0,
             pml4: 0,
             on_cpu: -1,
+            bsp_only: false,
             fs_base: 0,
             gs_base: 0,
             exit_code: 0,

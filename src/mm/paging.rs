@@ -493,6 +493,17 @@ pub fn clone_kernel_pdpt(dst_pml4: usize) -> bool {
         set_entry(dst_pml4, 0, pdpt as u64 | flags::PRESENT | flags::RW);
         // PDPT[0] → NEW PD (not shared 0x6000)
         set_entry(pdpt, 0, pd as u64 | flags::PRESENT | flags::RW);
+        // 共享 boot PDPT(0x5000) 的第 3 项（3-4GB）：smp_init 的 LAPIC、
+        // e1000 的 MMIO、fb 的 LFB 都映在这棵子树里，且只进了内核引导
+        // PML4。不共享的话，内核在用户 CR3 下一碰 LAPIC（this_cpu 读
+        // APIC ID）就缺页，缺页处理再读 LAPIC → 递归 #PF 风暴挂死。
+        // 共享 entry（而非复制子树）还能让事后新增的 MMIO 映射
+        // （如 fb auto_init）自动对所有已建用户 PML4 可见。
+        // 中间级不带 USER 位，ring-3 够不到 MMIO。
+        let mmio = entry(0x5000, 3);
+        if mmio != 0 {
+            set_entry(pdpt, 3, mmio);
+        }
         // 复制高半区直接映射（boot PML4[256] → 高 PDPT → boot PD 0x6000），
         // 让每个用户 PML4 都能在用户 ELF 覆盖低 1GB 后仍访问物理内存。
         let high = entry(0x4000, 256);
@@ -549,6 +560,13 @@ pub unsafe fn free_user_pages(pml4: usize) {
     // clone_kernel_pdpt 建的恒等映射副本（PML4[0]/PDPT[0] 无 USER 位），按 USER
     // 过滤会把整个 ELF 分支跳过。真正区分「用户页 vs 恒等映射」在末级 PTE：
     // 恒等映射 2MB 大页靠 HUGE 跳过，4KB 条目靠 USER 位区分。
+    //
+    // 共享的内核 MMIO 子树（boot PDPT[3]，clone_kernel_pdpt 把它原样挂进
+    // 每个用户 PML4）：LAPIC/e1000/fb 的页表页属内核所有，绝不能随进程
+    // 地址空间释放——否则 LAPIC 映射被拆，this_cpu 读 APIC ID 直接递归
+    // 缺页挂死（实测：pid2 execve 换地址空间时把 LAPIC PT 页送进了空闲
+    // 链表，页被二次分配后 LAPIC 全系统不可读）。
+    let mmio_root = unsafe { entry(0x5000, 3) };
     for pml4_i in 0..256usize {
         let pml4e = unsafe { entry(pml4, pml4_i) };
         if pml4e & flags::PRESENT == 0 { continue; }
@@ -558,6 +576,7 @@ pub unsafe fn free_user_pages(pml4: usize) {
             let pdpte = unsafe { entry(pdpt, pdpt_i) };
             if pdpte & flags::PRESENT == 0 { continue; }
             if pdpte & flags::HUGE != 0 { continue; }
+            if mmio_root != 0 && pdpte == mmio_root { continue; }
             let pd = (pdpte & ADDR_MASK) as usize;
             for pd_i in 0..512usize {
                 let pde = unsafe { entry(pd, pd_i) };

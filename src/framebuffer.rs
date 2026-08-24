@@ -41,8 +41,14 @@ impl BochsVbe {
         for opt in devices.iter() {
             if let Some(dev) = opt {
                 if dev.vendor_id != 0x1234 || dev.device_id != 0x1111 { continue; }
-                let lfb_bar = dev.bars[2].or(dev.bars[1])?;
-                if lfb_bar.is_io { continue; }
+                // 线性帧缓冲是最大的那个内存 BAR（stdvga 是 BAR0，16MB）。
+                // 绝不能拿 BAR2 之类的小寄存器区：QEMU 把它放在 0xFEBF0000，
+                // 紧邻 0xFEC00000 IOAPIC / 0xFEE00000 LAPIC——1024x768x32 的
+                // 3MB 像素写会踩进 LAPIC 窗口写坏 LVT LINT0/LINT1/SIVR，
+                // ExtINT 时钟全丢（睡眠任务永不唤醒）且杂散 NMI 狂刷。
+                let lfb_bar = dev.bars.iter().flatten()
+                    .filter(|b| !b.is_io)
+                    .max_by_key(|b| b.size)?;
                 return Some(BochsVbe { lfb: lfb_bar.base as usize });
             }
         }
